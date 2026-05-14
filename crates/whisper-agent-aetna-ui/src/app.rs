@@ -22,7 +22,7 @@
 //!   Per-thread drafts persisted via `SetThreadDraft`.
 //! - Pending-sudo approval banner above the affected thread.
 //! - Modals: fork-thread, "+ new pod", "+ new behavior".
-//! - Sheets: pod editor (Allow / Defaults / Limits + raw TOML),
+//! - Sheets: pod editor (General / Allow / Defaults + raw TOML),
 //!   behavior editor (Trigger / Thread / Scope / Retention / Prompt
 //!   / System Prompt / Raw TOML).
 //! - New-thread compose pane (backend / model / pod pickers + text
@@ -67,8 +67,9 @@ use whisper_agent_protocol::{
     ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
     QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
     SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
-    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaults, ThreadSummary,
-    TrackedCadenceInput, TrackedDriverInput, TriggerSpec, permission::SudoDecision,
+    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaultCaps,
+    ThreadDefaults, ThreadSummary, ToolSurface, TrackedCadenceInput, TrackedDriverInput,
+    TriggerSpec, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -1732,12 +1733,14 @@ pub struct ChatApp {
     picker_pod: Option<String>,
     picker_pod_open: bool,
     /// Host-env bindings picked for the next `CreateThread`. Empty
-    /// means "inherit pod default"; non-empty replaces the default
-    /// list exactly. Each entry carries an editable string buffer for
+    /// is interpreted through `picker_host_env_mode`: inherit ignores
+    /// this vec, none sends an explicit empty override, custom sends
+    /// the vec exactly. Each entry carries an editable string buffer for
     /// the workspace_root override — empty draft falls through to the
     /// scheduler's first-RW-path default at compose time, non-empty
     /// promotes to `Some(PathBuf::from(draft))` in
     /// `build_creation_request`.
+    picker_host_env_mode: BindingListMode,
     picker_host_envs: Vec<PickerHostEnv>,
     picker_host_envs_open: bool,
     /// Name of the host-env chip whose inline workspace_root editor is
@@ -1745,10 +1748,31 @@ pub struct ChatApp {
     /// the body of another chip swaps the open editor. Cleared on pod
     /// change (chip vec gets cleared too).
     picker_host_env_expanded: Option<String>,
-    /// MCP host names picked for the next `CreateThread`. Same
-    /// inherit-vs-replace semantics as `picker_host_envs`.
+    /// MCP host names picked for the next `CreateThread`. Interpreted
+    /// through `picker_mcp_hosts_mode`, mirroring host envs.
+    picker_mcp_hosts_mode: BindingListMode,
     picker_mcp_hosts: Vec<String>,
     picker_mcp_hosts_open: bool,
+    /// Separate, scrollable override surface for the full
+    /// create-time thread-default override set.
+    new_thread_overrides_open: bool,
+    new_thread_max_tokens: Option<u32>,
+    new_thread_max_tokens_buf: String,
+    new_thread_max_turns: Option<u32>,
+    new_thread_max_turns_buf: String,
+    new_thread_system_prompt: Option<SystemPromptChoice>,
+    new_thread_system_prompt_file_buf: String,
+    new_thread_system_prompt_text_buf: String,
+    new_thread_compaction: Option<whisper_agent_protocol::CompactionConfigOverride>,
+    new_thread_compaction_token_threshold_buf: String,
+    new_thread_autoquery: Option<whisper_agent_protocol::KnowledgeAutoqueryConfigOverride>,
+    new_thread_autoquery_top_k_buf: String,
+    new_thread_autoquery_min_score_buf: String,
+    new_thread_autoquery_max_query_chars_buf: String,
+    new_thread_autoquery_snippet_chars_buf: String,
+    new_thread_caps: Option<ThreadDefaultCaps>,
+    new_thread_tool_surface: Option<ToolSurface>,
+    new_thread_tool_surface_named_buf: String,
     /// Full `PodConfig` cache, populated lazily via `GetPod` —
     /// `PodSummary` (what `PodList` carries) doesn't have the
     /// `allow.host_env` / `allow.mcp_hosts` tables the new-thread
@@ -1998,6 +2022,13 @@ pub(crate) struct BehaviorEditorSheetState {
     /// Thread-tab `max_turns` override numeric buffer. Same shape
     /// as [`Self::thread_max_tokens_buf`].
     pub(crate) thread_max_turns_buf: String,
+    /// Thread-tab host-env binding mode. `None` means derive from
+    /// `working_config`; `Some(Custom)` lets the UI preserve an
+    /// intentionally empty custom list rather than displaying it as
+    /// explicit None.
+    thread_host_env_mode: Option<BindingListMode>,
+    /// Same transient mode state for shared MCP host bindings.
+    thread_mcp_hosts_mode: Option<BindingListMode>,
     /// Retention-tab `days` numeric buffer. Meaningful only when
     /// `cfg.on_completion` is `ArchiveAfterDays` or `DeleteAfterDays`;
     /// preserved across kind switches so toggling Keep ↔ Archive
@@ -2216,6 +2247,8 @@ impl BehaviorEditorSheetState {
             open_picker: None,
             thread_max_tokens_buf: String::new(),
             thread_max_turns_buf: String::new(),
+            thread_host_env_mode: None,
+            thread_mcp_hosts_mode: None,
             retention_days_buf: "30".into(),
             working_system_prompt: None,
             error: None,
@@ -2270,6 +2303,7 @@ impl BehaviorEditorSheetState {
         self.working_prompt = snapshot.prompt;
         self.working_system_prompt = snapshot.system_prompt;
         self.sync_thread_buffers_from_config();
+        self.sync_thread_binding_modes_from_config();
         self.sync_retention_buffer_from_config();
         // Seed the Raw tab's buffer from the structured config so a
         // first-time visit to Raw shows the snapshot's TOML rather
@@ -2323,6 +2357,7 @@ impl BehaviorEditorSheetState {
                         }
                     }
                     self.sync_thread_buffers_from_config();
+                    self.sync_thread_binding_modes_from_config();
                     self.sync_retention_buffer_from_config();
                 }
                 Err(e) => {
@@ -2382,6 +2417,16 @@ impl BehaviorEditorSheetState {
         }
     }
 
+    /// Reset transient binding-mode UI state after a fresh hydrate
+    /// or Raw → structured parse. During live editing these fields
+    /// preserve "Custom with no selected items" distinctly from
+    /// explicit None; after a config round-trip, the wire value is
+    /// authoritative again.
+    fn sync_thread_binding_modes_from_config(&mut self) {
+        self.thread_host_env_mode = None;
+        self.thread_mcp_hosts_mode = None;
+    }
+
     /// Resolve the form state into a `TriggerSpec` for `UpdateBehavior`.
     /// Each variant pulls from the live editor buffers — for kinds the
     /// user hasn't touched, the buffers were seeded from the snapshot
@@ -2433,9 +2478,9 @@ pub(crate) struct ForkModalState {
 }
 
 /// Form state for the pod editor sheet. Multi-tab surface mirroring
-/// the egui sibling: `Allow` (identity + allowed resources + caps),
-/// `Defaults` (thread-defaults pre-fill), `Limits` (pod-level caps),
-/// `RawToml` (always-available escape hatch). On hydrate the
+/// the egui sibling: `General` (identity + pod-wide controls),
+/// `Allow` (allowed resources + caps), `Defaults` (thread-defaults
+/// pre-fill), `RawToml` (always-available escape hatch). On hydrate the
 /// snapshot's `config` lands as the structured `working_config` and
 /// its `toml_text` becomes the raw buffer; the two are kept in sync
 /// across tab switches by re-serializing or re-parsing as the user
@@ -2528,11 +2573,8 @@ pub(crate) enum PodEditorPicker {
     DefaultsBackend,
     /// `thread_defaults.model` picker (Defaults tab).
     DefaultsModel,
-    /// `allow.tools.default` (Allow / Deny) picker (Defaults tab —
-    /// the gate lives under `[allow]` but its default is a
-    /// thread-default knob in spirit, so the egui sibling parks
-    /// it here).
-    DefaultsToolGate,
+    /// `allow.tools.default` (Allow / Deny) picker.
+    AllowToolGate,
     /// `thread_defaults.caps.pod_modify` selector.
     DefaultsCapsPodModify,
     /// `thread_defaults.caps.dispatch` selector.
@@ -2551,7 +2593,7 @@ impl PodEditorPicker {
             Self::AllowCapsBehaviors => POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
             Self::DefaultsBackend => POD_EDITOR_DEFAULTS_BACKEND_KEY,
             Self::DefaultsModel => POD_EDITOR_DEFAULTS_MODEL_KEY,
-            Self::DefaultsToolGate => POD_EDITOR_DEFAULTS_TOOL_GATE_KEY,
+            Self::AllowToolGate => POD_EDITOR_ALLOW_TOOL_GATE_KEY,
             Self::DefaultsCapsPodModify => POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY,
             Self::DefaultsCapsDispatch => POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY,
             Self::DefaultsCapsBehaviors => POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY,
@@ -2562,36 +2604,36 @@ impl PodEditorPicker {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PodEditorTab {
+    General,
     Allow,
     Defaults,
-    Limits,
     RawToml,
 }
 
 impl PodEditorTab {
     fn label(self) -> &'static str {
         match self {
+            PodEditorTab::General => "General",
             PodEditorTab::Allow => "Allow",
             PodEditorTab::Defaults => "Defaults",
-            PodEditorTab::Limits => "Limits",
             PodEditorTab::RawToml => "Raw",
         }
     }
 
     fn wire_value(self) -> &'static str {
         match self {
+            PodEditorTab::General => "general",
             PodEditorTab::Allow => "allow",
             PodEditorTab::Defaults => "defaults",
-            PodEditorTab::Limits => "limits",
             PodEditorTab::RawToml => "raw",
         }
     }
 
     fn from_wire(value: &str) -> Option<Self> {
         match value {
+            "general" | "limits" => Some(PodEditorTab::General),
             "allow" => Some(PodEditorTab::Allow),
             "defaults" => Some(PodEditorTab::Defaults),
-            "limits" => Some(PodEditorTab::Limits),
             "raw" => Some(PodEditorTab::RawToml),
             _ => None,
         }
@@ -2606,7 +2648,7 @@ impl PodEditorSheetState {
             working_toml: String::new(),
             baseline_toml: String::new(),
             baseline_config: None,
-            tab: PodEditorTab::Allow,
+            tab: PodEditorTab::General,
             raw_dirty: false,
             error: None,
             pending_get: Some(pending_get),
@@ -2808,11 +2850,31 @@ impl ChatApp {
             picker_model_open: false,
             picker_pod: None,
             picker_pod_open: false,
+            picker_host_env_mode: BindingListMode::Inherit,
             picker_host_envs: Vec::new(),
             picker_host_envs_open: false,
             picker_host_env_expanded: None,
+            picker_mcp_hosts_mode: BindingListMode::Inherit,
             picker_mcp_hosts: Vec::new(),
             picker_mcp_hosts_open: false,
+            new_thread_overrides_open: false,
+            new_thread_max_tokens: None,
+            new_thread_max_tokens_buf: String::new(),
+            new_thread_max_turns: None,
+            new_thread_max_turns_buf: String::new(),
+            new_thread_system_prompt: None,
+            new_thread_system_prompt_file_buf: String::new(),
+            new_thread_system_prompt_text_buf: String::new(),
+            new_thread_compaction: None,
+            new_thread_compaction_token_threshold_buf: String::new(),
+            new_thread_autoquery: None,
+            new_thread_autoquery_top_k_buf: String::new(),
+            new_thread_autoquery_min_score_buf: String::new(),
+            new_thread_autoquery_max_query_chars_buf: String::new(),
+            new_thread_autoquery_snippet_chars_buf: String::new(),
+            new_thread_caps: None,
+            new_thread_tool_surface: None,
+            new_thread_tool_surface_named_buf: default_core_tools_text(),
             pod_configs: HashMap::new(),
             pending_pod_config_gets: HashMap::new(),
             pending_new_thread: None,
@@ -3268,6 +3330,13 @@ impl ChatApp {
                     self.picker_backend = None;
                     self.picker_model = None;
                     self.picker_pod = None;
+                    self.picker_host_env_mode = BindingListMode::Inherit;
+                    self.picker_host_envs.clear();
+                    self.picker_host_env_expanded = None;
+                    self.picker_mcp_hosts_mode = BindingListMode::Inherit;
+                    self.picker_mcp_hosts.clear();
+                    self.reset_new_thread_overrides();
+                    self.new_thread_overrides_open = false;
                     self.compose_input.clear();
                 }
                 // Clear the pending-new-thread tracking when the
@@ -5293,6 +5362,9 @@ impl App for ChatApp {
             self.new_thread_error = None;
             return;
         }
+        if self.handle_new_thread_overrides_event(&event) {
+            return;
+        }
 
         // Thread-level action buttons. Each fires its matching wire
         // command for the currently-selected thread; the server's
@@ -5347,6 +5419,35 @@ impl App for ChatApp {
             self.handle_mcp_hosts_pick(action);
             return;
         }
+        if radio::apply_event(
+            &mut self.picker_host_env_mode,
+            &event,
+            PICKER_HOST_ENVS_MODE,
+            BindingListMode::from_wire,
+        ) {
+            if self.picker_host_env_mode != BindingListMode::Custom {
+                self.picker_host_envs_open = false;
+                self.picker_host_env_expanded = None;
+            } else {
+                self.ensure_pod_config_for_picker();
+            }
+            self.new_thread_error = None;
+            return;
+        }
+        if radio::apply_event(
+            &mut self.picker_mcp_hosts_mode,
+            &event,
+            PICKER_MCP_HOSTS_MODE,
+            BindingListMode::from_wire,
+        ) {
+            if self.picker_mcp_hosts_mode != BindingListMode::Custom {
+                self.picker_mcp_hosts_open = false;
+            } else {
+                self.ensure_pod_config_for_picker();
+            }
+            self.new_thread_error = None;
+            return;
+        }
         // Per-chip × removes. Route keys live under
         // `picker:host-envs:remove:<name>` / `picker:mcp-hosts:remove:<name>`.
         // Chip-body click toggles the inline workspace_root editor for
@@ -5360,6 +5461,10 @@ impl App for ChatApp {
                 if self.picker_host_env_expanded.as_deref() == Some(name) {
                     self.picker_host_env_expanded = None;
                 }
+                if self.picker_host_envs.is_empty() {
+                    self.picker_host_env_mode = BindingListMode::None;
+                }
+                self.new_thread_error = None;
                 return;
             }
             if let Some(name) = key.strip_prefix(PICKER_HOST_ENVS_EXPAND_PREFIX) {
@@ -5378,6 +5483,10 @@ impl App for ChatApp {
             }
             if let Some(name) = key.strip_prefix(PICKER_MCP_HOSTS_REMOVE_PREFIX) {
                 self.picker_mcp_hosts.retain(|n| n != name);
+                if self.picker_mcp_hosts.is_empty() {
+                    self.picker_mcp_hosts_mode = BindingListMode::None;
+                }
+                self.new_thread_error = None;
                 return;
             }
         }
@@ -5665,6 +5774,78 @@ fn chat_user_fork_key(msg_index: usize) -> String {
 struct PickerHostEnv {
     name: String,
     workspace_root_draft: String,
+}
+
+/// Explicit inheritance mode for binding lists. The underlying wire
+/// shape is `Option<Vec<_>>`, where `None` inherits and `Some([])`
+/// means "replace with nothing"; surfacing this as a radio choice
+/// keeps "empty because inherited" distinct from "explicitly none."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum BindingListMode {
+    #[default]
+    Inherit,
+    Custom,
+    None,
+}
+
+impl BindingListMode {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Custom => "custom",
+            Self::None => "none",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "inherit" => Some(Self::Inherit),
+            "custom" => Some(Self::Custom),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    fn from_optional_vec(value: Option<&[String]>) -> Self {
+        match value {
+            None => Self::Inherit,
+            Some([]) => Self::None,
+            Some(_) => Self::Custom,
+        }
+    }
+}
+
+fn binding_mode_group(key: &str, mode: BindingListMode) -> El {
+    radio_group(
+        key,
+        &mode.wire_value(),
+        [
+            ("inherit", "Inherit"),
+            ("custom", "Custom"),
+            ("none", "None"),
+        ],
+    )
+}
+
+fn editor_columns(left: El, right: El) -> El {
+    row([left.width(Size::Fill(1.0)), right.width(Size::Fill(1.0))])
+        .gap(tokens::SPACE_6)
+        .align(Align::Stretch)
+        .width(Size::Fill(1.0))
+        .height(Size::Hug)
+}
+
+fn editor_section(title: impl Into<String>, description: impl Into<String>, body: El) -> El {
+    let description = description.into();
+    let mut children = vec![text(title.into()).label().semibold()];
+    if !description.is_empty() {
+        children.push(paragraph(description).muted().small());
+    }
+    children.push(body);
+    column(children)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Hug)
 }
 
 /// Chip for a picked host-env entry — a body button (label = entry
@@ -5963,9 +6144,12 @@ const SIDEBAR_POD_SETTINGS_KEY: &str = "sidebar:pod-settings";
 /// individual constants below).
 const POD_EDITOR_KEY: &str = "pod-editor";
 const POD_EDITOR_TABS_KEY: &str = "pod-editor:tabs";
+/// General-tab field keys.
+const POD_EDITOR_GENERAL_NAME_KEY: &str = "pod-editor:general:name";
+const POD_EDITOR_GENERAL_DESCRIPTION_KEY: &str = "pod-editor:general:description";
+const POD_EDITOR_GENERAL_MAX_CONCURRENT_THREADS_KEY: &str =
+    "pod-editor:general:max-concurrent-threads";
 /// Allow-tab field keys.
-const POD_EDITOR_ALLOW_NAME_KEY: &str = "pod-editor:allow:name";
-const POD_EDITOR_ALLOW_DESCRIPTION_KEY: &str = "pod-editor:allow:description";
 const POD_EDITOR_ALLOW_BACKENDS_KEY: &str = "pod-editor:allow:backends";
 const POD_EDITOR_ALLOW_MCP_HOSTS_KEY: &str = "pod-editor:allow:mcp-hosts";
 const POD_EDITOR_ALLOW_BUCKETS_KEY: &str = "pod-editor:allow:buckets";
@@ -6029,7 +6213,7 @@ const POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY: &str =
     "pod-editor:defaults:autoquery:max-query-chars";
 const POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY: &str =
     "pod-editor:defaults:autoquery:snippet-chars";
-const POD_EDITOR_DEFAULTS_TOOL_GATE_KEY: &str = "pod-editor:defaults:tool-gate";
+const POD_EDITOR_ALLOW_TOOL_GATE_KEY: &str = "pod-editor:allow:tool-gate";
 const POD_EDITOR_DEFAULTS_HOST_ENV_KEY: &str = "pod-editor:defaults:host-env";
 /// Defaults-tab tool-surface routed keys. The structured editor for
 /// `thread_defaults.tool_surface` rides directly under the Defaults
@@ -6047,9 +6231,6 @@ const POD_EDITOR_DEFAULTS_CAPS_POD_MODIFY_KEY: &str = "pod-editor:defaults:caps:
 const POD_EDITOR_DEFAULTS_CAPS_DISPATCH_KEY: &str = "pod-editor:defaults:caps:dispatch";
 const POD_EDITOR_DEFAULTS_CAPS_BEHAVIORS_KEY: &str = "pod-editor:defaults:caps:behaviors";
 const POD_EDITOR_DEFAULTS_MCP_HOSTS_KEY: &str = "pod-editor:defaults:mcp-hosts";
-/// Limits-tab field keys.
-const POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY: &str =
-    "pod-editor:limits:max-concurrent-threads";
 /// Raw-tab field key (the only knob in that tab).
 const POD_EDITOR_TOML_KEY: &str = "pod-editor:raw:toml";
 const POD_EDITOR_SAVE_KEY: &str = "pod-editor:save";
@@ -6107,10 +6288,12 @@ const BEHAVIOR_EDITOR_THREAD_BACKEND_KEY: &str = "behavior-editor:thread:backend
 /// matching the pod editor's host_env multi-check shape.
 const BEHAVIOR_EDITOR_THREAD_HOST_ENV_OVERRIDE_KEY: &str =
     "behavior-editor:thread:host-env:override";
+const BEHAVIOR_EDITOR_THREAD_HOST_ENV_MODE_KEY: &str = "behavior-editor:thread:host-env:mode";
 const BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY: &str = "behavior-editor:thread:host-env";
 /// Same shape for `bindings.mcp_hosts`.
 const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY: &str =
     "behavior-editor:thread:mcp-hosts:override";
+const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_MODE_KEY: &str = "behavior-editor:thread:mcp-hosts:mode";
 const BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY: &str = "behavior-editor:thread:mcp-hosts";
 /// Scope-tab routed keys. Each `Option<...>` field on
 /// `BehaviorScope` carries an `_OVERRIDE_KEY` checkbox toggling
@@ -6658,8 +6841,51 @@ const PICKER_POD: &str = "picker:pod";
 /// `CreateThread` rejection above the new-thread form. Click clears
 /// `new_thread_error` without touching anything else.
 const NEW_THREAD_ERROR_DISMISS_KEY: &str = "new-thread:error:dismiss";
+const NEW_THREAD_OVERRIDES_OPEN_KEY: &str = "new-thread:overrides:open";
+const NEW_THREAD_OVERRIDES_CLOSE_KEY: &str = "new-thread:overrides:close";
+const NEW_THREAD_OVERRIDES_RESET_KEY: &str = "new-thread:overrides:reset";
+const NEW_THREAD_MAX_TOKENS_OVERRIDE_KEY: &str = "new-thread:overrides:max-tokens:override";
+const NEW_THREAD_MAX_TOKENS_KEY: &str = "new-thread:overrides:max-tokens";
+const NEW_THREAD_MAX_TURNS_OVERRIDE_KEY: &str = "new-thread:overrides:max-turns:override";
+const NEW_THREAD_MAX_TURNS_KEY: &str = "new-thread:overrides:max-turns";
+const NEW_THREAD_SYSTEM_PROMPT_MODE_KEY: &str = "new-thread:overrides:system-prompt:mode";
+const NEW_THREAD_SYSTEM_PROMPT_FILE_KEY: &str = "new-thread:overrides:system-prompt:file";
+const NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY: &str = "new-thread:overrides:system-prompt:text";
+const NEW_THREAD_COMPACTION_OVERRIDE_KEY: &str = "new-thread:overrides:compaction:override";
+const NEW_THREAD_COMPACTION_ENABLED_KEY: &str = "new-thread:overrides:compaction:enabled";
+const NEW_THREAD_COMPACTION_PROMPT_FILE_KEY: &str = "new-thread:overrides:compaction:prompt-file";
+const NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY: &str =
+    "new-thread:overrides:compaction:summary-regex";
+const NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY: &str =
+    "new-thread:overrides:compaction:token-threshold";
+const NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY: &str =
+    "new-thread:overrides:compaction:continuation-template";
+const NEW_THREAD_AUTOQUERY_OVERRIDE_KEY: &str = "new-thread:overrides:autoquery:override";
+const NEW_THREAD_AUTOQUERY_ENABLED_KEY: &str = "new-thread:overrides:autoquery:enabled";
+const NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY: &str = "new-thread:overrides:autoquery:hot-only";
+const NEW_THREAD_AUTOQUERY_TERMINAL_KEY: &str = "new-thread:overrides:autoquery:terminal";
+const NEW_THREAD_AUTOQUERY_BUCKETS_KEY: &str = "new-thread:overrides:autoquery:buckets";
+const NEW_THREAD_AUTOQUERY_SOURCE_KEY: &str = "new-thread:overrides:autoquery:source";
+const NEW_THREAD_AUTOQUERY_TOP_K_KEY: &str = "new-thread:overrides:autoquery:top-k";
+const NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY: &str = "new-thread:overrides:autoquery:min-score";
+const NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY: &str =
+    "new-thread:overrides:autoquery:max-query-chars";
+const NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY: &str = "new-thread:overrides:autoquery:snippet-chars";
+const NEW_THREAD_CAPS_OVERRIDE_KEY: &str = "new-thread:overrides:caps:override";
+const NEW_THREAD_CAPS_POD_MODIFY_KEY: &str = "new-thread:overrides:caps:pod-modify";
+const NEW_THREAD_CAPS_DISPATCH_KEY: &str = "new-thread:overrides:caps:dispatch";
+const NEW_THREAD_CAPS_BEHAVIORS_KEY: &str = "new-thread:overrides:caps:behaviors";
+const NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY: &str = "new-thread:overrides:tool-surface:override";
+const NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY: &str = "new-thread:overrides:tool-surface:core-tools";
+const NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY: &str =
+    "new-thread:overrides:tool-surface:core-tools:named";
+const NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY: &str =
+    "new-thread:overrides:tool-surface:initial-listing";
+const NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY: &str =
+    "new-thread:overrides:tool-surface:activation-surface";
 
 const PICKER_HOST_ENVS: &str = "picker:host-envs";
+const PICKER_HOST_ENVS_MODE: &str = "picker:host-envs:mode";
 const PICKER_HOST_ENVS_REMOVE_PREFIX: &str = "picker:host-envs:remove:";
 /// Routed-key prefix for the chip body button on each picked host-env
 /// entry. Clicking toggles inline workspace_root editing for that
@@ -6674,6 +6900,7 @@ const PICKER_HOST_ENVS_WSROOT_PREFIX: &str = "picker:host-envs:wsroot:";
 /// the inherit-from-spec behavior.
 const PICKER_HOST_ENVS_DEFAULT_PREFIX: &str = "picker:host-envs:default:";
 const PICKER_MCP_HOSTS: &str = "picker:mcp-hosts";
+const PICKER_MCP_HOSTS_MODE: &str = "picker:mcp-hosts:mode";
 const PICKER_MCP_HOSTS_REMOVE_PREFIX: &str = "picker:mcp-hosts:remove:";
 
 /// Sentinel option value emitted by the "inherit / auto / default"
@@ -6972,27 +7199,23 @@ impl ChatApp {
                         .map(|m| m.id.clone())
                 })
         });
-        let config_override = if model.is_some() {
-            Some(ThreadConfigOverride {
-                model,
-                ..Default::default()
-            })
-        } else {
-            None
+        let config_override = ThreadConfigOverride {
+            model,
+            max_tokens: self.new_thread_max_tokens,
+            max_turns: self.new_thread_max_turns,
+            system_prompt: self.new_thread_system_prompt.clone(),
+            compaction: self.new_thread_compaction.clone(),
+            autoquery: self.new_thread_autoquery.clone(),
+            caps: self.new_thread_caps,
+            tool_surface: self.new_thread_tool_surface.clone(),
         };
-        // Bindings request lights up when the user touched *any* of
-        // the backend / host_envs / mcp_hosts pickers. Each field maps
-        // independently: `None` ⇒ inherit pod default, `Some(empty)`
-        // ⇒ explicit-empty (the wire treats `Some(vec![])` as "no
-        // bindings — bare thread"), `Some(non-empty)` ⇒ explicit
-        // replacement. We only send `Some(empty)` for host_env /
-        // mcp_hosts if the user actually picked something and then
-        // removed it all in the same session; otherwise the field
-        // stays `None` so the pod default still wins.
-        let host_env = if self.picker_host_envs.is_empty() {
-            None
-        } else {
-            Some(
+        // Each binding field maps independently: `None` inherits,
+        // `Some(empty)` explicitly replaces with no bindings, and
+        // `Some(non-empty)` replaces with the selected list.
+        let host_env = match self.picker_host_env_mode {
+            BindingListMode::Inherit => None,
+            BindingListMode::None => Some(Vec::new()),
+            BindingListMode::Custom => Some(
                 self.picker_host_envs
                     .iter()
                     .map(|entry| {
@@ -7007,12 +7230,12 @@ impl ChatApp {
                         }
                     })
                     .collect(),
-            )
+            ),
         };
-        let mcp_hosts = if self.picker_mcp_hosts.is_empty() {
-            None
-        } else {
-            Some(self.picker_mcp_hosts.clone())
+        let mcp_hosts = match self.picker_mcp_hosts_mode {
+            BindingListMode::Inherit => None,
+            BindingListMode::None => Some(Vec::new()),
+            BindingListMode::Custom => Some(self.picker_mcp_hosts.clone()),
         };
         let bindings_request = if backend.is_some() || host_env.is_some() || mcp_hosts.is_some() {
             Some(ThreadBindingsRequest {
@@ -7023,7 +7246,511 @@ impl ChatApp {
         } else {
             None
         };
-        (config_override, bindings_request, self.picker_pod.clone())
+        (
+            (!config_override.is_empty()).then_some(config_override),
+            bindings_request,
+            self.picker_pod.clone(),
+        )
+    }
+
+    fn new_thread_override_count(&self) -> usize {
+        let mut count = 0;
+        count += usize::from(self.picker_backend.is_some());
+        count += usize::from(self.picker_model.is_some());
+        count += usize::from(self.picker_host_env_mode != BindingListMode::Inherit);
+        count += usize::from(self.picker_mcp_hosts_mode != BindingListMode::Inherit);
+        count += usize::from(self.new_thread_max_tokens.is_some());
+        count += usize::from(self.new_thread_max_turns.is_some());
+        count += usize::from(self.new_thread_system_prompt.is_some());
+        count += usize::from(self.new_thread_compaction.is_some());
+        count += usize::from(self.new_thread_autoquery.is_some());
+        count += usize::from(self.new_thread_caps.is_some());
+        count += usize::from(self.new_thread_tool_surface.is_some());
+        count
+    }
+
+    fn reset_new_thread_overrides(&mut self) {
+        self.picker_backend = None;
+        self.picker_backend_open = false;
+        self.picker_model = None;
+        self.picker_model_open = false;
+        self.picker_host_env_mode = BindingListMode::Inherit;
+        self.picker_host_envs.clear();
+        self.picker_host_envs_open = false;
+        self.picker_host_env_expanded = None;
+        self.picker_mcp_hosts_mode = BindingListMode::Inherit;
+        self.picker_mcp_hosts.clear();
+        self.picker_mcp_hosts_open = false;
+        self.new_thread_max_tokens = None;
+        self.new_thread_max_tokens_buf.clear();
+        self.new_thread_max_turns = None;
+        self.new_thread_max_turns_buf.clear();
+        self.new_thread_system_prompt = None;
+        self.new_thread_system_prompt_file_buf.clear();
+        self.new_thread_system_prompt_text_buf.clear();
+        self.new_thread_compaction = None;
+        self.new_thread_compaction_token_threshold_buf.clear();
+        self.new_thread_autoquery = None;
+        self.new_thread_autoquery_top_k_buf.clear();
+        self.new_thread_autoquery_min_score_buf.clear();
+        self.new_thread_autoquery_max_query_chars_buf.clear();
+        self.new_thread_autoquery_snippet_chars_buf.clear();
+        self.new_thread_caps = None;
+        self.new_thread_tool_surface = None;
+        self.new_thread_tool_surface_named_buf = default_core_tools_text();
+        self.new_thread_error = None;
+    }
+
+    fn picker_pod_config(&self) -> Option<&PodConfig> {
+        let pod_id = self.picker_effective_pod_id()?;
+        self.pod_configs.get(pod_id)
+    }
+
+    fn seed_new_thread_compaction_override(&mut self) {
+        let base = self
+            .picker_pod_config()
+            .map(|cfg| cfg.thread_defaults.compaction.clone())
+            .unwrap_or_default();
+        self.new_thread_compaction_token_threshold_buf = base
+            .token_threshold
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        self.new_thread_compaction = Some(whisper_agent_protocol::CompactionConfigOverride {
+            enabled: Some(base.enabled),
+            prompt_file: Some(base.prompt_file),
+            summary_regex: Some(base.summary_regex),
+            token_threshold: Some(base.token_threshold),
+            continuation_template: Some(base.continuation_template),
+        });
+    }
+
+    fn seed_new_thread_autoquery_override(&mut self) {
+        let base = self
+            .picker_pod_config()
+            .map(|cfg| cfg.thread_defaults.autoquery.clone())
+            .unwrap_or_default();
+        self.new_thread_autoquery_top_k_buf = base.top_k.to_string();
+        self.new_thread_autoquery_min_score_buf = format_float_for_input(base.min_rerank_score);
+        self.new_thread_autoquery_max_query_chars_buf = base.max_query_chars.to_string();
+        self.new_thread_autoquery_snippet_chars_buf = base.snippet_chars.to_string();
+        self.new_thread_autoquery =
+            Some(whisper_agent_protocol::KnowledgeAutoqueryConfigOverride {
+                enabled: Some(base.enabled),
+                buckets: Some(base.buckets),
+                hot_only: Some(base.hot_only),
+                top_k: Some(base.top_k),
+                min_rerank_score: Some(base.min_rerank_score),
+                max_query_chars: Some(base.max_query_chars),
+                snippet_chars: Some(base.snippet_chars),
+                query_source: Some(base.query_source),
+                inject_at_terminal: Some(base.inject_at_terminal),
+            });
+    }
+
+    fn seed_new_thread_caps_override(&mut self) {
+        self.new_thread_caps = Some(
+            self.picker_pod_config()
+                .map(|cfg| cfg.thread_defaults.caps)
+                .unwrap_or_default(),
+        );
+    }
+
+    fn seed_new_thread_tool_surface_override(&mut self) {
+        let surface = self
+            .picker_pod_config()
+            .map(|cfg| cfg.thread_defaults.tool_surface.clone())
+            .unwrap_or_default();
+        self.new_thread_tool_surface_named_buf = match &surface.core_tools {
+            CoreTools::All => default_core_tools_text(),
+            CoreTools::Named(list) => list.join("\n"),
+        };
+        self.new_thread_tool_surface = Some(surface);
+    }
+
+    fn handle_new_thread_overrides_event(&mut self, event: &UiEvent) -> bool {
+        if event.is_click_or_activate(NEW_THREAD_OVERRIDES_OPEN_KEY) {
+            self.new_thread_overrides_open = true;
+            self.ensure_pod_config_for_picker();
+            return true;
+        }
+        if event.is_click_or_activate(NEW_THREAD_OVERRIDES_RESET_KEY) {
+            self.reset_new_thread_overrides();
+            return true;
+        }
+        if !self.new_thread_overrides_open {
+            return false;
+        }
+        if event.is_click_or_activate(NEW_THREAD_OVERRIDES_CLOSE_KEY) {
+            self.new_thread_overrides_open = false;
+            return true;
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_MAX_TOKENS_OVERRIDE_KEY) {
+            if self.new_thread_max_tokens.is_some() {
+                self.new_thread_max_tokens = None;
+                self.new_thread_max_tokens_buf.clear();
+            } else {
+                let v = self
+                    .picker_pod_config()
+                    .map(|cfg| cfg.thread_defaults.max_tokens)
+                    .unwrap_or(4096);
+                self.new_thread_max_tokens = Some(v);
+                self.new_thread_max_tokens_buf = v.to_string();
+            }
+            return true;
+        }
+        let max_tokens_opts = NumericInputOpts::default()
+            .min(1.0)
+            .max(200_000.0)
+            .step(50.0);
+        if numeric_input::apply_event(
+            &mut self.new_thread_max_tokens_buf,
+            &mut self.selection,
+            NEW_THREAD_MAX_TOKENS_KEY,
+            &max_tokens_opts,
+            event,
+        ) {
+            if let Ok(v) = self.new_thread_max_tokens_buf.parse::<u32>() {
+                self.new_thread_max_tokens = Some(v.clamp(1, 200_000));
+            }
+            return true;
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_MAX_TURNS_OVERRIDE_KEY) {
+            if self.new_thread_max_turns.is_some() {
+                self.new_thread_max_turns = None;
+                self.new_thread_max_turns_buf.clear();
+            } else {
+                let v = self
+                    .picker_pod_config()
+                    .map(|cfg| cfg.thread_defaults.max_turns)
+                    .unwrap_or(12);
+                self.new_thread_max_turns = Some(v);
+                self.new_thread_max_turns_buf = v.to_string();
+            }
+            return true;
+        }
+        let max_turns_opts = NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0);
+        if numeric_input::apply_event(
+            &mut self.new_thread_max_turns_buf,
+            &mut self.selection,
+            NEW_THREAD_MAX_TURNS_KEY,
+            &max_turns_opts,
+            event,
+        ) {
+            if let Ok(v) = self.new_thread_max_turns_buf.parse::<u32>() {
+                self.new_thread_max_turns = Some(v.clamp(1, 10_000));
+            }
+            return true;
+        }
+
+        let mut prompt_mode: Option<String> = None;
+        if radio::apply_event(
+            &mut prompt_mode,
+            event,
+            NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
+            |raw| Some(Some(raw.to_string())),
+        ) {
+            match prompt_mode.as_deref() {
+                Some("inherit") => self.new_thread_system_prompt = None,
+                Some("file") => {
+                    let name = if self.new_thread_system_prompt_file_buf.is_empty() {
+                        self.picker_pod_config()
+                            .map(|cfg| cfg.thread_defaults.system_prompt_file.clone())
+                            .unwrap_or_else(|| "system_prompt.md".to_string())
+                    } else {
+                        self.new_thread_system_prompt_file_buf.clone()
+                    };
+                    self.new_thread_system_prompt_file_buf = name.clone();
+                    self.new_thread_system_prompt = Some(SystemPromptChoice::File { name });
+                }
+                Some("text") => {
+                    let text = self.new_thread_system_prompt_text_buf.clone();
+                    self.new_thread_system_prompt = Some(SystemPromptChoice::Text { text });
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if event.target_key() == Some(NEW_THREAD_SYSTEM_PROMPT_FILE_KEY) {
+            text_input::apply_event(
+                &mut self.new_thread_system_prompt_file_buf,
+                &mut self.selection,
+                NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
+                event,
+            );
+            self.new_thread_system_prompt = Some(SystemPromptChoice::File {
+                name: self.new_thread_system_prompt_file_buf.clone(),
+            });
+            return true;
+        }
+        if event.target_key() == Some(NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY) {
+            text_area::apply_event(
+                &mut self.new_thread_system_prompt_text_buf,
+                &mut self.selection,
+                NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
+                event,
+            );
+            self.new_thread_system_prompt = Some(SystemPromptChoice::Text {
+                text: self.new_thread_system_prompt_text_buf.clone(),
+            });
+            return true;
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_COMPACTION_OVERRIDE_KEY) {
+            if self.new_thread_compaction.is_some() {
+                self.new_thread_compaction = None;
+            } else {
+                self.seed_new_thread_compaction_override();
+            }
+            return true;
+        }
+        if let Some(compaction) = self.new_thread_compaction.as_mut() {
+            if event.is_click_or_activate(NEW_THREAD_COMPACTION_ENABLED_KEY) {
+                let current = compaction.enabled.unwrap_or(false);
+                compaction.enabled = Some(!current);
+                return true;
+            }
+            if event.target_key() == Some(NEW_THREAD_COMPACTION_PROMPT_FILE_KEY) {
+                let mut buf = compaction.prompt_file.clone().unwrap_or_default();
+                text_input::apply_event(
+                    &mut buf,
+                    &mut self.selection,
+                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
+                    event,
+                );
+                compaction.prompt_file = Some(buf);
+                return true;
+            }
+            if event.target_key() == Some(NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY) {
+                let mut buf = compaction.summary_regex.clone().unwrap_or_default();
+                text_input::apply_event(
+                    &mut buf,
+                    &mut self.selection,
+                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
+                    event,
+                );
+                compaction.summary_regex = Some(buf);
+                return true;
+            }
+            let threshold_opts = NumericInputOpts::default()
+                .min(0.0)
+                .max(1_000_000.0)
+                .step(1000.0);
+            if numeric_input::apply_event(
+                &mut self.new_thread_compaction_token_threshold_buf,
+                &mut self.selection,
+                NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
+                &threshold_opts,
+                event,
+            ) {
+                compaction.token_threshold = if self
+                    .new_thread_compaction_token_threshold_buf
+                    .trim()
+                    .is_empty()
+                {
+                    Some(None)
+                } else {
+                    self.new_thread_compaction_token_threshold_buf
+                        .parse::<u32>()
+                        .ok()
+                        .map(|v| Some(Some(v.min(1_000_000))))
+                        .unwrap_or(compaction.token_threshold)
+                };
+                return true;
+            }
+            if event.target_key() == Some(NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY) {
+                let mut buf = compaction.continuation_template.clone().unwrap_or_default();
+                text_area::apply_event(
+                    &mut buf,
+                    &mut self.selection,
+                    NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
+                    event,
+                );
+                compaction.continuation_template = Some(buf);
+                return true;
+            }
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_OVERRIDE_KEY) {
+            if self.new_thread_autoquery.is_some() {
+                self.new_thread_autoquery = None;
+            } else {
+                self.seed_new_thread_autoquery_override();
+            }
+            return true;
+        }
+        if let Some(autoquery) = self.new_thread_autoquery.as_mut() {
+            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_ENABLED_KEY) {
+                autoquery.enabled = Some(!autoquery.enabled.unwrap_or(false));
+                return true;
+            }
+            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY) {
+                autoquery.hot_only = Some(!autoquery.hot_only.unwrap_or(true));
+                return true;
+            }
+            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_TERMINAL_KEY) {
+                autoquery.inject_at_terminal = Some(!autoquery.inject_at_terminal.unwrap_or(false));
+                return true;
+            }
+            let buckets = autoquery.buckets.get_or_insert_with(Vec::new);
+            if apply_checkbox_list_to_vec(buckets, event, NEW_THREAD_AUTOQUERY_BUCKETS_KEY) {
+                return true;
+            }
+            let mut source_pick = autoquery.query_source;
+            if radio::apply_event(
+                &mut source_pick,
+                event,
+                NEW_THREAD_AUTOQUERY_SOURCE_KEY,
+                |raw| autoquery_source_from_wire(raw).map(Some),
+            ) {
+                autoquery.query_source = source_pick;
+                return true;
+            }
+            let top_k_opts = NumericInputOpts::default().min(0.0).max(20.0).step(1.0);
+            if numeric_input::apply_event(
+                &mut self.new_thread_autoquery_top_k_buf,
+                &mut self.selection,
+                NEW_THREAD_AUTOQUERY_TOP_K_KEY,
+                &top_k_opts,
+                event,
+            ) {
+                if let Ok(v) = self.new_thread_autoquery_top_k_buf.parse::<u32>() {
+                    autoquery.top_k = Some(v.min(20));
+                }
+                return true;
+            }
+            let score_opts = NumericInputOpts::default()
+                .min(-100.0)
+                .max(100.0)
+                .step(0.05);
+            if numeric_input::apply_event(
+                &mut self.new_thread_autoquery_min_score_buf,
+                &mut self.selection,
+                NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
+                &score_opts,
+                event,
+            ) {
+                if let Ok(v) = self.new_thread_autoquery_min_score_buf.parse::<f32>() {
+                    autoquery.min_rerank_score = Some(v.clamp(-100.0, 100.0));
+                }
+                return true;
+            }
+            let chars_opts = NumericInputOpts::default()
+                .min(0.0)
+                .max(50_000.0)
+                .step(250.0);
+            if numeric_input::apply_event(
+                &mut self.new_thread_autoquery_max_query_chars_buf,
+                &mut self.selection,
+                NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
+                &chars_opts,
+                event,
+            ) {
+                if let Ok(v) = self.new_thread_autoquery_max_query_chars_buf.parse::<u32>() {
+                    autoquery.max_query_chars = Some(v.min(50_000));
+                }
+                return true;
+            }
+            let snippet_opts = NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0);
+            if numeric_input::apply_event(
+                &mut self.new_thread_autoquery_snippet_chars_buf,
+                &mut self.selection,
+                NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
+                &snippet_opts,
+                event,
+            ) {
+                if let Ok(v) = self.new_thread_autoquery_snippet_chars_buf.parse::<u32>() {
+                    autoquery.snippet_chars = Some(v.min(5_000));
+                }
+                return true;
+            }
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_CAPS_OVERRIDE_KEY) {
+            if self.new_thread_caps.is_some() {
+                self.new_thread_caps = None;
+            } else {
+                self.seed_new_thread_caps_override();
+            }
+            return true;
+        }
+        if let Some(caps) = self.new_thread_caps.as_mut() {
+            if radio::apply_event(
+                &mut caps.pod_modify,
+                event,
+                NEW_THREAD_CAPS_POD_MODIFY_KEY,
+                pod_modify_cap_from_wire,
+            ) || radio::apply_event(
+                &mut caps.dispatch,
+                event,
+                NEW_THREAD_CAPS_DISPATCH_KEY,
+                dispatch_cap_from_wire,
+            ) || radio::apply_event(
+                &mut caps.behaviors,
+                event,
+                NEW_THREAD_CAPS_BEHAVIORS_KEY,
+                behaviors_cap_from_wire,
+            ) {
+                return true;
+            }
+        }
+
+        if event.is_click_or_activate(NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY) {
+            if self.new_thread_tool_surface.is_some() {
+                self.new_thread_tool_surface = None;
+            } else {
+                self.seed_new_thread_tool_surface_override();
+            }
+            return true;
+        }
+        if let Some(surface) = self.new_thread_tool_surface.as_mut() {
+            let mut core_tools_pick: Option<String> = None;
+            if radio::apply_event(
+                &mut core_tools_pick,
+                event,
+                NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
+                |raw| Some(Some(raw.to_string())),
+            ) {
+                if let Some(pick) = core_tools_pick.as_deref() {
+                    surface.core_tools = match pick {
+                        "all" => CoreTools::All,
+                        "named" => CoreTools::Named(parse_core_tools_named(
+                            &self.new_thread_tool_surface_named_buf,
+                        )),
+                        _ => surface.core_tools.clone(),
+                    };
+                }
+                return true;
+            }
+            if event.target_key() == Some(NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY) {
+                text_area::apply_event(
+                    &mut self.new_thread_tool_surface_named_buf,
+                    &mut self.selection,
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
+                    event,
+                );
+                surface.core_tools = CoreTools::Named(parse_core_tools_named(
+                    &self.new_thread_tool_surface_named_buf,
+                ));
+                return true;
+            }
+            if radio::apply_event(
+                &mut surface.initial_listing,
+                event,
+                NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY,
+                initial_listing_from_wire,
+            ) || radio::apply_event(
+                &mut surface.activation_surface,
+                event,
+                NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
+                activation_surface_from_wire,
+            ) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn handle_backend_pick(&mut self, action: SelectAction) {
@@ -7094,8 +7821,10 @@ impl ChatApp {
                 // may no longer be in the new pod's allow list. Clear
                 // both so the user re-picks against the right surface;
                 // partial-validity is too clever for v1.
+                self.picker_host_env_mode = BindingListMode::Inherit;
                 self.picker_host_envs.clear();
                 self.picker_host_env_expanded = None;
+                self.picker_mcp_hosts_mode = BindingListMode::Inherit;
                 self.picker_mcp_hosts.clear();
                 self.ensure_pod_config_for_picker();
             }
@@ -7113,6 +7842,7 @@ impl ChatApp {
     fn handle_host_envs_pick(&mut self, action: SelectAction) {
         match action {
             SelectAction::Toggle => {
+                self.picker_host_env_mode = BindingListMode::Custom;
                 self.close_other_pickers(PICKER_HOST_ENVS);
                 self.picker_host_envs_open = !self.picker_host_envs_open;
                 if self.picker_host_envs_open {
@@ -7123,6 +7853,7 @@ impl ChatApp {
             SelectAction::Pick(value) => {
                 if value != PICKER_INHERIT && !self.picker_host_envs.iter().any(|e| e.name == value)
                 {
+                    self.picker_host_env_mode = BindingListMode::Custom;
                     self.picker_host_envs.push(PickerHostEnv {
                         name: value,
                         workspace_root_draft: String::new(),
@@ -7138,6 +7869,7 @@ impl ChatApp {
     fn handle_mcp_hosts_pick(&mut self, action: SelectAction) {
         match action {
             SelectAction::Toggle => {
+                self.picker_mcp_hosts_mode = BindingListMode::Custom;
                 self.close_other_pickers(PICKER_MCP_HOSTS);
                 self.picker_mcp_hosts_open = !self.picker_mcp_hosts_open;
                 if self.picker_mcp_hosts_open {
@@ -7147,6 +7879,7 @@ impl ChatApp {
             SelectAction::Dismiss => self.picker_mcp_hosts_open = false,
             SelectAction::Pick(value) => {
                 if value != PICKER_INHERIT && !self.picker_mcp_hosts.contains(&value) {
+                    self.picker_mcp_hosts_mode = BindingListMode::Custom;
                     self.picker_mcp_hosts.push(value);
                 }
                 self.picker_mcp_hosts_open = false;
@@ -8460,10 +9193,11 @@ impl ChatApp {
 
     /// New-thread compose form. Rendered in the content pane when no
     /// thread is selected — the equivalent of the egui sibling's
-    /// `composing_new` mode. Three `select_trigger` pickers
-    /// (backend / model / pod) sit above a `text_area` and a "Start"
-    /// button. Open menus are emitted as overlay layers from
-    /// [`popover_layers`] so they paint above the rest of the UI.
+    /// `composing_new` mode. Backend / model / pod remain root-level
+    /// controls; runtime binding overrides live behind Advanced
+    /// settings so the common start path stays compact. Open menus
+    /// are emitted as overlay layers from [`popover_layers`] so they
+    /// paint above the rest of the UI.
     fn new_thread_pane(&self) -> El {
         let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
         let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
@@ -8511,20 +9245,18 @@ impl ChatApp {
             card_header([
                 card_title("Start a new conversation"),
                 card_description(
-                    "Pick a backend, model, and pod, then layer on host-env / MCP \
-                     bindings if the defaults don't fit. Empty pickers fall through \
-                     to the pod's `thread_defaults`.",
+                    "Pick the conversation's main runtime target. Empty backend and \
+                     model pickers fall through to the selected pod defaults.",
                 ),
             ]),
             card_content([form([
                 top_row,
-                self.host_envs_picker_row(),
-                self.mcp_hosts_picker_row(),
+                self.new_thread_overrides_summary_row(),
                 form_item([form_label("Message"), form_control(editor)]),
             ])]),
             card_footer([footer]),
         ])
-        .width(Size::Fixed(900.0));
+        .width(Size::Fixed(980.0));
 
         // Stack the destructive alert above the card when the last
         // submit attempt was rejected by the server. Width matches
@@ -8539,11 +9271,648 @@ impl ChatApp {
         // pane edges on small windows.
         column([column(stack_items)
             .gap(tokens::SPACE_3)
-            .width(Size::Fixed(900.0))])
+            .width(Size::Fixed(980.0))])
         .padding(tokens::SPACE_6)
         .align(Align::Center)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
+    }
+
+    fn new_thread_overrides_summary_row(&self) -> El {
+        let count = self.new_thread_override_count();
+        let summary = if count == 0 {
+            "Using pod thread defaults".to_string()
+        } else {
+            format!(
+                "{count} thread default override{} active",
+                if count == 1 { "" } else { "s" }
+            )
+        };
+        let mut reset = button("Reset").key(NEW_THREAD_OVERRIDES_RESET_KEY).ghost();
+        if count == 0 {
+            reset = reset.disabled();
+        }
+        form_item([
+            form_label("Thread overrides"),
+            form_control(
+                row([
+                    paragraph(summary).muted().small().width(Size::Fill(1.0)),
+                    reset,
+                    button("Edit overrides")
+                        .key(NEW_THREAD_OVERRIDES_OPEN_KEY)
+                        .secondary(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+            ),
+            form_description(
+                "Optional create-time overrides for the selected pod's thread defaults.",
+            ),
+        ])
+    }
+
+    fn render_new_thread_overrides_modal(&self) -> Option<El> {
+        if !self.new_thread_overrides_open {
+            return None;
+        }
+
+        let header = dialog_header([
+            dialog_title("Thread overrides"),
+            dialog_description(
+                "Override the selected pod's thread defaults for the next conversation only.",
+            ),
+        ]);
+
+        let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
+        let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
+
+        let max_tokens_row = self.render_optional_numeric_row(
+            self.new_thread_max_tokens.is_some(),
+            NEW_THREAD_MAX_TOKENS_OVERRIDE_KEY,
+            NEW_THREAD_MAX_TOKENS_KEY,
+            &self.new_thread_max_tokens_buf,
+            "(inherit pod default)",
+            NumericInputOpts::default()
+                .min(1.0)
+                .max(200_000.0)
+                .step(50.0),
+        );
+        let max_turns_row = self.render_optional_numeric_row(
+            self.new_thread_max_turns.is_some(),
+            NEW_THREAD_MAX_TURNS_OVERRIDE_KEY,
+            NEW_THREAD_MAX_TURNS_KEY,
+            &self.new_thread_max_turns_buf,
+            "(inherit pod default)",
+            NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
+        );
+
+        let prompt_mode = match self.new_thread_system_prompt.as_ref() {
+            None => "inherit",
+            Some(SystemPromptChoice::File { .. }) => "file",
+            Some(SystemPromptChoice::Text { .. }) => "text",
+        };
+        let prompt_control: El = match self.new_thread_system_prompt.as_ref() {
+            Some(SystemPromptChoice::File { .. }) => column([
+                radio_group(
+                    NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
+                    &prompt_mode,
+                    [
+                        ("inherit", "Inherit"),
+                        ("file", "Pod file"),
+                        ("text", "Inline text"),
+                    ],
+                ),
+                text_input(
+                    &self.new_thread_system_prompt_file_buf,
+                    &self.selection,
+                    NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
+                ),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0)),
+            Some(SystemPromptChoice::Text { .. }) => column([
+                radio_group(
+                    NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
+                    &prompt_mode,
+                    [
+                        ("inherit", "Inherit"),
+                        ("file", "Pod file"),
+                        ("text", "Inline text"),
+                    ],
+                ),
+                text_area(
+                    &self.new_thread_system_prompt_text_buf,
+                    &self.selection,
+                    NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
+                )
+                .height(Size::Fixed(120.0)),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0)),
+            None => radio_group(
+                NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
+                &prompt_mode,
+                [
+                    ("inherit", "Inherit"),
+                    ("file", "Pod file"),
+                    ("text", "Inline text"),
+                ],
+            ),
+        };
+
+        let execution_section = editor_section(
+            "Execution",
+            "Backend/model selection, system prompt, and loop limits.",
+            form([
+                form_item([
+                    form_label("backend"),
+                    form_control(backend_trigger),
+                    form_description(self.backend_hint()),
+                ]),
+                form_item([
+                    form_label("model"),
+                    form_control(model_trigger),
+                    form_description(self.model_hint()),
+                ]),
+                form_item([
+                    form_label("system prompt"),
+                    form_control(prompt_control),
+                    form_description(
+                        "Inherit the pod prompt, read a different pod file, or seed inline text.",
+                    ),
+                ]),
+                form_item([
+                    form_label("max tokens"),
+                    form_control(max_tokens_row),
+                    form_description("Per-response output cap for this thread."),
+                ]),
+                form_item([
+                    form_label("max turns"),
+                    form_control(max_turns_row),
+                    form_description("Per-cycle assistant-turn cap for this thread."),
+                ]),
+            ]),
+        );
+
+        let bindings_section = editor_section(
+            "Runtime Bindings",
+            "Override host-env and shared MCP sessions for this thread.",
+            form([self.host_envs_picker_row(), self.mcp_hosts_picker_row()]),
+        );
+
+        let compaction_section = editor_section(
+            "Compaction",
+            "Optional per-thread compaction policy override.",
+            self.render_new_thread_compaction_override(),
+        );
+
+        let autoquery_section = editor_section(
+            "Knowledge Autoquery",
+            "Optional per-thread retrieval nudge override.",
+            self.render_new_thread_autoquery_override(),
+        );
+
+        let caps_section = editor_section(
+            "Capability Caps",
+            "Override the thread's starting typed caps, bounded by the pod allow ceiling.",
+            self.render_new_thread_caps_override(),
+        );
+        let tool_surface_section = editor_section(
+            "Tool Surface",
+            "Override how this thread presents and discovers tools.",
+            self.render_new_thread_tool_surface_override(),
+        );
+
+        let body = editor_columns(
+            column([execution_section, bindings_section, compaction_section]).gap(tokens::SPACE_5),
+            column([autoquery_section, caps_section, tool_surface_section]).gap(tokens::SPACE_5),
+        );
+
+        let footer = dialog_footer([
+            button("Reset").key(NEW_THREAD_OVERRIDES_RESET_KEY).ghost(),
+            button("Done").key(NEW_THREAD_OVERRIDES_CLOSE_KEY).primary(),
+        ]);
+        let scroll_body = scroll([scroll_gutter_column([body], tokens::SPACE_4)])
+            .key("new-thread:overrides:scroll");
+        let panel = dialog_content([header, scroll_body, footer])
+            .block_pointer()
+            .width(Size::Fixed(1120.0))
+            .height(Size::Fixed(760.0));
+        Some(
+            overlay([scrim(NEW_THREAD_OVERRIDES_CLOSE_KEY), panel])
+                .align(Align::Center)
+                .justify(Justify::Center),
+        )
+    }
+
+    fn render_optional_numeric_row(
+        &self,
+        enabled: bool,
+        override_key: &str,
+        value_key: &str,
+        buf: &str,
+        inherit_label: &str,
+        opts: NumericInputOpts,
+    ) -> El {
+        if enabled {
+            row([
+                numeric_input(buf, &self.selection, value_key, opts),
+                button("Use pod default").key(override_key).ghost(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
+        } else {
+            row([
+                paragraph(inherit_label)
+                    .muted()
+                    .small()
+                    .width(Size::Fill(1.0)),
+                button("Override").key(override_key).secondary(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(Align::Center)
+            .width(Size::Fill(1.0))
+        }
+    }
+
+    fn render_override_activation_row(
+        &self,
+        active: bool,
+        toggle_key: &str,
+        active_label: &str,
+        inherited_label: &str,
+    ) -> El {
+        let label = if active {
+            active_label
+        } else {
+            inherited_label
+        };
+        let action = if active {
+            button("Use pod default").key(toggle_key).ghost()
+        } else {
+            button("Override").key(toggle_key).secondary()
+        };
+        row([
+            paragraph(label).muted().small().width(Size::Fill(1.0)),
+            action,
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0))
+    }
+
+    fn render_override_control_row(
+        &self,
+        active: bool,
+        toggle_key: &str,
+        active_control: El,
+        inherited_label: &str,
+        reset_label: &str,
+        align: Align,
+    ) -> El {
+        if active {
+            row([
+                active_control.width(Size::Fill(1.0)),
+                button(reset_label).key(toggle_key).ghost(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(align)
+            .width(Size::Fill(1.0))
+        } else {
+            row([
+                paragraph(inherited_label)
+                    .muted()
+                    .small()
+                    .width(Size::Fill(1.0)),
+                button("Override").key(toggle_key).secondary(),
+            ])
+            .gap(tokens::SPACE_2)
+            .align(align)
+            .width(Size::Fill(1.0))
+        }
+    }
+
+    fn render_new_thread_compaction_override(&self) -> El {
+        let Some(compaction) = self.new_thread_compaction.as_ref() else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_COMPACTION_OVERRIDE_KEY,
+                "",
+                "Using pod compaction defaults.",
+            );
+        };
+        let token_threshold = numeric_input(
+            &self.new_thread_compaction_token_threshold_buf,
+            &self.selection,
+            NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
+            NumericInputOpts::default()
+                .min(0.0)
+                .max(1_000_000.0)
+                .step(1000.0),
+        );
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_COMPACTION_OVERRIDE_KEY,
+                    "Compaction override active.",
+                    "",
+                )),
+            ]),
+            form_item([
+                form_label("enabled"),
+                form_control(
+                    row([
+                        checkbox(compaction.enabled.unwrap_or(false))
+                            .key(NEW_THREAD_COMPACTION_ENABLED_KEY),
+                        text("enabled").muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                ),
+            ]),
+            form_item([
+                form_label("prompt file"),
+                form_control(text_input(
+                    compaction.prompt_file.as_deref().unwrap_or(""),
+                    &self.selection,
+                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
+                )),
+            ]),
+            form_item([
+                form_label("summary regex"),
+                form_control(text_input(
+                    compaction.summary_regex.as_deref().unwrap_or(""),
+                    &self.selection,
+                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
+                )),
+            ]),
+            form_item([
+                form_label("token threshold"),
+                form_control(token_threshold),
+                form_description("Empty means no threshold override."),
+            ]),
+            form_item([
+                form_label("continuation template"),
+                form_control(
+                    text_area(
+                        compaction.continuation_template.as_deref().unwrap_or(""),
+                        &self.selection,
+                        NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
+                    )
+                    .height(Size::Fixed(80.0)),
+                ),
+            ]),
+        ])
+    }
+
+    fn render_new_thread_autoquery_override(&self) -> El {
+        let Some(autoquery) = self.new_thread_autoquery.as_ref() else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_AUTOQUERY_OVERRIDE_KEY,
+                "",
+                "Using pod autoquery defaults.",
+            );
+        };
+        let buckets = autoquery.buckets.as_deref().unwrap_or(&[]);
+        let bucket_options = self.current_autoquery_bucket_options();
+        let bucket_widget = if bucket_options.is_empty() {
+            paragraph("(no in-scope buckets)").muted().small()
+        } else {
+            checkbox_column(NEW_THREAD_AUTOQUERY_BUCKETS_KEY, buckets, bucket_options)
+        };
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_AUTOQUERY_OVERRIDE_KEY,
+                    "Autoquery override active.",
+                    "",
+                )),
+            ]),
+            form_item([
+                form_label("enabled"),
+                form_control(
+                    row([
+                        checkbox(autoquery.enabled.unwrap_or(false))
+                            .key(NEW_THREAD_AUTOQUERY_ENABLED_KEY),
+                        text("enabled").muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                ),
+            ]),
+            form_item([
+                form_label("hot only"),
+                form_control(
+                    row([
+                        checkbox(autoquery.hot_only.unwrap_or(true))
+                            .key(NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY),
+                        text("hot buckets only").muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                ),
+            ]),
+            form_item([
+                form_label("terminal turns"),
+                form_control(
+                    row([
+                        checkbox(autoquery.inject_at_terminal.unwrap_or(false))
+                            .key(NEW_THREAD_AUTOQUERY_TERMINAL_KEY),
+                        text("inject at terminal turns").muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                ),
+            ]),
+            form_item([
+                form_label("query source"),
+                form_control(radio_group(
+                    NEW_THREAD_AUTOQUERY_SOURCE_KEY,
+                    &autoquery_source_label(
+                        autoquery
+                            .query_source
+                            .unwrap_or(KnowledgeAutoquerySource::default()),
+                    ),
+                    [
+                        ("reasoning_then_text", "Reasoning then text"),
+                        ("text_then_reasoning", "Text then reasoning"),
+                        ("reasoning_and_text", "Reasoning and text"),
+                        ("reasoning_only", "Reasoning only"),
+                        ("text_only", "Text only"),
+                    ],
+                )),
+            ]),
+            form_item([form_label("buckets"), form_control(bucket_widget)]),
+            form_item([
+                form_label("top k"),
+                form_control(numeric_input(
+                    &self.new_thread_autoquery_top_k_buf,
+                    &self.selection,
+                    NEW_THREAD_AUTOQUERY_TOP_K_KEY,
+                    NumericInputOpts::default().min(0.0).max(20.0).step(1.0),
+                )),
+            ]),
+            form_item([
+                form_label("min rerank"),
+                form_control(numeric_input(
+                    &self.new_thread_autoquery_min_score_buf,
+                    &self.selection,
+                    NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
+                    NumericInputOpts::default()
+                        .min(-100.0)
+                        .max(100.0)
+                        .step(0.05),
+                )),
+            ]),
+            form_item([
+                form_label("query chars"),
+                form_control(numeric_input(
+                    &self.new_thread_autoquery_max_query_chars_buf,
+                    &self.selection,
+                    NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
+                    NumericInputOpts::default()
+                        .min(0.0)
+                        .max(50_000.0)
+                        .step(250.0),
+                )),
+            ]),
+            form_item([
+                form_label("snippet chars"),
+                form_control(numeric_input(
+                    &self.new_thread_autoquery_snippet_chars_buf,
+                    &self.selection,
+                    NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
+                    NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
+                )),
+            ]),
+        ])
+    }
+
+    fn render_new_thread_caps_override(&self) -> El {
+        let Some(caps) = self.new_thread_caps else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_CAPS_OVERRIDE_KEY,
+                "",
+                "Using pod starting caps.",
+            );
+        };
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_CAPS_OVERRIDE_KEY,
+                    "Capability cap override active.",
+                    "",
+                )),
+            ]),
+            form_item([
+                form_label("pod_modify"),
+                form_control(radio_group(
+                    NEW_THREAD_CAPS_POD_MODIFY_KEY,
+                    &pod_modify_cap_label(caps.pod_modify),
+                    [
+                        ("none", "None"),
+                        ("memories", "Memories"),
+                        ("content", "Content"),
+                        ("modify_allow", "Modify allow"),
+                    ],
+                )),
+            ]),
+            form_item([
+                form_label("dispatch"),
+                form_control(radio_group(
+                    NEW_THREAD_CAPS_DISPATCH_KEY,
+                    &dispatch_cap_label(caps.dispatch),
+                    [("none", "None"), ("within_scope", "Within scope")],
+                )),
+            ]),
+            form_item([
+                form_label("behaviors"),
+                form_control(radio_group(
+                    NEW_THREAD_CAPS_BEHAVIORS_KEY,
+                    &behaviors_cap_label(caps.behaviors),
+                    [
+                        ("none", "None"),
+                        ("read", "Read"),
+                        ("author_narrower", "Author narrower"),
+                        ("author_any", "Author any"),
+                    ],
+                )),
+            ]),
+        ])
+    }
+
+    fn render_new_thread_tool_surface_override(&self) -> El {
+        let Some(surface) = self.new_thread_tool_surface.as_ref() else {
+            return self.render_override_activation_row(
+                false,
+                NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY,
+                "",
+                "Using pod tool surface.",
+            );
+        };
+        let is_all = matches!(surface.core_tools, CoreTools::All);
+        let core_tools = if is_all {
+            column([
+                radio_group(
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
+                    &"all",
+                    [
+                        ("all", "All admissible tools"),
+                        ("named", "Only named tools"),
+                    ],
+                ),
+                paragraph("Every admitted tool is sent with its full description.")
+                    .muted()
+                    .small(),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+        } else {
+            column([
+                radio_group(
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
+                    &"named",
+                    [
+                        ("all", "All admissible tools"),
+                        ("named", "Only named tools"),
+                    ],
+                ),
+                text_area(
+                    &self.new_thread_tool_surface_named_buf,
+                    &self.selection,
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
+                )
+                .height(Size::Fixed(84.0))
+                .mono(),
+            ])
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0))
+        };
+        form([
+            form_item([
+                form_label("override"),
+                form_control(self.render_override_activation_row(
+                    true,
+                    NEW_THREAD_TOOL_SURFACE_OVERRIDE_KEY,
+                    "Tool surface override active.",
+                    "",
+                )),
+            ]),
+            form_item([form_label("core tools"), form_control(core_tools)]),
+            form_item([
+                form_label("initial listing"),
+                form_control(radio_group(
+                    NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY,
+                    &initial_listing_label(surface.initial_listing),
+                    [
+                        ("none", "None"),
+                        ("all_names", "All names"),
+                        ("core_only", "Core only + counts"),
+                    ],
+                )),
+            ]),
+            form_item([
+                form_label("activation"),
+                form_control(radio_group(
+                    NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
+                    &activation_surface_label(surface.activation_surface),
+                    [
+                        ("announce", "Announce names"),
+                        ("inject_schema", "Inject schemas"),
+                    ],
+                )),
+            ]),
+        ])
     }
 
     /// Destructive alert rendered above the new-thread card when a
@@ -8605,19 +9974,15 @@ impl ChatApp {
     /// "Default" reset button. The hint surfaces the inherit vs.
     /// replace semantics so users don't have to read the docs.
     fn host_envs_picker_row(&self) -> El {
-        let label = if self.picker_host_envs.is_empty() {
-            "Inherit pod default".to_string()
-        } else {
-            format!(
-                "{} env{} selected",
-                self.picker_host_envs.len(),
-                if self.picker_host_envs.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-            )
-        };
+        let label = format!(
+            "{} env{} selected",
+            self.picker_host_envs.len(),
+            if self.picker_host_envs.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
         let trigger = select_trigger(PICKER_HOST_ENVS, label);
 
         let mut chips: Vec<El> = self
@@ -8636,9 +10001,27 @@ impl ChatApp {
         chips.push(trigger);
         let chip_row = row(chips).gap(tokens::SPACE_2).align(Align::Center);
 
-        let mut control_children: Vec<El> = vec![chip_row];
-        if let Some(editor) = self.host_envs_workspace_root_editor() {
-            control_children.push(editor);
+        let mut control_children: Vec<El> = vec![binding_mode_group(
+            PICKER_HOST_ENVS_MODE,
+            self.picker_host_env_mode,
+        )];
+        match self.picker_host_env_mode {
+            BindingListMode::Inherit => {
+                control_children.push(paragraph(self.host_envs_inherited_hint()).muted().small());
+            }
+            BindingListMode::None => {
+                control_children.push(
+                    paragraph("No host-env MCP sessions will be bound for this thread.")
+                        .muted()
+                        .small(),
+                );
+            }
+            BindingListMode::Custom => {
+                control_children.push(chip_row);
+                if let Some(editor) = self.host_envs_workspace_root_editor() {
+                    control_children.push(editor);
+                }
+            }
         }
         let control = column(control_children).gap(tokens::SPACE_2);
 
@@ -8700,19 +10083,15 @@ impl ChatApp {
     /// [`host_envs_picker_row`] but reads from the pod's
     /// `allow.mcp_hosts` rather than `allow.host_env`.
     fn mcp_hosts_picker_row(&self) -> El {
-        let label = if self.picker_mcp_hosts.is_empty() {
-            "Inherit pod default".to_string()
-        } else {
-            format!(
-                "{} host{} selected",
-                self.picker_mcp_hosts.len(),
-                if self.picker_mcp_hosts.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                },
-            )
-        };
+        let label = format!(
+            "{} host{} selected",
+            self.picker_mcp_hosts.len(),
+            if self.picker_mcp_hosts.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
         let trigger = select_trigger(PICKER_MCP_HOSTS, label);
 
         let mut chips: Vec<El> = self
@@ -8723,11 +10102,55 @@ impl ChatApp {
         chips.push(trigger);
         let chip_row = row(chips).gap(tokens::SPACE_2).align(Align::Center);
 
+        let mut control_children: Vec<El> = vec![binding_mode_group(
+            PICKER_MCP_HOSTS_MODE,
+            self.picker_mcp_hosts_mode,
+        )];
+        match self.picker_mcp_hosts_mode {
+            BindingListMode::Inherit => {
+                control_children.push(paragraph(self.mcp_hosts_inherited_hint()).muted().small());
+            }
+            BindingListMode::None => {
+                control_children.push(
+                    paragraph("No shared MCP hosts will be bound for this thread.")
+                        .muted()
+                        .small(),
+                );
+            }
+            BindingListMode::Custom => control_children.push(chip_row),
+        }
+
         form_item([
             form_label("MCP hosts"),
-            form_control(chip_row),
+            form_control(column(control_children).gap(tokens::SPACE_2)),
             form_description(self.mcp_hosts_hint()),
         ])
+    }
+
+    fn host_envs_inherited_hint(&self) -> String {
+        let Some(pod_id) = self.picker_effective_pod_id() else {
+            return "Inherits once pods load.".to_string();
+        };
+        match self.pod_configs.get(pod_id) {
+            None => "Inherits the pod default host envs; fetching pod config…".to_string(),
+            Some(cfg) if cfg.thread_defaults.host_env.is_empty() => {
+                "Inherits no host envs from this pod.".to_string()
+            }
+            Some(cfg) => format!("Inherits: {}", cfg.thread_defaults.host_env.join(", ")),
+        }
+    }
+
+    fn mcp_hosts_inherited_hint(&self) -> String {
+        let Some(pod_id) = self.picker_effective_pod_id() else {
+            return "Inherits once pods load.".to_string();
+        };
+        match self.pod_configs.get(pod_id) {
+            None => "Inherits the pod default shared MCP hosts; fetching pod config…".to_string(),
+            Some(cfg) if cfg.thread_defaults.mcp_hosts.is_empty() => {
+                "Inherits no shared MCP hosts from this pod.".to_string()
+            }
+            Some(cfg) => format!("Inherits: {}", cfg.thread_defaults.mcp_hosts.join(", ")),
+        }
     }
 
     fn host_envs_hint(&self) -> String {
@@ -8750,6 +10173,14 @@ impl ChatApp {
                 if allow.mcp_hosts.len() == 1 { "" } else { "s" },
             ),
         }
+    }
+
+    fn current_autoquery_bucket_options(&self) -> Vec<(String, String)> {
+        let Some(cfg) = self.picker_pod_config() else {
+            return Vec::new();
+        };
+        let pod_id = self.picker_effective_pod_id();
+        self.autoquery_bucket_options_for(cfg, pod_id)
     }
 
     fn backend_label(&self) -> String {
@@ -8824,6 +10255,9 @@ impl ChatApp {
     /// modal or fork dialog without reshaping `build`.
     fn popover_layers(&self) -> Vec<Option<El>> {
         let mut out: Vec<Option<El>> = Vec::new();
+        if let Some(modal_el) = self.render_new_thread_overrides_modal() {
+            out.push(Some(modal_el));
+        }
         if self.picker_backend_open {
             out.push(Some(self.backend_menu()));
         }
@@ -9449,6 +10883,55 @@ impl ChatApp {
             return true;
         }
 
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            let mut mode = editor.thread_host_env_mode.unwrap_or_else(|| {
+                BindingListMode::from_optional_vec(cfg.thread.bindings.host_env.as_deref())
+            });
+            if radio::apply_event(
+                &mut mode,
+                event,
+                BEHAVIOR_EDITOR_THREAD_HOST_ENV_MODE_KEY,
+                BindingListMode::from_wire,
+            ) {
+                cfg.thread.bindings.host_env = match mode {
+                    BindingListMode::Inherit => None,
+                    BindingListMode::None => Some(Vec::new()),
+                    BindingListMode::Custom => {
+                        Some(cfg.thread.bindings.host_env.clone().unwrap_or_default())
+                    }
+                };
+                editor.thread_host_env_mode = Some(mode);
+                editor.error = None;
+                return true;
+            }
+        }
+        if let Some(editor) = self.behavior_editor.as_mut()
+            && let Some(cfg) = editor.working_config.as_mut()
+        {
+            let mut mode = editor.thread_mcp_hosts_mode.unwrap_or_else(|| {
+                BindingListMode::from_optional_vec(cfg.thread.bindings.mcp_hosts.as_deref())
+            });
+            if radio::apply_event(
+                &mut mode,
+                event,
+                BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_MODE_KEY,
+                BindingListMode::from_wire,
+            ) {
+                cfg.thread.bindings.mcp_hosts = match mode {
+                    BindingListMode::Inherit => None,
+                    BindingListMode::None => Some(Vec::new()),
+                    BindingListMode::Custom => {
+                        Some(cfg.thread.bindings.mcp_hosts.clone().unwrap_or_default())
+                    }
+                };
+                editor.thread_mcp_hosts_mode = Some(mode);
+                editor.error = None;
+                return true;
+            }
+        }
+
         // host_env / mcp_hosts override checkboxes. Toggling on
         // seeds an empty `Some(vec![])` (the multi-check column
         // populates entries as the user clicks); toggling off
@@ -9462,6 +10945,7 @@ impl ChatApp {
                 } else {
                     Some(Vec::new())
                 };
+                editor.thread_host_env_mode = None;
                 editor.error = None;
             }
             return true;
@@ -9475,6 +10959,7 @@ impl ChatApp {
                 } else {
                     Some(Vec::new())
                 };
+                editor.thread_mcp_hosts_mode = None;
                 editor.error = None;
             }
             return true;
@@ -9490,6 +10975,7 @@ impl ChatApp {
             && let Some(vec) = cfg.thread.bindings.host_env.as_mut()
             && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_THREAD_HOST_ENV_KEY)
         {
+            editor.thread_host_env_mode = Some(BindingListMode::Custom);
             editor.error = None;
             return true;
         }
@@ -9498,6 +10984,7 @@ impl ChatApp {
             && let Some(vec) = cfg.thread.bindings.mcp_hosts.as_mut()
             && apply_checkbox_list_to_vec(vec, event, BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_KEY)
         {
+            editor.thread_mcp_hosts_mode = Some(BindingListMode::Custom);
             editor.error = None;
             return true;
         }
@@ -10490,18 +11977,16 @@ impl ChatApp {
 
         let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
-        // Inline `dialog()` shape so we can override
-        // `dialog_content`'s 420 px stock width: the 7-tab strip and
-        // the Defaults / Thread / Scope rows need substantially more
-        // room. 720 px matches egui's `Window::default_width(720)` and
-        // leaves a comfortable margin on a 1280 px viewport. Height
-        // pinned at 640 px so the inner scroll has a bounded extent;
-        // mirrors egui's `default_height(560)` plus a little headroom
-        // for the larger form_item gaps aetna uses.
+        // These editor surfaces are exhaustive configuration tools,
+        // not quick confirmation dialogs. Size them for a maximized
+        // desktop browser so the tab bodies can breathe while the
+        // inner scroll still has a bounded extent.
+        const EDITOR_W: f32 = 1180.0;
+        const EDITOR_H: f32 = 780.0;
         let panel = dialog_content(children)
             .block_pointer()
-            .width(Size::Fixed(720.0))
-            .height(Size::Fixed(640.0));
+            .width(Size::Fixed(EDITOR_W))
+            .height(Size::Fixed(EDITOR_H));
         let layer = overlay([scrim(format!("{BEHAVIOR_EDITOR_KEY}:dismiss")), panel])
             .align(Align::Center)
             .justify(Justify::Center);
@@ -10796,7 +12281,7 @@ impl ChatApp {
 
         // Model row.
         let model_override = cfg.thread.model.is_some();
-        let model_value: El = if let Some(model) = cfg.thread.model.as_ref() {
+        let model_control: El = if let Some(model) = cfg.thread.model.as_ref() {
             let label = if model.is_empty() {
                 "(none)".to_string()
             } else {
@@ -10804,23 +12289,23 @@ impl ChatApp {
             };
             select_trigger(BEHAVIOR_EDITOR_THREAD_MODEL_KEY, label)
         } else {
-            paragraph("(inherit pod default)").muted().small()
+            paragraph("")
         };
-        let model_row = row([
-            checkbox(model_override).key(BEHAVIOR_EDITOR_THREAD_MODEL_OVERRIDE_KEY),
-            text("override").muted().small(),
-            model_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let model_row = self.render_override_control_row(
+            model_override,
+            BEHAVIOR_EDITOR_THREAD_MODEL_OVERRIDE_KEY,
+            model_control,
+            "Using pod default.",
+            "Use pod default",
+            Align::Center,
+        );
 
         // Numeric override row helper inlined twice — splitting it
         // out into a method would carry a bag of arguments (label,
         // override_key, value_key, buf, opts) and only buy a small
         // dedup, so keep it inline here.
         let max_tokens_override = cfg.thread.max_tokens.is_some();
-        let max_tokens_value: El = if max_tokens_override {
+        let max_tokens_control: El = if max_tokens_override {
             numeric_input(
                 &editor.thread_max_tokens_buf,
                 &self.selection,
@@ -10831,19 +12316,19 @@ impl ChatApp {
                     .step(50.0),
             )
         } else {
-            paragraph("(inherit pod default)").muted().small()
+            paragraph("")
         };
-        let max_tokens_row = row([
-            checkbox(max_tokens_override).key(BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_OVERRIDE_KEY),
-            text("override").muted().small(),
-            max_tokens_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let max_tokens_row = self.render_override_control_row(
+            max_tokens_override,
+            BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_OVERRIDE_KEY,
+            max_tokens_control,
+            "Using pod default.",
+            "Use pod default",
+            Align::Center,
+        );
 
         let max_turns_override = cfg.thread.max_turns.is_some();
-        let max_turns_value: El = if max_turns_override {
+        let max_turns_control: El = if max_turns_override {
             numeric_input(
                 &editor.thread_max_turns_buf,
                 &self.selection,
@@ -10851,16 +12336,16 @@ impl ChatApp {
                 NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
             )
         } else {
-            paragraph("(inherit pod default)").muted().small()
+            paragraph("")
         };
-        let max_turns_row = row([
-            checkbox(max_turns_override).key(BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY),
-            text("override").muted().small(),
-            max_turns_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let max_turns_row = self.render_override_control_row(
+            max_turns_override,
+            BEHAVIOR_EDITOR_THREAD_MAX_TURNS_OVERRIDE_KEY,
+            max_turns_control,
+            "Using pod default.",
+            "Use pod default",
+            Align::Center,
+        );
 
         let backend_hint = format!(
             "Effective backend for the model picker: `{}`. Use the bindings \
@@ -10875,7 +12360,7 @@ impl ChatApp {
 
         // Bindings.backend row (Optional<String>).
         let backend_override = cfg.thread.bindings.backend.is_some();
-        let backend_value: El = if let Some(name) = cfg.thread.bindings.backend.as_ref() {
+        let backend_control: El = if let Some(name) = cfg.thread.bindings.backend.as_ref() {
             let label = if name.is_empty() {
                 "(none)".to_string()
             } else {
@@ -10883,110 +12368,178 @@ impl ChatApp {
             };
             select_trigger(BEHAVIOR_EDITOR_THREAD_BACKEND_KEY, label)
         } else {
-            paragraph("(inherit pod default)").muted().small()
+            paragraph("")
         };
-        let backend_row = row([
-            checkbox(backend_override).key(BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY),
-            text("override").muted().small(),
-            backend_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let backend_row = self.render_override_control_row(
+            backend_override,
+            BEHAVIOR_EDITOR_THREAD_BACKEND_OVERRIDE_KEY,
+            backend_control,
+            "Using pod default.",
+            "Use pod default",
+            Align::Center,
+        );
 
-        // host_env / mcp_hosts override rows. When override is OFF
-        // we render the standard inherit hint; when ON we render a
-        // multi-check column over the pod's allow list. The pod
-        // config may not have landed yet (parallel `GetPod` is in
-        // flight), so an unhydrated state surfaces a "(loading…)"
-        // hint rather than a blank list.
-        let host_env_override = cfg.thread.bindings.host_env.is_some();
-        let host_env_value: El = if !host_env_override {
-            paragraph("(inherit pod default)").muted().small()
-        } else if editor.pending_pod_get.is_some() {
-            paragraph("(loading pod allow list…)").muted().small()
-        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
-            self.render_behavior_editor_thread_host_env_check(cfg, pod_cfg)
-        } else {
-            paragraph("(pod config unavailable)").muted().small()
-        };
-        let host_env_row = row([
-            checkbox(host_env_override).key(BEHAVIOR_EDITOR_THREAD_HOST_ENV_OVERRIDE_KEY),
-            text("override").muted().small(),
-            host_env_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Start)
-        .width(Size::Fill(1.0));
+        let host_env_row = self.render_behavior_editor_thread_host_env_mode(editor, cfg);
+        let mcp_hosts_row = self.render_behavior_editor_thread_mcp_hosts_mode(editor, cfg);
 
-        let mcp_hosts_override = cfg.thread.bindings.mcp_hosts.is_some();
-        let mcp_hosts_value: El = if !mcp_hosts_override {
-            paragraph("(inherit pod default)").muted().small()
-        } else if editor.pending_pod_get.is_some() {
-            paragraph("(loading pod allow list…)").muted().small()
-        } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
-            self.render_behavior_editor_thread_mcp_hosts_check(cfg, pod_cfg)
-        } else {
-            paragraph("(pod config unavailable)").muted().small()
-        };
-        let mcp_hosts_row = row([
-            checkbox(mcp_hosts_override).key(BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_OVERRIDE_KEY),
-            text("override").muted().small(),
-            mcp_hosts_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Start)
-        .width(Size::Fill(1.0));
-
-        form([
-            form_item([
-                form_label("model"),
-                form_control(model_row),
-                form_description(backend_hint),
-            ]),
-            form_item([
-                form_label("max tokens"),
-                form_control(max_tokens_row),
-                form_description(
-                    "Per-response output cap for the spawned thread. Inherits \
+        let model_section = editor_section(
+            "Model And Turn Limits",
+            "Overrides for the spawned thread's model selection and loop budget.",
+            form([
+                form_item([
+                    form_label("model"),
+                    form_control(model_row),
+                    form_description(backend_hint),
+                ]),
+                form_item([
+                    form_label("max tokens"),
+                    form_control(max_tokens_row),
+                    form_description(
+                        "Per-response output cap for the spawned thread. Inherits \
                      `thread_defaults.max_tokens` when off.",
-                ),
-            ]),
-            form_item([
-                form_label("max turns"),
-                form_control(max_turns_row),
-                form_description(
-                    "Per-cycle assistant-turn cap for the spawned thread. \
+                    ),
+                ]),
+                form_item([
+                    form_label("max turns"),
+                    form_control(max_turns_row),
+                    form_description(
+                        "Per-cycle assistant-turn cap for the spawned thread. \
                      Inherits `thread_defaults.max_turns` when off.",
-                ),
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("backend binding"),
-                form_control(backend_row),
-                form_description(
-                    "Server-known backend catalog. The pod's `[allow.backends]` \
+        );
+
+        let bindings_section = editor_section(
+            "Runtime Bindings",
+            "Override the pod-default backend, host-env sessions, and shared MCP hosts.",
+            form([
+                form_item([
+                    form_label("backend binding"),
+                    form_control(backend_row),
+                    form_description(
+                        "Server-known backend catalog. The pod's `[allow.backends]` \
                      is authoritative — picks outside it are rejected on save.",
-                ),
-            ]),
-            form_item([
-                form_label("host_env binding"),
-                form_control(host_env_row),
-                form_description(
-                    "Replace the pod-default host_env list for this behavior's \
+                    ),
+                ]),
+                form_item([
+                    form_label("host_env binding"),
+                    form_control(host_env_row),
+                    form_description(
+                        "Replace the pod-default host_env list for this behavior's \
                      spawned threads. Options come from the pod's \
                      `[allow.host_env]`.",
-                ),
-            ]),
-            form_item([
-                form_label("mcp_hosts binding"),
-                form_control(mcp_hosts_row),
-                form_description(
-                    "Replace the pod-default mcp_hosts list for this behavior's \
+                    ),
+                ]),
+                form_item([
+                    form_label("mcp_hosts binding"),
+                    form_control(mcp_hosts_row),
+                    form_description(
+                        "Replace the pod-default mcp_hosts list for this behavior's \
                      spawned threads. Options come from the pod's \
                      `[allow.mcp_hosts]`.",
-                ),
+                    ),
+                ]),
             ]),
-        ])
+        );
+
+        editor_columns(model_section, bindings_section)
+    }
+
+    fn render_behavior_editor_thread_host_env_mode(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        let mode = editor.thread_host_env_mode.unwrap_or_else(|| {
+            BindingListMode::from_optional_vec(cfg.thread.bindings.host_env.as_deref())
+        });
+        let mut children = vec![binding_mode_group(
+            BEHAVIOR_EDITOR_THREAD_HOST_ENV_MODE_KEY,
+            mode,
+        )];
+        match mode {
+            BindingListMode::Inherit => {
+                let hint = editor
+                    .pod_config
+                    .as_ref()
+                    .map(|pod| {
+                        if pod.thread_defaults.host_env.is_empty() {
+                            "Inherits no host envs from the pod.".to_string()
+                        } else {
+                            format!("Inherits: {}", pod.thread_defaults.host_env.join(", "))
+                        }
+                    })
+                    .unwrap_or_else(|| "Inherits the pod default host envs.".to_string());
+                children.push(paragraph(hint).muted().small());
+            }
+            BindingListMode::None => {
+                children.push(
+                    paragraph("Spawned threads bind no host-env MCP sessions.")
+                        .muted()
+                        .small(),
+                );
+            }
+            BindingListMode::Custom => {
+                let value: El = if editor.pending_pod_get.is_some() {
+                    paragraph("(loading pod allow list…)").muted().small()
+                } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+                    self.render_behavior_editor_thread_host_env_check(cfg, pod_cfg)
+                } else {
+                    paragraph("(pod config unavailable)").muted().small()
+                };
+                children.push(value);
+            }
+        }
+        column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
+    }
+
+    fn render_behavior_editor_thread_mcp_hosts_mode(
+        &self,
+        editor: &BehaviorEditorSheetState,
+        cfg: &BehaviorConfig,
+    ) -> El {
+        let mode = editor.thread_mcp_hosts_mode.unwrap_or_else(|| {
+            BindingListMode::from_optional_vec(cfg.thread.bindings.mcp_hosts.as_deref())
+        });
+        let mut children = vec![binding_mode_group(
+            BEHAVIOR_EDITOR_THREAD_MCP_HOSTS_MODE_KEY,
+            mode,
+        )];
+        match mode {
+            BindingListMode::Inherit => {
+                let hint = editor
+                    .pod_config
+                    .as_ref()
+                    .map(|pod| {
+                        if pod.thread_defaults.mcp_hosts.is_empty() {
+                            "Inherits no shared MCP hosts from the pod.".to_string()
+                        } else {
+                            format!("Inherits: {}", pod.thread_defaults.mcp_hosts.join(", "))
+                        }
+                    })
+                    .unwrap_or_else(|| "Inherits the pod default shared MCP hosts.".to_string());
+                children.push(paragraph(hint).muted().small());
+            }
+            BindingListMode::None => {
+                children.push(
+                    paragraph("Spawned threads bind no shared MCP hosts.")
+                        .muted()
+                        .small(),
+                );
+            }
+            BindingListMode::Custom => {
+                let value: El = if editor.pending_pod_get.is_some() {
+                    paragraph("(loading pod allow list…)").muted().small()
+                } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
+                    self.render_behavior_editor_thread_mcp_hosts_check(cfg, pod_cfg)
+                } else {
+                    paragraph("(pod config unavailable)").muted().small()
+                };
+                children.push(value);
+            }
+        }
+        column(children).gap(tokens::SPACE_2).width(Size::Fill(1.0))
     }
 
     /// Multi-check column over the pod's `allow.host_env` names.
@@ -11086,7 +12639,7 @@ impl ChatApp {
         // override-count text; off ⇒ inherit hint. Per-tool
         // overrides defer to Raw TOML (matches egui).
         let tools_override = cfg.scope.tools.is_some();
-        let tools_value: El = if let Some(map) = cfg.scope.tools.as_ref() {
+        let tools_control: El = if let Some(map) = cfg.scope.tools.as_ref() {
             let trigger = select_trigger(
                 BEHAVIOR_EDITOR_SCOPE_TOOLS_DEFAULT_KEY,
                 disposition_label(map.default),
@@ -11102,16 +12655,16 @@ impl ChatApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0))
         } else {
-            paragraph("(inherit pod allow.tools)").muted().small()
+            paragraph("")
         };
-        let tools_row = row([
-            checkbox(tools_override).key(BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY),
-            text("override").muted().small(),
-            tools_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let tools_row = self.render_override_control_row(
+            tools_override,
+            BEHAVIOR_EDITOR_SCOPE_TOOLS_OVERRIDE_KEY,
+            tools_control,
+            "Using pod tool defaults.",
+            "Use pod defaults",
+            Align::Center,
+        );
 
         // Cap rows: each cap is `Option<Cap>`; override on ⇒
         // select_trigger over the cap's variants; off ⇒ inherit
@@ -11136,7 +12689,7 @@ impl ChatApp {
         // Structured editor lands later (same pattern as the pod
         // editor's Defaults `tool_surface` sub-slice).
         let tool_surface_override = cfg.scope.tool_surface.is_some();
-        let tool_surface_value: El = if tool_surface_override {
+        let tool_surface_control: El = if tool_surface_override {
             paragraph(
                 "(override on — structured editor coming in a follow-up; \
                  use Raw TOML to edit fields)",
@@ -11144,86 +12697,107 @@ impl ChatApp {
             .muted()
             .small()
         } else {
-            paragraph("(inherit pod thread_defaults.tool_surface)")
-                .muted()
-                .small()
+            paragraph("")
         };
-        let tool_surface_row = row([
-            checkbox(tool_surface_override).key(BEHAVIOR_EDITOR_SCOPE_TOOL_SURFACE_OVERRIDE_KEY),
-            text("override").muted().small(),
-            tool_surface_value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0));
+        let tool_surface_row = self.render_override_control_row(
+            tool_surface_override,
+            BEHAVIOR_EDITOR_SCOPE_TOOL_SURFACE_OVERRIDE_KEY,
+            tool_surface_control,
+            "Using pod tool surface.",
+            "Use pod default",
+            Align::Center,
+        );
 
-        form([
-            form_item([
-                form_label("backends"),
-                form_control(backends_row),
-                form_description(
-                    "Restrict the spawned thread to a subset of pod-allowed \
+        let resource_section = editor_section(
+            "Resource Narrowing",
+            "Optional subsets of the pod's allowed runtime resources.",
+            form([
+                form_item([
+                    form_label("backends"),
+                    form_control(backends_row),
+                    form_description(
+                        "Restrict the spawned thread to a subset of pod-allowed \
                      backends. Empty list = none.",
-                ),
-            ]),
-            form_item([
-                form_label("host_envs"),
-                form_control(host_envs_row),
-                form_description(
-                    "Restrict the spawned thread to a subset of pod-allowed \
+                    ),
+                ]),
+                form_item([
+                    form_label("host_envs"),
+                    form_control(host_envs_row),
+                    form_description(
+                        "Restrict the spawned thread to a subset of pod-allowed \
                      host envs.",
-                ),
-            ]),
-            form_item([
-                form_label("mcp_hosts"),
-                form_control(mcp_hosts_row),
-                form_description(
-                    "Restrict the spawned thread to a subset of pod-allowed \
+                    ),
+                ]),
+                form_item([
+                    form_label("mcp_hosts"),
+                    form_control(mcp_hosts_row),
+                    form_description(
+                        "Restrict the spawned thread to a subset of pod-allowed \
                      shared MCP hosts.",
-                ),
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("tools default"),
-                form_control(tools_row),
-                form_description(
-                    "Per-tool default for un-overridden tools. Per-tool \
+        );
+
+        let tool_section = editor_section(
+            "Tools",
+            "Optional tool-default and tool-surface narrowing.",
+            form([
+                form_item([
+                    form_label("tools default"),
+                    form_control(tools_row),
+                    form_description(
+                        "Per-tool default for un-overridden tools. Per-tool \
                      overrides ride through Raw TOML in v1.",
-                ),
+                    ),
+                ]),
+                form_item([
+                    form_label("tool surface"),
+                    form_control(tool_surface_row),
+                    form_description(
+                        "Optional override of the pod's `thread_defaults.\
+                         tool_surface`. Replaces wholesale; this is a \
+                         presentation knob, not a permission gate.",
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("pod_modify"),
-                form_control(pod_modify_row),
-                form_description(
-                    "Cap on pod-directory writes for the spawned thread. \
+        );
+
+        let caps_section = editor_section(
+            "Capability Caps",
+            "Optional per-behavior caps, each no wider than the pod ceiling.",
+            form([
+                form_item([
+                    form_label("pod_modify"),
+                    form_control(pod_modify_row),
+                    form_description(
+                        "Cap on pod-directory writes for the spawned thread. \
                      Inherits the pod ceiling when off.",
-                ),
-            ]),
-            form_item([
-                form_label("dispatch"),
-                form_control(dispatch_row),
-                form_description(
-                    "Cap on `dispatch_thread` calls. `none` blocks even \
+                    ),
+                ]),
+                form_item([
+                    form_label("dispatch"),
+                    form_control(dispatch_row),
+                    form_description(
+                        "Cap on `dispatch_thread` calls. `none` blocks even \
                      children with strictly narrower scopes.",
-                ),
-            ]),
-            form_item([
-                form_label("behaviors"),
-                form_control(behaviors_row),
-                form_description(
-                    "Cap on the behavior-management tools. `read` lets the \
+                    ),
+                ]),
+                form_item([
+                    form_label("behaviors"),
+                    form_control(behaviors_row),
+                    form_description(
+                        "Cap on the behavior-management tools. `read` lets the \
                      thread read configs; `author_*` opens write paths.",
-                ),
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("tool surface"),
-                form_control(tool_surface_row),
-                form_description(
-                    "Optional override of the pod's `thread_defaults.\
-                     tool_surface`. Replaces wholesale; this is a \
-                     presentation knob, not a permission gate.",
-                ),
-            ]),
-        ])
+        );
+
+        editor_columns(
+            column([resource_section, tool_section]).gap(tokens::SPACE_5),
+            caps_section,
+        )
     }
 
     /// Helper for the Scope tab's resource-set rows (backends /
@@ -11242,9 +12816,7 @@ impl ChatApp {
         empty_hint: &str,
     ) -> El {
         let on = selected.is_some();
-        let value: El = if !on {
-            paragraph("(inherit pod ceiling)").muted().small()
-        } else if editor.pending_pod_get.is_some() {
+        let value: El = if editor.pending_pod_get.is_some() {
             paragraph("(loading pod allow list…)").muted().small()
         } else if let Some(pod_cfg) = editor.pod_config.as_ref() {
             let names = pod_options(pod_cfg);
@@ -11258,14 +12830,14 @@ impl ChatApp {
         } else {
             paragraph("(pod config unavailable)").muted().small()
         };
-        row([
-            checkbox(on).key(override_key),
-            text("override").muted().small(),
+        self.render_override_control_row(
+            on,
+            override_key,
             value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Start)
-        .width(Size::Fill(1.0))
+            "Using pod allow ceiling.",
+            "Use pod ceiling",
+            Align::Start,
+        )
     }
 
     /// Helper for the Scope tab's cap rows. Override checkbox + a
@@ -11281,16 +12853,16 @@ impl ChatApp {
         let value: El = if let Some(lbl) = current_label {
             select_trigger(trigger_key, lbl)
         } else {
-            paragraph("(inherit pod ceiling)").muted().small()
+            paragraph("")
         };
-        row([
-            checkbox(on).key(override_key),
-            text("override").muted().small(),
+        self.render_override_control_row(
+            on,
+            override_key,
             value,
-        ])
-        .gap(tokens::SPACE_2)
-        .align(Align::Center)
-        .width(Size::Fill(1.0))
+            "Using pod cap ceiling.",
+            "Use pod ceiling",
+            Align::Center,
+        )
     }
 
     /// Retention tab body. Mirrors the egui sibling's
@@ -11346,8 +12918,8 @@ impl ChatApp {
     }
 
     /// SystemPrompt tab body. Mirrors the egui sibling's
-    /// `render_behavior_editor_system_prompt_tab`. An override
-    /// checkbox flips `cfg.thread.system_prompt` between `None`
+    /// `render_behavior_editor_system_prompt_tab`. The override
+    /// action flips `cfg.thread.system_prompt` between `None`
     /// (inherit pod default) and `Some(File { name = conventional
     /// path })`. When on, a text_area binds to
     /// `working_system_prompt` (File variant) or directly to the
@@ -11362,17 +12934,15 @@ impl ChatApp {
 
         let mut items: Vec<El> = vec![form_item([
             form_label("override"),
-            form_control(
-                row([
-                    checkbox(override_on).key(BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY),
-                    text("override pod default system prompt").muted().small(),
-                ])
-                .gap(tokens::SPACE_2)
-                .align(Align::Center),
-            ),
+            form_control(self.render_override_activation_row(
+                override_on,
+                BEHAVIOR_EDITOR_SYSTEM_PROMPT_OVERRIDE_KEY,
+                "System prompt override active.",
+                "Using pod default system prompt.",
+            )),
             form_description(
-                "Off = inherit the pod's default system prompt. On = use \
-                 the text below as the agent-personality preamble for \
+                "Use an override to replace the pod's default system prompt \
+                 with the text below as the agent-personality preamble for \
                  spawned threads. Stored as a sibling file in the \
                  behavior's directory.",
             ),
@@ -11382,7 +12952,7 @@ impl ChatApp {
             items.push(form_item([
                 form_label("body"),
                 form_control(
-                    paragraph("(inheriting pod default — toggle override on to edit)")
+                    paragraph("(using pod default — add an override to edit)")
                         .muted()
                         .small(),
                 ),
@@ -11571,9 +13141,9 @@ impl ChatApp {
             PodEditorPicker::AllowCapsPodModify,
             PodEditorPicker::AllowCapsDispatch,
             PodEditorPicker::AllowCapsBehaviors,
+            PodEditorPicker::AllowToolGate,
             PodEditorPicker::DefaultsBackend,
             PodEditorPicker::DefaultsModel,
-            PodEditorPicker::DefaultsToolGate,
             PodEditorPicker::DefaultsCapsPodModify,
             PodEditorPicker::DefaultsCapsDispatch,
             PodEditorPicker::DefaultsCapsBehaviors,
@@ -11585,22 +13155,22 @@ impl ChatApp {
             }
         }
 
-        // Allow tab text fields.
-        if event.target_key() == Some(POD_EDITOR_ALLOW_NAME_KEY) {
+        // General tab text fields.
+        if event.target_key() == Some(POD_EDITOR_GENERAL_NAME_KEY) {
             if let Some(editor) = self.pod_editor.as_mut()
                 && let Some(cfg) = editor.working_config.as_mut()
             {
                 text_input::apply_event(
                     &mut cfg.name,
                     &mut self.selection,
-                    POD_EDITOR_ALLOW_NAME_KEY,
+                    POD_EDITOR_GENERAL_NAME_KEY,
                     event,
                 );
                 editor.error = None;
             }
             return true;
         }
-        if event.target_key() == Some(POD_EDITOR_ALLOW_DESCRIPTION_KEY) {
+        if event.target_key() == Some(POD_EDITOR_GENERAL_DESCRIPTION_KEY) {
             if let Some(editor) = self.pod_editor.as_mut()
                 && let Some(cfg) = editor.working_config.as_mut()
             {
@@ -11608,7 +13178,7 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    POD_EDITOR_ALLOW_DESCRIPTION_KEY,
+                    POD_EDITOR_GENERAL_DESCRIPTION_KEY,
                     event,
                 );
                 cfg.description = if buf.trim().is_empty() {
@@ -11942,7 +13512,7 @@ impl ChatApp {
             }
         }
 
-        // Limits tab numeric input — `limits.max_concurrent_threads`.
+        // General tab numeric input — `limits.max_concurrent_threads`.
         // Same buffer-then-parse-back pattern as the Defaults numeric
         // inputs above; see the comment there.
         if let Some(editor) = self.pod_editor.as_mut() {
@@ -11950,7 +13520,7 @@ impl ChatApp {
             if numeric_input::apply_event(
                 &mut editor.max_concurrent_threads_buf,
                 &mut self.selection,
-                POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY,
+                POD_EDITOR_GENERAL_MAX_CONCURRENT_THREADS_KEY,
                 &opts,
                 event,
             ) {
@@ -12488,7 +14058,7 @@ impl ChatApp {
                         PodEditorPicker::DefaultsModel => {
                             cfg.thread_defaults.model = value;
                         }
-                        PodEditorPicker::DefaultsToolGate => {
+                        PodEditorPicker::AllowToolGate => {
                             if let Some(v) = tool_gate_from_wire(&value) {
                                 cfg.allow.tools.default = v;
                             }
@@ -12574,9 +14144,9 @@ impl ChatApp {
     /// Render the pod editor modal if open. Same dialog + `scroll`
     /// shape as the behavior editor; the only meaningful difference
     /// is the body — one big monospace `text_area` over the raw TOML
-    /// instead of a structured form. The Allow tab is structured;
-    /// Defaults / Limits land in follow-up slices. RawToml is the
-    /// always-available escape hatch with the full text_area.
+    /// instead of a structured form. General / Allow / Defaults are
+    /// structured; RawToml is the always-available escape hatch with
+    /// the full text_area.
     fn render_pod_editor_modal(&self) -> Option<El> {
         let editor = self.pod_editor.as_ref()?;
 
@@ -12588,7 +14158,7 @@ impl ChatApp {
         let header = dialog_header([
             dialog_title(format!("Pod settings — {pod_label}")),
             dialog_description(
-                "Edit the pod's allow lists, thread defaults, and limits. \
+                "Edit the pod's identity, allow lists, thread defaults, and limits. \
                  The Raw TOML tab is always available; the structured \
                  tabs round-trip through it on save.",
             ),
@@ -12601,16 +14171,16 @@ impl ChatApp {
             &tab_value,
             [
                 (
+                    PodEditorTab::General.wire_value(),
+                    PodEditorTab::General.label(),
+                ),
+                (
                     PodEditorTab::Allow.wire_value(),
                     PodEditorTab::Allow.label(),
                 ),
                 (
                     PodEditorTab::Defaults.wire_value(),
                     PodEditorTab::Defaults.label(),
-                ),
-                (
-                    PodEditorTab::Limits.wire_value(),
-                    PodEditorTab::Limits.label(),
                 ),
                 (
                     PodEditorTab::RawToml.wire_value(),
@@ -12623,9 +14193,9 @@ impl ChatApp {
             paragraph("loading pod…").muted()
         } else {
             match editor.tab {
+                PodEditorTab::General => self.render_pod_editor_general_tab(editor),
                 PodEditorTab::Allow => self.render_pod_editor_allow_tab(editor),
                 PodEditorTab::Defaults => self.render_pod_editor_defaults_tab(editor),
-                PodEditorTab::Limits => self.render_pod_editor_limits_tab(editor),
                 PodEditorTab::RawToml => {
                     text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
                 }
@@ -12657,15 +14227,15 @@ impl ChatApp {
 
         let children: Vec<El> = vec![header, scroll_body, dialog_footer([cancel, save])];
 
-        // Inline `dialog()` shape so we can override
-        // `dialog_content`'s 420 px stock width: the Allow tab's
-        // multi-checks and the Defaults tab's wide rows need more room.
-        // Sized to match the behavior editor (720 × 640) for a
-        // consistent editor footprint.
+        // Match the behavior editor's desktop-sized footprint: pod
+        // settings are an exhaustive configuration surface, so they
+        // should not feel like a compact confirmation dialog.
+        const EDITOR_W: f32 = 1180.0;
+        const EDITOR_H: f32 = 780.0;
         let panel = dialog_content(children)
             .block_pointer()
-            .width(Size::Fixed(720.0))
-            .height(Size::Fixed(640.0));
+            .width(Size::Fixed(EDITOR_W))
+            .height(Size::Fixed(EDITOR_H));
         let mut layers = vec![scrim(format!("{POD_EDITOR_KEY}:dismiss")), panel];
         if let Some(sub) = editor.host_env_editor.as_ref() {
             layers.push(scrim(HOST_ENV_EDITOR_DISMISS_KEY));
@@ -12677,23 +14247,70 @@ impl ChatApp {
         Some(layer)
     }
 
-    /// Allow tab body. Identity (name + description), allowed
-    /// resources including host-env specs, and cap ceilings. Per-tool
-    /// overrides defer to the Raw TOML tab (the egui sibling does the
-    /// same).
-    fn render_pod_editor_allow_tab(&self, editor: &PodEditorSheetState) -> El {
+    /// General tab body. Pod metadata plus the small set of pod-level
+    /// controls that are neither allow-list nor thread-default
+    /// settings.
+    fn render_pod_editor_general_tab(&self, editor: &PodEditorSheetState) -> El {
         let Some(cfg) = editor.working_config.as_ref() else {
             return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
                 .muted();
         };
 
-        let name_input = text_input(&cfg.name, &self.selection, POD_EDITOR_ALLOW_NAME_KEY);
+        let name_input = text_input(&cfg.name, &self.selection, POD_EDITOR_GENERAL_NAME_KEY);
         let description_input = text_area(
             cfg.description.as_deref().unwrap_or(""),
             &self.selection,
-            POD_EDITOR_ALLOW_DESCRIPTION_KEY,
+            POD_EDITOR_GENERAL_DESCRIPTION_KEY,
         )
         .height(Size::Fixed(64.0));
+        let max_concurrent_widget = numeric_input(
+            &editor.max_concurrent_threads_buf,
+            &self.selection,
+            POD_EDITOR_GENERAL_MAX_CONCURRENT_THREADS_KEY,
+            NumericInputOpts::default().min(1.0).max(1000.0).step(1.0),
+        );
+
+        let identity_section = editor_section(
+            "Identity",
+            "Pod metadata shown in the sidebar and picker surfaces.",
+            form([
+                form_item([
+                    form_label("name"),
+                    form_control(name_input),
+                    form_description("Display name for the pod."),
+                ]),
+                form_item([
+                    form_label("description"),
+                    form_control(description_input),
+                    form_description("Optional — surfaced in the pod list."),
+                ]),
+            ]),
+        );
+
+        let controls_section = editor_section(
+            "General Controls",
+            "Pod-wide controls that shape how this pod can be used.",
+            form([form_item([
+                form_label("max concurrent threads"),
+                form_control(max_concurrent_widget),
+                form_description(
+                    "Ceiling on simultaneously-running threads in this pod. New threads \
+                     above the cap queue rather than dispatch.",
+                ),
+            ])]),
+        );
+
+        editor_columns(identity_section, controls_section)
+    }
+
+    /// Allow tab body. Allowed resources including host-env specs,
+    /// and cap ceilings. Per-tool overrides defer to the Raw TOML tab
+    /// (the egui sibling does the same).
+    fn render_pod_editor_allow_tab(&self, editor: &PodEditorSheetState) -> El {
+        let Some(cfg) = editor.working_config.as_ref() else {
+            return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
+                .muted();
+        };
 
         // Multi-check rows over server-known catalogs.
         let backends_widget = self.render_pod_editor_backends_check(cfg);
@@ -12716,63 +14333,91 @@ impl ChatApp {
             POD_EDITOR_ALLOW_CAPS_BEHAVIORS_KEY,
             behaviors_cap_label(cfg.allow.caps.behaviors),
         );
+        let tool_gate_trigger = select_trigger(
+            POD_EDITOR_ALLOW_TOOL_GATE_KEY,
+            tool_gate_label(cfg.allow.tools.default),
+        );
+        let override_count = cfg.allow.tools.overrides.len();
+        let overrides_label: El = if override_count == 0 {
+            paragraph("(none — edit per-tool overrides via the Raw tab)")
+                .muted()
+                .small()
+        } else {
+            paragraph(format!(
+                "{override_count} override(s) — edit via the Raw tab"
+            ))
+            .muted()
+            .small()
+        };
 
-        form([
-            form_item([
-                form_label("name"),
-                form_control(name_input),
-                form_description("Display name for the pod."),
-            ]),
-            form_item([
-                form_label("description"),
-                form_control(description_input),
-                form_description("Optional — surfaced in the pod list."),
-            ]),
-            form_item([
-                form_label("Allowed backends"),
-                form_control(backends_widget),
-                form_description(
-                    "Threads in this pod may bind to any backend listed here. \
+        let resources_section = editor_section(
+            "Allowed Resources",
+            "Catalog entries the pod is allowed to expose to its threads.",
+            form([
+                form_item([
+                    form_label("Allowed backends"),
+                    form_control(backends_widget),
+                    form_description(
+                        "Threads in this pod may bind to any backend listed here. \
                      `thread_defaults.backend` must be one of these.",
-                ),
-            ]),
-            form_item([
-                form_label("Allowed shared MCP hosts"),
-                form_control(mcp_hosts_widget),
-                form_description(
-                    "Singleton MCP hosts the pod can use. `thread_defaults.mcp_hosts` \
+                    ),
+                ]),
+                form_item([
+                    form_label("Allowed shared MCP hosts"),
+                    form_control(mcp_hosts_widget),
+                    form_description(
+                        "Singleton MCP hosts the pod can use. `thread_defaults.mcp_hosts` \
                      must reference these by name.",
-                ),
-            ]),
-            form_item([
-                form_label("Allowed knowledge buckets"),
-                form_control(buckets_widget),
-                form_description(
-                    "Bucket ids that threads in this pod may query through the \
+                    ),
+                ]),
+                form_item([
+                    form_label("Allowed knowledge buckets"),
+                    form_control(buckets_widget),
+                    form_description(
+                        "Bucket ids that threads in this pod may query through the \
                      `knowledge_query` tool. Empty list = no buckets reachable.",
-                ),
-            ]),
-            form_item([
-                form_label("Host environments"),
-                form_control(host_envs_widget),
-                form_description(
-                    "Named daemon/spec pairs threads in this pod may bind to. \
+                    ),
+                ]),
+                form_item([
+                    form_label("Host environments"),
+                    form_control(host_envs_widget),
+                    form_description(
+                        "Named daemon/spec pairs threads in this pod may bind to. \
                      `provider` names a daemon admitted via `[[auth.daemons]]`.",
-                ),
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("pod_modify ceiling"),
-                form_control(pod_modify_trigger),
+        );
+
+        let permissions_section = editor_section(
+            "Permission Ceiling",
+            "Tool and capability ceilings applied before thread defaults or behavior narrowing.",
+            form([
+                form_item([
+                    form_label("tool gate default"),
+                    form_control(tool_gate_trigger),
+                    form_description(
+                        "Disposition for tools not listed in `allow.tools.overrides`. \
+                     This is part of the pod's permission ceiling.",
+                    ),
+                ]),
+                form_item([form_label("tool overrides"), form_control(overrides_label)]),
+                form_item([
+                    form_label("pod_modify ceiling"),
+                    form_control(pod_modify_trigger),
+                ]),
+                form_item([
+                    form_label("dispatch ceiling"),
+                    form_control(dispatch_trigger),
+                ]),
+                form_item([
+                    form_label("behaviors ceiling"),
+                    form_control(behaviors_trigger),
+                ]),
             ]),
-            form_item([
-                form_label("dispatch ceiling"),
-                form_control(dispatch_trigger),
-            ]),
-            form_item([
-                form_label("behaviors ceiling"),
-                form_control(behaviors_trigger),
-            ]),
-        ])
+        );
+
+        editor_columns(resources_section, permissions_section)
     }
 
     fn render_pod_editor_host_envs(&self, cfg: &PodConfig) -> El {
@@ -12795,7 +14440,7 @@ impl ChatApp {
                     row([
                         column([
                             text(entry.name.clone()).label().bold(),
-                            paragraph(summary).muted().small(),
+                            text(summary).muted().small().ellipsis(),
                         ])
                         .gap(tokens::SPACE_1)
                         .width(Size::Fill(1.0)),
@@ -12918,23 +14563,6 @@ impl ChatApp {
         );
         let autoquery_widget = self.render_pod_editor_defaults_autoquery(editor, cfg);
 
-        let tool_gate_trigger = select_trigger(
-            POD_EDITOR_DEFAULTS_TOOL_GATE_KEY,
-            tool_gate_label(cfg.allow.tools.default),
-        );
-        let override_count = cfg.allow.tools.overrides.len();
-        let overrides_label: El = if override_count == 0 {
-            paragraph("(none — edit per-tool overrides via the Raw tab)")
-                .muted()
-                .small()
-        } else {
-            paragraph(format!(
-                "{override_count} override(s) — edit via the Raw tab"
-            ))
-            .muted()
-            .small()
-        };
-
         let host_env_widget = self.render_pod_editor_defaults_host_env_check(cfg);
         let mcp_hosts_widget = self.render_pod_editor_defaults_mcp_hosts_check(cfg);
 
@@ -12951,64 +14579,69 @@ impl ChatApp {
             behaviors_cap_label(cfg.thread_defaults.caps.behaviors),
         );
 
-        form([
-            form_item([
-                form_label("backend"),
-                form_control(backend_trigger),
-                form_description(
-                    "Default model backend for new threads. Must be in `allow.backends`.",
-                ),
-            ]),
-            form_item([
-                form_label("model"),
-                form_control(model_trigger),
-                form_description(
-                    "Default model id for new threads. The list filters to the picked \
+        let execution_section = editor_section(
+            "Execution Defaults",
+            "Model, system prompt, and loop limits used when a new thread starts.",
+            form([
+                form_item([
+                    form_label("backend"),
+                    form_control(backend_trigger),
+                    form_description(
+                        "Default model backend for new threads. Must be in `allow.backends`.",
+                    ),
+                ]),
+                form_item([
+                    form_label("model"),
+                    form_control(model_trigger),
+                    form_description(
+                        "Default model id for new threads. The list filters to the picked \
                      backend's catalog.",
-                ),
-            ]),
-            form_item([
-                form_label("system prompt file"),
-                form_control(system_prompt_input),
-                form_description(
-                    "Path relative to the pod directory. Empty = no pod-level system \
+                    ),
+                ]),
+                form_item([
+                    form_label("system prompt file"),
+                    form_control(system_prompt_input),
+                    form_description(
+                        "Path relative to the pod directory. Empty = no pod-level system \
                      prompt.",
-                ),
-            ]),
-            form_item([
-                form_label("max tokens"),
-                form_control(max_tokens_widget),
-                form_description(
-                    "Per-response output cap. Threads inherit this and can override \
+                    ),
+                ]),
+                form_item([
+                    form_label("max tokens"),
+                    form_control(max_tokens_widget),
+                    form_description(
+                        "Per-response output cap. Threads inherit this and can override \
                      at create-time.",
-                ),
-            ]),
-            form_item([
-                form_label("max turns"),
-                form_control(max_turns_widget),
-                form_description(
-                    "Per-cycle assistant-turn cap. The thread halts the loop once \
+                    ),
+                ]),
+                form_item([
+                    form_label("max turns"),
+                    form_control(max_turns_widget),
+                    form_description(
+                        "Per-cycle assistant-turn cap. The thread halts the loop once \
                      reached.",
-                ),
+                    ),
+                ]),
             ]),
-            form_item([
+        );
+
+        let retrieval_section = editor_section(
+            "Knowledge Autoquery",
+            "Optional hot-bucket retrieval injected after model sub-turns.",
+            form([form_item([
                 form_label("autoquery"),
                 form_control(autoquery_widget),
                 form_description(
                     "Optional hot-bucket retrieval after model sub-turns. Cold buckets are \
                      skipped so live nudges never stall on index loading.",
                 ),
-            ]),
-            form_item([
-                form_label("tool gate default"),
-                form_control(tool_gate_trigger),
-                form_description(
-                    "Disposition for tools not listed in `allow.tools.overrides`. \
-                     `allow_all` matches the legacy AutoApproveAll preset.",
-                ),
-            ]),
-            form_item([form_label("tool overrides"), form_control(overrides_label)]),
-            form_item([
+            ])]),
+        );
+
+        let tool_surface_section = editor_section(
+            "Tool Surface",
+            "Presentation defaults for tool schemas and discovery prompts.",
+            form([form_item([
                 form_label("tool surface"),
                 form_control(self.render_pod_editor_defaults_tool_surface(editor)),
                 form_description(
@@ -13016,38 +14649,57 @@ impl ChatApp {
                      listing + mid-conversation activation. Behaviors can wholesale-\
                      replace this via `[scope.tool_surface]`.",
                 ),
-            ]),
-            form_item([
-                form_label("default host envs"),
-                form_control(host_env_widget),
-                form_description(
-                    "Names from `allow.host_env` that new threads bind to by default. \
+            ])]),
+        );
+
+        let bindings_section = editor_section(
+            "Default Bindings",
+            "Host-env and shared MCP sessions automatically bound to new threads.",
+            form([
+                form_item([
+                    form_label("default host envs"),
+                    form_control(host_env_widget),
+                    form_description(
+                        "Names from `allow.host_env` that new threads bind to by default. \
                      Empty = threads run with no host-env MCPs (shared MCPs only).",
-                ),
+                    ),
+                ]),
+                form_item([
+                    form_label("default mcp hosts"),
+                    form_control(mcp_hosts_widget),
+                    form_description(
+                        "Subset of `allow.mcp_hosts` new threads subscribe to by default.",
+                    ),
+                ]),
             ]),
-            form_item([
-                form_label("default caps — pod_modify"),
-                form_control(pod_modify_trigger),
-                form_description("Starting `pod_modify` cap on a new thread. Must be ≤ allow."),
+        );
+
+        let caps_section = editor_section(
+            "Default Capability Caps",
+            "Starting caps for new interactive threads in this pod.",
+            form([
+                form_item([
+                    form_label("default caps — pod_modify"),
+                    form_control(pod_modify_trigger),
+                    form_description("Starting `pod_modify` cap on a new thread. Must be ≤ allow."),
+                ]),
+                form_item([
+                    form_label("default caps — dispatch"),
+                    form_control(dispatch_trigger),
+                    form_description("Starting `dispatch` cap on a new thread. Must be ≤ allow."),
+                ]),
+                form_item([
+                    form_label("default caps — behaviors"),
+                    form_control(behaviors_trigger),
+                    form_description("Starting `behaviors` cap on a new thread. Must be ≤ allow."),
+                ]),
             ]),
-            form_item([
-                form_label("default caps — dispatch"),
-                form_control(dispatch_trigger),
-                form_description("Starting `dispatch` cap on a new thread. Must be ≤ allow."),
-            ]),
-            form_item([
-                form_label("default caps — behaviors"),
-                form_control(behaviors_trigger),
-                form_description("Starting `behaviors` cap on a new thread. Must be ≤ allow."),
-            ]),
-            form_item([
-                form_label("default mcp hosts"),
-                form_control(mcp_hosts_widget),
-                form_description(
-                    "Subset of `allow.mcp_hosts` new threads subscribe to by default.",
-                ),
-            ]),
-        ])
+        );
+
+        editor_columns(
+            column([execution_section, retrieval_section]).gap(tokens::SPACE_5),
+            column([tool_surface_section, bindings_section, caps_section]).gap(tokens::SPACE_5),
+        )
     }
 
     fn render_pod_editor_defaults_autoquery(
@@ -13138,11 +14790,19 @@ impl ChatApp {
     }
 
     fn autoquery_bucket_options(&self, cfg: &PodConfig) -> Vec<(String, String)> {
+        let pod_id = self.pod_editor.as_ref().map(|e| e.pod_id.as_str());
+        self.autoquery_bucket_options_for(cfg, pod_id)
+    }
+
+    fn autoquery_bucket_options_for(
+        &self,
+        cfg: &PodConfig,
+        pod_id: Option<&str>,
+    ) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for name in &cfg.allow.knowledge_buckets {
             out.push((format!("server:{name}"), format!("server:{name}")));
         }
-        let pod_id = self.pod_editor.as_ref().map(|e| e.pod_id.as_str());
         if let Some(pod_id) = pod_id {
             for b in &self.buckets {
                 if b.scope == "pod" && b.pod_id.as_deref() == Some(pod_id) {
@@ -13615,34 +15275,6 @@ impl ChatApp {
         .width(Size::Fill(1.0))
     }
 
-    /// Limits tab body. Pod-level resource ceilings — currently a
-    /// single `max_concurrent_threads` knob, since the protocol's
-    /// [`PodLimits`] struct only carries that one field. As the
-    /// schema grows (rate caps, spend ceilings, …) new form items
-    /// drop in alongside.
-    fn render_pod_editor_limits_tab(&self, editor: &PodEditorSheetState) -> El {
-        let Some(_cfg) = editor.working_config.as_ref() else {
-            return paragraph("no parsed config — fix the on-disk pod.toml from the Raw tab")
-                .muted();
-        };
-
-        let max_concurrent_widget = numeric_input(
-            &editor.max_concurrent_threads_buf,
-            &self.selection,
-            POD_EDITOR_LIMITS_MAX_CONCURRENT_THREADS_KEY,
-            NumericInputOpts::default().min(1.0).max(1000.0).step(1.0),
-        );
-
-        form([form_item([
-            form_label("max concurrent threads"),
-            form_control(max_concurrent_widget),
-            form_description(
-                "Ceiling on simultaneously-running threads in this pod. New threads \
-                 above the cap queue rather than dispatch.",
-            ),
-        ])])
-    }
-
     /// Build the select_menu for whichever pod-editor picker is open.
     /// Single-active — at most one picker open at a time. The menu
     /// options match the underlying cap / disposition enum, except
@@ -13737,7 +15369,7 @@ impl ChatApp {
                 }
                 select_menu(which.key(), options)
             }
-            PodEditorPicker::DefaultsToolGate => {
+            PodEditorPicker::AllowToolGate => {
                 let options: Vec<(String, String)> = [Disposition::Allow, Disposition::Deny]
                     .into_iter()
                     .map(|d| {

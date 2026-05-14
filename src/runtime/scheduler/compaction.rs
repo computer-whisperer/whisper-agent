@@ -282,6 +282,8 @@ impl Scheduler {
             system_prompt: None,
             compaction: None, // inherit pod's compaction defaults again
             autoquery: None,
+            caps: None,
+            tool_surface: None,
         });
         // Compaction inherits the parent's host-env list verbatim —
         // same pod allows both parent and continuation, so every entry

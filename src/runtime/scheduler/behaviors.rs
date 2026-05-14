@@ -15,7 +15,7 @@ use futures::stream::FuturesUnordered;
 use tracing::{info, warn};
 use whisper_agent_protocol::{ServerToClient, ThreadStateLabel};
 
-use super::thread_config::{behavior_override_to_requests, render_behavior_prompt};
+use super::thread_config::render_behavior_prompt;
 use super::triggers::{
     count_missed_occurrences, is_cron_due, parse_rfc3339_utc, validate_webhook_target,
 };
@@ -121,7 +121,7 @@ impl Scheduler {
         let payload = payload.unwrap_or(serde_json::Value::Null);
         let rendered_prompt = render_behavior_prompt(&prompt, &payload);
 
-        let (config_override, bindings_request) = behavior_override_to_requests(&config.thread);
+        let (config_override, bindings_request) = config.thread.to_create_thread_requests();
 
         // Behavior fire-time scope: pod.allow ceiling narrowed by the
         // behavior's declared `[scope]` block. Differs from the

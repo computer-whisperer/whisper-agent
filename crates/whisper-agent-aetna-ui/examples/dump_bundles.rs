@@ -114,6 +114,13 @@ enum Scene {
     /// `select_menu` popover anchors below the trigger and shows the
     /// inherit row + per-backend rows.
     NewThreadFormBackendOpen,
+    /// New-thread compose form with the separate thread-overrides
+    /// modal open. This keeps root-level compose controls compact
+    /// while still dumping the full per-thread override surface.
+    NewThreadOverridesInheritedOpen,
+    /// Same modal, with each optional override group enabled so the
+    /// dump covers the detailed controls behind the activation rows.
+    NewThreadOverridesOpen,
     /// New-thread compose form with backend, model, and pod all
     /// picked. Validates the trigger label fallbacks and that
     /// picking a backend triggers a model-list fetch.
@@ -296,12 +303,15 @@ enum Scene {
     /// `before_build` drain hydrates the editor's tab body before
     /// the dump paints.
     FileTreeBehaviorPromptDeepLink,
-    /// Pod editor sheet, opened and switched to the Limits tab.
-    /// Same hydration shape as `PodEditorHydrated`; an extra click
-    /// on the `pod-editor:tabs:tab:limits` trigger flips the
-    /// active tab. Renders a single numeric_input
-    /// (`max_concurrent_threads`).
-    PodEditorLimitsTab,
+    /// Pod editor sheet, opened on the General tab. Same hydration
+    /// shape as `PodEditorHydrated`; kept as its own dump so the
+    /// identity + pod-wide controls remain covered even if the
+    /// default tab changes later.
+    PodEditorGeneralTab,
+    /// Pod editor sheet switched to the Allow tab so the allowed
+    /// resources and permission ceiling columns are covered now that
+    /// the hydrated editor defaults to General.
+    PodEditorAllowTab,
     /// Fork-from-message dialog with a User row pre-selected. The
     /// dialog opens via a synthetic click on the per-row fork
     /// affordance (`chat:user-fork:{msg_index}`) — routing is
@@ -416,7 +426,7 @@ enum Scene {
 }
 
 impl Scene {
-    const ALL: [Scene; 60] = [
+    const ALL: [Scene; 63] = [
         Scene::Connecting,
         Scene::Connected,
         Scene::Closed,
@@ -427,6 +437,8 @@ impl Scene {
         Scene::ThreadWithToolCall,
         Scene::NewThreadFormReady,
         Scene::NewThreadFormBackendOpen,
+        Scene::NewThreadOverridesInheritedOpen,
+        Scene::NewThreadOverridesOpen,
         Scene::NewThreadFormFilled,
         Scene::ThreadPrefilling,
         Scene::ThreadWithDraft,
@@ -451,7 +463,8 @@ impl Scene {
         Scene::BehaviorEditorTriggerKindOpen,
         Scene::PodEditorHydrated,
         Scene::PodEditorDefaultsTab,
-        Scene::PodEditorLimitsTab,
+        Scene::PodEditorGeneralTab,
+        Scene::PodEditorAllowTab,
         Scene::BehaviorEditorThreadTab,
         Scene::BehaviorEditorScopeTab,
         Scene::BehaviorEditorRetentionTab,
@@ -491,6 +504,8 @@ impl Scene {
             Scene::ThreadWithToolCall => "thread_with_tool_call",
             Scene::NewThreadFormReady => "new_thread_form_ready",
             Scene::NewThreadFormBackendOpen => "new_thread_form_backend_open",
+            Scene::NewThreadOverridesInheritedOpen => "new_thread_overrides_inherited_open",
+            Scene::NewThreadOverridesOpen => "new_thread_overrides_open",
             Scene::NewThreadFormFilled => "new_thread_form_filled",
             Scene::ThreadPrefilling => "thread_prefilling",
             Scene::ThreadWithDraft => "thread_with_draft",
@@ -515,7 +530,8 @@ impl Scene {
             Scene::BehaviorEditorTriggerKindOpen => "behavior_editor_trigger_kind_open",
             Scene::PodEditorHydrated => "pod_editor_hydrated",
             Scene::PodEditorDefaultsTab => "pod_editor_defaults_tab",
-            Scene::PodEditorLimitsTab => "pod_editor_limits_tab",
+            Scene::PodEditorGeneralTab => "pod_editor_general_tab",
+            Scene::PodEditorAllowTab => "pod_editor_allow_tab",
             Scene::BehaviorEditorThreadTab => "behavior_editor_thread_tab",
             Scene::BehaviorEditorScopeTab => "behavior_editor_scope_tab",
             Scene::BehaviorEditorRetentionTab => "behavior_editor_retention_tab",
@@ -581,6 +597,22 @@ impl Scene {
             // One toggle click on the backend trigger leaves the menu
             // open — render captures the popover.
             Scene::NewThreadFormBackendOpen => vec!["picker:backend"],
+            // Open the separate overrides modal in its inherited
+            // state so inactive override affordances stay covered.
+            Scene::NewThreadOverridesInheritedOpen => vec!["new-thread:overrides:open"],
+            // Open the separate overrides modal and enable each
+            // optional group so the dump covers the detailed widgets,
+            // not just the inherited summary rows.
+            Scene::NewThreadOverridesOpen => vec![
+                "new-thread:overrides:open",
+                "new-thread:overrides:max-tokens:override",
+                "new-thread:overrides:max-turns:override",
+                "new-thread:overrides:system-prompt:mode:radio:file",
+                "new-thread:overrides:compaction:override",
+                "new-thread:overrides:autoquery:override",
+                "new-thread:overrides:caps:override",
+                "new-thread:overrides:tool-surface:override",
+            ],
             // Open the "+ New pod" dialog by clicking the sidebar
             // header's plus button. Same click path the live UI
             // takes — the modal then renders as an overlay layer.
@@ -675,9 +707,10 @@ impl Scene {
             Scene::PodEditorDefaultsTab => {
                 vec!["sidebar:pod-settings", "pod-editor:tabs:tab:defaults"]
             }
-            Scene::PodEditorLimitsTab => {
-                vec!["sidebar:pod-settings", "pod-editor:tabs:tab:limits"]
+            Scene::PodEditorGeneralTab => {
+                vec!["sidebar:pod-settings", "pod-editor:tabs:tab:general"]
             }
+            Scene::PodEditorAllowTab => vec!["sidebar:pod-settings", "pod-editor:tabs:tab:allow"],
             // Select the thread, then click the per-row fork
             // affordance for the first User message. `mock_snapshot`
             // pushes an empty system_text at msg_index=0 first, so
@@ -876,7 +909,12 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 _ => {}
             })
         }
-        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab | Scene::PodEditorLimitsTab => {
+        Scene::PodEditorHydrated
+        | Scene::PodEditorDefaultsTab
+        | Scene::PodEditorGeneralTab
+        | Scene::PodEditorAllowTab
+        | Scene::NewThreadOverridesInheritedOpen
+        | Scene::NewThreadOverridesOpen => {
             let queue = inbound.clone();
             Box::new(move |msg| {
                 if let ClientToServer::GetPod {
@@ -1333,6 +1371,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         }
         Scene::NewThreadFormReady
         | Scene::NewThreadFormBackendOpen
+        | Scene::NewThreadOverridesInheritedOpen
+        | Scene::NewThreadOverridesOpen
         | Scene::NewThreadFormFilled => {
             // Same baseline as `PopulatedNoSelection` — connection,
             // pods, and an empty thread list — plus a `BackendsList`
@@ -1444,7 +1484,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 behaviors: mock_mavis_behaviors(),
             }));
         }
-        Scene::PodEditorHydrated | Scene::PodEditorDefaultsTab | Scene::PodEditorLimitsTab => {
+        Scene::PodEditorHydrated
+        | Scene::PodEditorDefaultsTab
+        | Scene::PodEditorGeneralTab
+        | Scene::PodEditorAllowTab => {
             // Connection + pod list (so the active-pod gear renders),
             // plus an empty thread list so the right pane is the
             // no-selection compose form (visible behind the right-
@@ -2296,6 +2339,7 @@ fn mock_default_pod_snapshot() -> whisper_agent_protocol::PodSnapshot {
     use whisper_agent_protocol::{
         AllowMap, CompactionConfig, NamedHostEnv, PodAllow, PodConfig, PodLimits, PodSnapshot,
         ThreadDefaults,
+        sandbox::{AccessMode, HostEnvSpec, Mount, NetworkPolicy, PathAccess, ResourceLimits},
     };
     let toml_text = r#"name = "default"
 description = "the synthesized server-default pod"
@@ -2309,7 +2353,22 @@ knowledge_buckets = ["wiki"]
 [[allow.host_env]]
 name = "main"
 provider = "shell"
-host = "127.0.0.1"
+kind = "landlock"
+allowed_paths = ["/home/christian/workspace:rw", "/tmp:rw"]
+network = "isolated"
+
+[[allow.host_env]]
+name = "browser"
+provider = "containerd"
+kind = "container"
+image = "ghcr.io/example/browser-agent:latest"
+network = "allow_list"
+network_hosts = ["example.com", "docs.rs"]
+
+[[allow.host_env.mounts]]
+host = "/home/christian/Downloads"
+guest = "/downloads"
+mode = "ro"
 
 [allow.tools]
 default = "allow"
@@ -2331,7 +2390,46 @@ mcp_hosts = ["filesystem", "git"]
         allow: PodAllow {
             backends: vec!["anthropic-prod".into(), "openai-team".into()],
             mcp_hosts: vec!["filesystem".into(), "git".into()],
-            host_env: Vec::<NamedHostEnv>::new(),
+            host_env: vec![
+                NamedHostEnv {
+                    name: "main".into(),
+                    provider: "shell".into(),
+                    spec: HostEnvSpec::Landlock {
+                        allowed_paths: vec![
+                            PathAccess {
+                                path: "/home/christian/workspace".into(),
+                                mode: AccessMode::ReadWrite,
+                            },
+                            PathAccess {
+                                path: "/tmp".into(),
+                                mode: AccessMode::ReadWrite,
+                            },
+                        ],
+                        network: NetworkPolicy::Isolated,
+                    },
+                },
+                NamedHostEnv {
+                    name: "browser".into(),
+                    provider: "containerd".into(),
+                    spec: HostEnvSpec::Container {
+                        image: "ghcr.io/example/browser-agent:latest".into(),
+                        mounts: vec![Mount {
+                            host: "/home/christian/Downloads".into(),
+                            guest: "/downloads".into(),
+                            mode: AccessMode::ReadOnly,
+                        }],
+                        network: NetworkPolicy::AllowList {
+                            hosts: vec!["example.com".into(), "docs.rs".into()],
+                        },
+                        limits: Some(ResourceLimits {
+                            cpus: Some(2),
+                            memory_mb: Some(4096),
+                            timeout_s: Some(900),
+                        }),
+                        env: Default::default(),
+                    },
+                },
+            ],
             knowledge_buckets: vec!["wiki".into()],
             tools: AllowMap::allow_all(),
             caps: Default::default(),

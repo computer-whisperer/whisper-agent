@@ -4,8 +4,7 @@
 //! top) are readable without the surrounding lifecycle noise.
 
 use whisper_agent_protocol::{
-    AllowMap, CompactionConfig, HostEnvSpec, ThreadBindingsRequest, ThreadConfig,
-    ThreadConfigOverride,
+    AllowMap, CompactionConfig, HostEnvSpec, ThreadConfig, ThreadConfigOverride,
 };
 
 use crate::pod::Pod;
@@ -93,117 +92,14 @@ pub fn build_default_pod_config(
 /// Binding-side defaults (backend, sandbox, shared hosts) are produced
 /// separately by `resolve_bindings_choice`.
 pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
-    let defaults = &pod.config.thread_defaults;
-    ThreadConfig {
-        model: defaults.model.clone(),
-        max_tokens: defaults.max_tokens,
-        max_turns: defaults.max_turns,
-        compaction: defaults.compaction.clone(),
-        autoquery: defaults.autoquery.clone(),
-    }
+    ThreadConfig::from_thread_defaults(&pod.config.thread_defaults)
 }
 
 pub(super) fn apply_config_override(
     base: ThreadConfig,
     ov: Option<ThreadConfigOverride>,
 ) -> ThreadConfig {
-    let Some(ov) = ov else { return base };
-    let compaction = apply_compaction_override(base.compaction, ov.compaction);
-    let autoquery = apply_autoquery_override(base.autoquery, ov.autoquery);
-    ThreadConfig {
-        model: ov.model.unwrap_or(base.model),
-        max_tokens: ov.max_tokens.unwrap_or(base.max_tokens),
-        max_turns: ov.max_turns.unwrap_or(base.max_turns),
-        compaction,
-        autoquery,
-    }
-}
-
-/// Layer a partial `CompactionConfigOverride` on top of a pod-inherited
-/// base. `None` fields on the override inherit; `Some(_)` fields replace.
-/// `token_threshold` is `Option<Option<u32>>` so it can be explicitly
-/// cleared to `None` as well as explicitly set.
-fn apply_compaction_override(
-    base: CompactionConfig,
-    ov: Option<whisper_agent_protocol::CompactionConfigOverride>,
-) -> CompactionConfig {
-    let Some(ov) = ov else { return base };
-    CompactionConfig {
-        enabled: ov.enabled.unwrap_or(base.enabled),
-        prompt_file: ov.prompt_file.unwrap_or(base.prompt_file),
-        summary_regex: ov.summary_regex.unwrap_or(base.summary_regex),
-        token_threshold: ov.token_threshold.unwrap_or(base.token_threshold),
-        continuation_template: ov
-            .continuation_template
-            .unwrap_or(base.continuation_template),
-    }
-}
-
-/// Layer a partial autoquery override on top of a pod-inherited base.
-fn apply_autoquery_override(
-    base: whisper_agent_protocol::KnowledgeAutoqueryConfig,
-    ov: Option<whisper_agent_protocol::KnowledgeAutoqueryConfigOverride>,
-) -> whisper_agent_protocol::KnowledgeAutoqueryConfig {
-    let Some(ov) = ov else { return base };
-    whisper_agent_protocol::KnowledgeAutoqueryConfig {
-        enabled: ov.enabled.unwrap_or(base.enabled),
-        buckets: ov.buckets.unwrap_or(base.buckets),
-        hot_only: ov.hot_only.unwrap_or(base.hot_only),
-        top_k: ov.top_k.unwrap_or(base.top_k),
-        min_rerank_score: ov.min_rerank_score.unwrap_or(base.min_rerank_score),
-        max_query_chars: ov.max_query_chars.unwrap_or(base.max_query_chars),
-        snippet_chars: ov.snippet_chars.unwrap_or(base.snippet_chars),
-        query_source: ov.query_source.unwrap_or(base.query_source),
-        inject_at_terminal: ov.inject_at_terminal.unwrap_or(base.inject_at_terminal),
-    }
-}
-
-/// Translate a behavior's thread-override block into the
-/// (ThreadConfigOverride, ThreadBindingsRequest) pair `create_task`
-/// consumes. `None` returns for either side mean "inherit everything
-/// from pod defaults."
-pub(super) fn behavior_override_to_requests(
-    ov: &whisper_agent_protocol::BehaviorThreadOverride,
-) -> (Option<ThreadConfigOverride>, Option<ThreadBindingsRequest>) {
-    let config_override = if ov.model.is_some()
-        || ov.max_tokens.is_some()
-        || ov.max_turns.is_some()
-        || ov.system_prompt.is_some()
-    {
-        Some(ThreadConfigOverride {
-            model: ov.model.clone(),
-            max_tokens: ov.max_tokens,
-            max_turns: ov.max_turns,
-            system_prompt: ov.system_prompt.clone(),
-            compaction: None, // behaviors inherit pod compaction policy
-            autoquery: None,
-        })
-    } else {
-        None
-    };
-    let b = &ov.bindings;
-    let bindings_request = if b.backend.is_some() || b.host_env.is_some() || b.mcp_hosts.is_some() {
-        // BehaviorBindingsOverride still declares host_env as bare
-        // names — behaviors don't get a per-binding workspace_root
-        // knob. resolve_bindings_choice defaults each entry's
-        // workspace_root from the named pod entry's first RW path.
-        Some(ThreadBindingsRequest {
-            backend: b.backend.clone(),
-            host_env: b.host_env.as_ref().map(|names| {
-                names
-                    .iter()
-                    .map(|name| whisper_agent_protocol::HostEnvBindingRequest {
-                        name: name.clone(),
-                        workspace_root: None,
-                    })
-                    .collect()
-            }),
-            mcp_hosts: b.mcp_hosts.clone(),
-        })
-    } else {
-        None
-    };
-    (config_override, bindings_request)
+    base.compose_override(ov)
 }
 
 /// Render a behavior's prompt template. Minimal v1: a single
@@ -263,7 +159,7 @@ mod tests {
                 mcp_hosts: Some(vec!["fetch".into()]),
             },
         };
-        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let (cfg, bindings) = ov.to_create_thread_requests();
         let cfg = cfg.expect("config_override populated");
         assert_eq!(cfg.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(cfg.max_tokens, Some(8192));
@@ -294,7 +190,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let (cfg, bindings) = ov.to_create_thread_requests();
         let cfg = cfg.expect("config_override populated");
         assert!(matches!(
             cfg.system_prompt,
@@ -306,7 +202,7 @@ mod tests {
     #[test]
     fn override_returns_none_when_nothing_set() {
         let ov = BehaviorThreadOverride::default();
-        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let (cfg, bindings) = ov.to_create_thread_requests();
         assert!(cfg.is_none());
         assert!(bindings.is_none());
     }
@@ -321,7 +217,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (cfg, bindings) = behavior_override_to_requests(&ov);
+        let (cfg, bindings) = ov.to_create_thread_requests();
         assert!(cfg.is_none(), "no config-side fields were set");
         assert!(bindings.is_some());
     }

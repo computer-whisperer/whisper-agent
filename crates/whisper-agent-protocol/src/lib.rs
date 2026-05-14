@@ -145,6 +145,39 @@ pub struct ThreadConfig {
     pub autoquery: KnowledgeAutoqueryConfig,
 }
 
+impl ThreadConfig {
+    /// Project a pod's `[thread_defaults]` into the runtime config
+    /// stored on a freshly-created thread.
+    ///
+    /// Resource bindings (`backend`, `host_env`, `mcp_hosts`) and
+    /// creation-time prompt choice are composed separately; this type
+    /// intentionally carries only model/runtime policy.
+    pub fn from_thread_defaults(defaults: &ThreadDefaults) -> Self {
+        Self {
+            model: defaults.model.clone(),
+            max_tokens: defaults.max_tokens,
+            max_turns: defaults.max_turns,
+            compaction: defaults.compaction.clone(),
+            autoquery: defaults.autoquery.clone(),
+        }
+    }
+
+    /// Layer a create-time partial override on top of a resolved base.
+    /// `None` fields inherit; `Some` fields replace. `system_prompt`
+    /// is intentionally ignored here because it is resolved into the
+    /// conversation prefix, not stored on `ThreadConfig`.
+    pub fn compose_override(self, ov: Option<ThreadConfigOverride>) -> Self {
+        let Some(ov) = ov else { return self };
+        Self {
+            model: ov.model.unwrap_or(self.model),
+            max_tokens: ov.max_tokens.unwrap_or(self.max_tokens),
+            max_turns: ov.max_turns.unwrap_or(self.max_turns),
+            compaction: self.compaction.compose_override(ov.compaction),
+            autoquery: self.autoquery.compose_override(ov.autoquery),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +209,29 @@ pub struct ThreadConfigOverride {
     /// the pod's defaults; any set field replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autoquery: Option<KnowledgeAutoqueryConfigOverride>,
+    /// Starting typed caps for the new thread. `None` inherits
+    /// `thread_defaults.caps`; `Some` replaces the starting cap block
+    /// and is still bounded by the pod's `allow.caps` ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps: Option<ThreadDefaultCaps>,
+    /// Tool-catalog presentation for the new thread. `None` inherits
+    /// `thread_defaults.tool_surface`; `Some` replaces it wholesale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_surface: Option<ToolSurface>,
+}
+
+impl ThreadConfigOverride {
+    /// True when this override would not change thread creation at all.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.max_tokens.is_none()
+            && self.max_turns.is_none()
+            && self.system_prompt.is_none()
+            && self.compaction.is_none()
+            && self.autoquery.is_none()
+            && self.caps.is_none()
+            && self.tool_surface.is_none()
+    }
 }
 
 /// How a thread-creation caller specifies the system prompt to seed
@@ -233,6 +289,42 @@ pub struct KnowledgeAutoqueryConfigOverride {
     pub query_source: Option<KnowledgeAutoquerySource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_at_terminal: Option<bool>,
+}
+
+impl CompactionConfig {
+    /// Compose a per-thread override onto an inherited compaction base.
+    /// `token_threshold` is double-optional so callers can explicitly
+    /// clear the threshold with `Some(None)`.
+    pub fn compose_override(self, ov: Option<CompactionConfigOverride>) -> Self {
+        let Some(ov) = ov else { return self };
+        Self {
+            enabled: ov.enabled.unwrap_or(self.enabled),
+            prompt_file: ov.prompt_file.unwrap_or(self.prompt_file),
+            summary_regex: ov.summary_regex.unwrap_or(self.summary_regex),
+            token_threshold: ov.token_threshold.unwrap_or(self.token_threshold),
+            continuation_template: ov
+                .continuation_template
+                .unwrap_or(self.continuation_template),
+        }
+    }
+}
+
+impl KnowledgeAutoqueryConfig {
+    /// Compose a per-thread override onto an inherited autoquery base.
+    pub fn compose_override(self, ov: Option<KnowledgeAutoqueryConfigOverride>) -> Self {
+        let Some(ov) = ov else { return self };
+        Self {
+            enabled: ov.enabled.unwrap_or(self.enabled),
+            buckets: ov.buckets.unwrap_or(self.buckets),
+            hot_only: ov.hot_only.unwrap_or(self.hot_only),
+            top_k: ov.top_k.unwrap_or(self.top_k),
+            min_rerank_score: ov.min_rerank_score.unwrap_or(self.min_rerank_score),
+            max_query_chars: ov.max_query_chars.unwrap_or(self.max_query_chars),
+            snippet_chars: ov.snippet_chars.unwrap_or(self.snippet_chars),
+            query_source: ov.query_source.unwrap_or(self.query_source),
+            inject_at_terminal: ov.inject_at_terminal.unwrap_or(self.inject_at_terminal),
+        }
+    }
 }
 
 /// Concrete resource bindings for a thread. Each field names an entry in
@@ -409,6 +501,20 @@ pub struct ThreadBindingsRequest {
     /// means "no shared hosts beyond the primary").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
+}
+
+impl ThreadBindingsRequest {
+    /// True when every binding axis inherits from pod defaults.
+    pub fn is_empty(&self) -> bool {
+        self.backend_override().is_none() && self.host_env.is_none() && self.mcp_hosts.is_none()
+    }
+
+    /// Backend override after normalizing the legacy empty-string
+    /// inherit sentinel. Empty host/MCP vectors are not normalized here:
+    /// those are meaningful explicit replacements.
+    pub fn backend_override(&self) -> Option<&str> {
+        self.backend.as_deref().filter(|name| !name.is_empty())
+    }
 }
 
 /// Provenance enum for catalog entries surfaced over the wire. Mirrors
@@ -2589,6 +2695,104 @@ pub fn decode_from_server(bytes: &[u8]) -> Result<ServerToClient, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_thread_defaults() -> ThreadDefaults {
+        ThreadDefaults {
+            backend: "anthropic".into(),
+            model: "claude-default".into(),
+            system_prompt_file: "system_prompt.md".into(),
+            max_tokens: 4096,
+            max_turns: 12,
+            host_env: vec!["main".into()],
+            mcp_hosts: vec!["fetch".into()],
+            compaction: CompactionConfig {
+                enabled: true,
+                prompt_file: "compact.md".into(),
+                summary_regex: "summary:(.*)".into(),
+                token_threshold: Some(10_000),
+                continuation_template: "continue: {{summary}}".into(),
+            },
+            autoquery: KnowledgeAutoqueryConfig {
+                enabled: true,
+                buckets: vec!["server:docs".into()],
+                hot_only: true,
+                top_k: 3,
+                min_rerank_score: 0.4,
+                max_query_chars: 2048,
+                snippet_chars: 700,
+                query_source: KnowledgeAutoquerySource::TextOnly,
+                inject_at_terminal: false,
+            },
+            caps: ThreadDefaultCaps::default(),
+            tool_surface: ToolSurface::default(),
+        }
+    }
+
+    #[test]
+    fn thread_config_composes_from_defaults_and_partial_override() {
+        let base = ThreadConfig::from_thread_defaults(&sample_thread_defaults());
+        let composed = base.compose_override(Some(ThreadConfigOverride {
+            model: Some("claude-override".into()),
+            max_tokens: None,
+            max_turns: Some(20),
+            system_prompt: Some(SystemPromptChoice::Text {
+                text: "custom persona".into(),
+            }),
+            compaction: Some(CompactionConfigOverride {
+                enabled: Some(false),
+                token_threshold: Some(None),
+                ..Default::default()
+            }),
+            autoquery: Some(KnowledgeAutoqueryConfigOverride {
+                buckets: Some(vec!["pod:notes".into()]),
+                top_k: Some(5),
+                ..Default::default()
+            }),
+            caps: None,
+            tool_surface: None,
+        }));
+
+        assert_eq!(composed.model, "claude-override");
+        assert_eq!(composed.max_tokens, 4096);
+        assert_eq!(composed.max_turns, 20);
+        assert!(!composed.compaction.enabled);
+        assert_eq!(composed.compaction.prompt_file, "compact.md");
+        assert_eq!(composed.compaction.token_threshold, None);
+        assert_eq!(composed.autoquery.buckets, vec!["pod:notes".to_string()]);
+        assert_eq!(composed.autoquery.top_k, 5);
+        assert_eq!(
+            composed.autoquery.query_source,
+            KnowledgeAutoquerySource::TextOnly
+        );
+    }
+
+    #[test]
+    fn thread_override_empty_tracks_all_creation_axes() {
+        assert!(ThreadConfigOverride::default().is_empty());
+        assert!(
+            !ThreadConfigOverride {
+                system_prompt: Some(SystemPromptChoice::Text { text: "x".into() }),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+
+        assert!(ThreadBindingsRequest::default().is_empty());
+        assert!(
+            ThreadBindingsRequest {
+                backend: Some(String::new()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !ThreadBindingsRequest {
+                host_env: Some(Vec::new()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
 
     #[test]
     fn host_env_binding_request_accepts_bare_string() {

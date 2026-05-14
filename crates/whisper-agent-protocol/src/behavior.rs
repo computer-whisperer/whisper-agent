@@ -231,6 +231,33 @@ pub struct BehaviorThreadOverride {
     pub bindings: BehaviorBindingsOverride,
 }
 
+impl BehaviorThreadOverride {
+    /// Translate this behavior-local override into the same create-thread
+    /// request pair used by interactive New Thread and dispatch calls.
+    ///
+    /// Behavior thread overrides deliberately do not expose compaction or
+    /// autoquery yet, so those remain inherited from the pod default.
+    pub fn to_create_thread_requests(
+        &self,
+    ) -> (
+        Option<crate::ThreadConfigOverride>,
+        Option<crate::ThreadBindingsRequest>,
+    ) {
+        let config = crate::ThreadConfigOverride {
+            model: self.model.clone(),
+            max_tokens: self.max_tokens,
+            max_turns: self.max_turns,
+            system_prompt: self.system_prompt.clone(),
+            compaction: None,
+            autoquery: None,
+            caps: None,
+            tool_surface: None,
+        };
+        let config = (!config.is_empty()).then_some(config);
+        (config, self.bindings.to_thread_bindings_request())
+    }
+}
+
 /// Bindings subset for a behavior's spawned threads. Each `Some` replaces
 /// the pod-default binding; each `None` inherits. All values must resolve
 /// against the pod's `[allow]` table at trigger time — the cap is still
@@ -251,6 +278,33 @@ pub struct BehaviorBindingsOverride {
     pub host_env: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_hosts: Option<Vec<String>>,
+}
+
+impl BehaviorBindingsOverride {
+    /// Convert behavior binding overrides into the general thread-binding
+    /// request shape. Behaviors expose host envs as bare names; workspace
+    /// roots stay `None` so the scheduler resolves each one from the
+    /// named pod entry at fire time.
+    pub fn to_thread_bindings_request(&self) -> Option<crate::ThreadBindingsRequest> {
+        let request = crate::ThreadBindingsRequest {
+            backend: self
+                .backend
+                .as_ref()
+                .filter(|name| !name.is_empty())
+                .cloned(),
+            host_env: self.host_env.as_ref().map(|names| {
+                names
+                    .iter()
+                    .map(|name| crate::HostEnvBindingRequest {
+                        name: name.clone(),
+                        workspace_root: None,
+                    })
+                    .collect()
+            }),
+            mcp_hosts: self.mcp_hosts.clone(),
+        };
+        (!request.is_empty()).then_some(request)
+    }
 }
 
 /// Accept both `None`, a bare string (legacy), and a `Vec<String>` (new)
@@ -540,5 +594,46 @@ mod tests {
         // `None` fields are skipped; behaviors with an inherit-everything
         // scope don't clutter the wire.
         assert!(!json.contains("\"host_envs\""));
+    }
+
+    #[test]
+    fn behavior_thread_override_converts_to_create_thread_requests() {
+        let ov = BehaviorThreadOverride {
+            model: Some("sonnet-4-6".into()),
+            max_tokens: Some(8192),
+            max_turns: Some(20),
+            system_prompt: Some(crate::SystemPromptChoice::File {
+                name: "behaviors/daily/system_prompt.md".into(),
+            }),
+            bindings: BehaviorBindingsOverride {
+                backend: Some("anthropic".into()),
+                host_env: Some(vec!["readonly".into()]),
+                mcp_hosts: Some(vec!["fetch".into()]),
+            },
+        };
+        let (config, bindings) = ov.to_create_thread_requests();
+        let config = config.expect("config override");
+        assert_eq!(config.model.as_deref(), Some("sonnet-4-6"));
+        assert_eq!(config.max_tokens, Some(8192));
+        assert_eq!(config.max_turns, Some(20));
+        assert!(config.compaction.is_none());
+        assert!(config.autoquery.is_none());
+
+        let bindings = bindings.expect("binding override");
+        assert_eq!(bindings.backend.as_deref(), Some("anthropic"));
+        let envs = bindings.host_env.expect("host_env override");
+        assert_eq!(envs[0].name, "readonly");
+        assert!(envs[0].workspace_root.is_none());
+        assert_eq!(
+            bindings.mcp_hosts.as_deref(),
+            Some(&["fetch".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn empty_behavior_thread_override_inherits_everything() {
+        let (config, bindings) = BehaviorThreadOverride::default().to_create_thread_requests();
+        assert!(config.is_none());
+        assert!(bindings.is_none());
     }
 }

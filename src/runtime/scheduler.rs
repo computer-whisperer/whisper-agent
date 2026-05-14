@@ -2832,6 +2832,10 @@ impl Scheduler {
         let system_prompt_choice = config_override
             .as_ref()
             .and_then(|o| o.system_prompt.clone());
+        let caps_override = config_override.as_ref().and_then(|o| o.caps);
+        let create_tool_surface_override = config_override
+            .as_ref()
+            .and_then(|o| o.tool_surface.clone());
         // Resolve the thread's plain config (model, limits, policy).
         let base_config = base_thread_config_from_pod(pod);
         let config = apply_config_override(base_config, config_override);
@@ -2906,7 +2910,31 @@ impl Scheduler {
         //   - Top-level WS create: attach `Interactive{via_conn: conn_id}`.
         //   - Behavior fire / auto-compact / cron: stays `None`;
         //     `request_escalation` is filtered out of the catalog.
-        let base_scope = base_scope_override.unwrap_or_else(|| self.pod_thread_scope(&pod_id));
+        let mut base_scope = base_scope_override.unwrap_or_else(|| self.pod_thread_scope(&pod_id));
+        if let Some(caps) = caps_override {
+            let ceiling = self.pod_scope_ceiling(&pod_id);
+            if caps.pod_modify > ceiling.pod_modify {
+                return Err(format!(
+                    "thread cap pod_modify={:?} exceeds pod allow ceiling {:?}",
+                    caps.pod_modify, ceiling.pod_modify
+                ));
+            }
+            if caps.dispatch > ceiling.dispatch {
+                return Err(format!(
+                    "thread cap dispatch={:?} exceeds pod allow ceiling {:?}",
+                    caps.dispatch, ceiling.dispatch
+                ));
+            }
+            if caps.behaviors > ceiling.behaviors {
+                return Err(format!(
+                    "thread cap behaviors={:?} exceeds pod allow ceiling {:?}",
+                    caps.behaviors, ceiling.behaviors
+                ));
+            }
+            base_scope.pod_modify = caps.pod_modify;
+            base_scope.dispatch = caps.dispatch;
+            base_scope.behaviors = caps.behaviors;
+        }
         let mut scope = match &dispatched_by_parent {
             Some((parent_id, _)) => match self.tasks.get(parent_id) {
                 Some(parent) => base_scope.narrow(&parent.scope),
@@ -2929,11 +2957,13 @@ impl Scheduler {
         // replaced by the behavior-declared override. `compose` is a
         // wholesale replace (not per-field narrowing) — tool-surface
         // knobs are presentation preferences, not permissions.
+        let effective_tool_surface_override =
+            create_tool_surface_override.or(tool_surface_override);
         let tool_surface = pod
             .config
             .thread_defaults
             .tool_surface
-            .compose(tool_surface_override.as_ref());
+            .compose(effective_tool_surface_override.as_ref());
         let mut task = Thread::new(
             thread_id.clone(),
             pod_id.clone(),

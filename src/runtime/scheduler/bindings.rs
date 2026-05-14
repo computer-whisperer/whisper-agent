@@ -92,7 +92,10 @@ pub(super) fn resolve_bindings_choice(
     let allow = &pod.config.allow;
     let request = request.unwrap_or_default();
 
-    let backend_name = request.backend.unwrap_or_else(|| defaults.backend.clone());
+    let backend_name = request
+        .backend
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| defaults.backend.clone());
     if !backend_name.is_empty() && !allow.backends.iter().any(|b| b == &backend_name) {
         return Err(format!(
             "backend `{}` not in pod `{}`'s allow.backends ({})",
@@ -323,6 +326,22 @@ mod tests {
         assert_eq!(r.backend_name, "anthropic");
         assert_eq!(r.host_env.len(), 1);
         assert_eq!(r.shared_host_names, vec!["fetch".to_string()]);
+    }
+
+    #[test]
+    fn empty_backend_request_inherits_pod_default() {
+        let pod = pod_with_two_backends_and_two_envs();
+        let r = resolve_bindings_choice(
+            &pod,
+            Some(ThreadBindingsRequest {
+                backend: Some(String::new()),
+                host_env: None,
+                mcp_hosts: None,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.backend_name, "anthropic");
     }
 
     #[test]
