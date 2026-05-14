@@ -1375,9 +1375,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
         | Scene::NewThreadOverridesOpen
         | Scene::NewThreadFormFilled => {
             // Same baseline as `PopulatedNoSelection` — connection,
-            // pods, and an empty thread list — plus a `BackendsList`
-            // so the backend picker has options. The `Filled` scene
-            // also pre-seeds a `ModelsList` for the backend the
+            // pods, and an empty thread list — plus `BackendsList`
+            // and `BucketsList` so picker menus and override bucket
+            // groups have options. The `Filled` scene also pre-seeds
+            // a `ModelsList` for the backend the
             // synthetic clicks pick.
             q.push_back(InboundEvent::ConnectionOpened);
             q.push_back(InboundEvent::Wire(ServerToClient::PodList {
@@ -1392,6 +1393,10 @@ fn build_app(scene: Scene) -> Box<dyn App> {
             q.push_back(InboundEvent::Wire(ServerToClient::BackendsList {
                 correlation_id: None,
                 backends: mock_backends(),
+            }));
+            q.push_back(InboundEvent::Wire(ServerToClient::BucketsList {
+                correlation_id: None,
+                buckets: mock_buckets(),
             }));
             if matches!(scene, Scene::NewThreadFormFilled) {
                 q.push_back(InboundEvent::Wire(ServerToClient::ModelsList {
@@ -2487,7 +2492,7 @@ fn mock_shared_mcp_hosts() -> Vec<whisper_agent_protocol::SharedMcpHostInfo> {
     ]
 }
 
-/// Server-known knowledge buckets for the pod-editor Allow tab.
+/// Known knowledge buckets for config-surface bundle scenes.
 fn mock_buckets() -> Vec<whisper_agent_protocol::BucketSummary> {
     use whisper_agent_protocol::BucketSummary;
     vec![
@@ -2517,6 +2522,20 @@ fn mock_buckets() -> Vec<whisper_agent_protocol::BucketSummary> {
             dense_enabled: true,
             sparse_enabled: false,
             created_at: "2026-04-20T00:00:00Z".into(),
+            active_slot: None,
+        },
+        BucketSummary {
+            id: "scratch-notes".into(),
+            scope: "pod".into(),
+            pod_id: Some("default".into()),
+            name: "scratch-notes".into(),
+            description: Some("Default pod working notes.".into()),
+            source_kind: "stored".into(),
+            source_detail: None,
+            embedder_provider: "qwen3-embedding-0.6b".into(),
+            dense_enabled: true,
+            sparse_enabled: true,
+            created_at: "2026-05-02T00:00:00Z".into(),
             active_slot: None,
         },
     ]

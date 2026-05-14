@@ -6434,6 +6434,25 @@ fn checkbox_column(group_prefix: &str, selected: &[String], options: Vec<(String
     column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
+fn grouped_checkbox_column(
+    group_prefix: &str,
+    selected: &[String],
+    groups: Vec<(&'static str, Vec<(String, String)>)>,
+) -> El {
+    let mut children = Vec::new();
+    for (title, options) in groups {
+        if options.is_empty() {
+            continue;
+        }
+        children.push(text(title).muted().small().semibold());
+        children.push(checkbox_column(group_prefix, selected, options));
+    }
+    column(children)
+        .gap(tokens::SPACE_2)
+        .width(Size::Fill(1.0))
+        .height(Size::Hug)
+}
+
 fn scroll_gutter_column<I, E>(children: I, gap: f32) -> El
 where
     I: IntoIterator<Item = E>,
@@ -9449,7 +9468,7 @@ impl ChatApp {
 
         let autoquery_section = editor_section(
             "Knowledge Autoquery",
-            "Optional per-thread retrieval nudge override.",
+            "Per-thread automatic retrieval targets inside the selected pod's in-scope buckets.",
             self.render_new_thread_autoquery_override(),
         );
 
@@ -9659,11 +9678,17 @@ impl ChatApp {
             );
         };
         let buckets = autoquery.buckets.as_deref().unwrap_or(&[]);
-        let bucket_options = self.current_autoquery_bucket_options();
-        let bucket_widget = if bucket_options.is_empty() {
-            paragraph("(no in-scope buckets)").muted().small()
+        let bucket_groups = self.current_autoquery_bucket_groups();
+        let has_bucket_options = bucket_groups.iter().any(|(_, options)| !options.is_empty());
+        let bucket_widget = if has_bucket_options {
+            grouped_checkbox_column(NEW_THREAD_AUTOQUERY_BUCKETS_KEY, buckets, bucket_groups)
         } else {
-            checkbox_column(NEW_THREAD_AUTOQUERY_BUCKETS_KEY, buckets, bucket_options)
+            paragraph("(no in-scope buckets)").muted().small()
+        };
+        let bucket_hint = if buckets.is_empty() {
+            "empty = all in-scope hot buckets"
+        } else {
+            "selected in-scope hot buckets only"
         };
         form([
             form_item([
@@ -9729,7 +9754,15 @@ impl ChatApp {
                     ],
                 )),
             ]),
-            form_item([form_label("buckets"), form_control(bucket_widget)]),
+            form_item([
+                form_label("target buckets"),
+                form_control(bucket_widget),
+                form_description(
+                    "Subset for this thread's automatic nudges. Options are limited \
+                     by the pod's server bucket grants plus its pod-scope buckets.",
+                ),
+            ]),
+            paragraph(bucket_hint).muted().small(),
             form_item([
                 form_label("top k"),
                 form_control(numeric_input(
@@ -10175,12 +10208,12 @@ impl ChatApp {
         }
     }
 
-    fn current_autoquery_bucket_options(&self) -> Vec<(String, String)> {
+    fn current_autoquery_bucket_groups(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
         let Some(cfg) = self.picker_pod_config() else {
             return Vec::new();
         };
         let pod_id = self.picker_effective_pod_id();
-        self.autoquery_bucket_options_for(cfg, pod_id)
+        self.autoquery_bucket_groups_for(cfg, pod_id)
     }
 
     fn backend_label(&self) -> String {
@@ -14371,11 +14404,12 @@ impl ChatApp {
                     ),
                 ]),
                 form_item([
-                    form_label("Allowed knowledge buckets"),
+                    form_label("Server bucket grants"),
                     form_control(buckets_widget),
                     form_description(
-                        "Bucket ids that threads in this pod may query through the \
-                     `knowledge_query` tool. Empty list = no buckets reachable.",
+                        "Server-scope bucket ids this pod may query manually or target \
+                     with autoquery. Pod-scope buckets under this pod are in scope \
+                     automatically and are not listed here.",
                     ),
                 ]),
                 form_item([
@@ -14494,16 +14528,17 @@ impl ChatApp {
     }
 
     fn render_pod_editor_buckets_check(&self, cfg: &PodConfig) -> El {
-        if self.buckets.is_empty() {
-            return paragraph("(no buckets exist on this server yet)")
-                .muted()
-                .small();
-        }
         let options: Vec<(String, String)> = self
             .buckets
             .iter()
-            .map(|b| (b.id.clone(), b.id.clone()))
+            .filter(|b| b.scope == "server")
+            .map(|b| (b.id.clone(), format!("server:{}", b.id)))
             .collect();
+        if options.is_empty() {
+            return paragraph("(no server-scope buckets exist yet)")
+                .muted()
+                .small();
+        }
         checkbox_column(
             POD_EDITOR_ALLOW_BUCKETS_KEY,
             &cfg.allow.knowledge_buckets,
@@ -14626,14 +14661,14 @@ impl ChatApp {
         );
 
         let retrieval_section = editor_section(
-            "Knowledge Autoquery",
-            "Optional hot-bucket retrieval injected after model sub-turns.",
+            "Knowledge Autoquery Defaults",
+            "Default automatic retrieval targets inside the pod's in-scope buckets.",
             form([form_item([
-                form_label("autoquery"),
+                form_label("autoquery defaults"),
                 form_control(autoquery_widget),
                 form_description(
-                    "Optional hot-bucket retrieval after model sub-turns. Cold buckets are \
-                     skipped so live nudges never stall on index loading.",
+                    "This does not grant bucket access. Targets are chosen from server \
+                     grants on Allow plus pod-scope buckets under this pod.",
                 ),
             ])]),
         );
@@ -14742,20 +14777,21 @@ impl ChatApp {
             POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY,
             NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
         );
-        let bucket_options = self.autoquery_bucket_options(cfg);
-        let bucket_widget = if bucket_options.is_empty() {
-            paragraph("(no in-scope buckets)").muted().small()
-        } else {
-            checkbox_column(
+        let bucket_groups = self.autoquery_bucket_groups(cfg);
+        let has_bucket_options = bucket_groups.iter().any(|(_, options)| !options.is_empty());
+        let bucket_widget = if has_bucket_options {
+            grouped_checkbox_column(
                 POD_EDITOR_DEFAULTS_AUTOQUERY_BUCKETS_KEY,
                 &aq.buckets,
-                bucket_options,
+                bucket_groups,
             )
+        } else {
+            paragraph("(no in-scope buckets)").muted().small()
         };
         let bucket_hint = if aq.buckets.is_empty() {
             "empty = all in-scope hot buckets"
         } else {
-            "selected subset only"
+            "selected in-scope hot buckets only"
         };
 
         column([
@@ -14778,7 +14814,15 @@ impl ChatApp {
             .gap(tokens::SPACE_2)
             .align(Align::Center),
             form_item([form_label("query source"), form_control(source_trigger)]),
-            form_item([form_label("buckets"), form_control(bucket_widget)]),
+            form_item([
+                form_label("target buckets"),
+                form_control(bucket_widget),
+                form_description(
+                    "Subset for automatic nudges. Options are already limited to \
+                     in-scope buckets: server grants from Allow plus this pod's \
+                     pod-scope buckets.",
+                ),
+            ]),
             paragraph(bucket_hint).muted().small(),
             form_item([form_label("top k"), form_control(top_k)]),
             form_item([form_label("min rerank"), form_control(min_score)]),
@@ -14789,30 +14833,36 @@ impl ChatApp {
         .width(Size::Fill(1.0))
     }
 
-    fn autoquery_bucket_options(&self, cfg: &PodConfig) -> Vec<(String, String)> {
+    fn autoquery_bucket_groups(
+        &self,
+        cfg: &PodConfig,
+    ) -> Vec<(&'static str, Vec<(String, String)>)> {
         let pod_id = self.pod_editor.as_ref().map(|e| e.pod_id.as_str());
-        self.autoquery_bucket_options_for(cfg, pod_id)
+        self.autoquery_bucket_groups_for(cfg, pod_id)
     }
 
-    fn autoquery_bucket_options_for(
+    fn autoquery_bucket_groups_for(
         &self,
         cfg: &PodConfig,
         pod_id: Option<&str>,
-    ) -> Vec<(String, String)> {
-        let mut out = Vec::new();
+    ) -> Vec<(&'static str, Vec<(String, String)>)> {
+        let mut server = Vec::new();
         for name in &cfg.allow.knowledge_buckets {
-            out.push((format!("server:{name}"), format!("server:{name}")));
+            server.push((format!("server:{name}"), format!("server:{name}")));
         }
+        let mut pod = Vec::new();
         if let Some(pod_id) = pod_id {
             for b in &self.buckets {
                 if b.scope == "pod" && b.pod_id.as_deref() == Some(pod_id) {
-                    out.push((format!("pod:{}", b.id), format!("pod:{}", b.id)));
+                    pod.push((format!("pod:{}", b.id), format!("pod:{}", b.id)));
                 }
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.dedup_by(|a, b| a.0 == b.0);
-        out
+        server.sort_by(|a, b| a.0.cmp(&b.0));
+        server.dedup_by(|a, b| a.0 == b.0);
+        pod.sort_by(|a, b| a.0.cmp(&b.0));
+        pod.dedup_by(|a, b| a.0 == b.0);
+        vec![("Server grants", server), ("Pod buckets", pod)]
     }
 
     fn render_pod_editor_defaults_host_env_check(&self, cfg: &PodConfig) -> El {
