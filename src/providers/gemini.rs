@@ -427,6 +427,7 @@ impl GeminiClient {
                         capabilities: crate::providers::model::gemini_capabilities_for(
                             m.name.strip_prefix("models/").unwrap_or(&m.name),
                         ),
+                        tunables: Vec::new(),
                     })
                     .collect())
             }
@@ -457,6 +458,7 @@ impl GeminiClient {
                     context_window: None,
                     max_output_tokens: None,
                     capabilities: crate::providers::model::gemini_capabilities_for(id),
+                    tunables: Vec::new(),
                 };
                 Ok(vec![
                     entry("gemini-3-pro-preview", "Gemini 3 Pro (preview)"),
@@ -1564,7 +1566,12 @@ struct ListedModel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use whisper_agent_protocol::TunableValue;
+
+    static EMPTY_TUNABLES: BTreeMap<String, TunableValue> = BTreeMap::new();
 
     fn req<'a>(messages: &'a [Message], tools: &'a [ToolSpec], model: &'a str) -> ModelRequest<'a> {
         ModelRequest {
@@ -1574,6 +1581,7 @@ mod tests {
             tools,
             messages,
             cache_breakpoints: &[],
+            tunables: &EMPTY_TUNABLES,
         }
     }
 

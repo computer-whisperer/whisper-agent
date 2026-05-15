@@ -286,6 +286,9 @@ impl Scheduler {
             tools: None,
             knowledge_buckets: None,
             tool_surface: None,
+            // Carry the parent's tunables verbatim so the continuation
+            // re-issues model calls with the same backend knobs.
+            tunables: (!old_config.tunables.is_empty()).then(|| old_config.tunables.clone()),
         });
         // Compaction inherits the parent's host-env list verbatim —
         // same pod allows both parent and continuation, so every entry

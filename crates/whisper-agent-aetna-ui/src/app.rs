@@ -69,7 +69,7 @@ use whisper_agent_protocol::{
     SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
     SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaultCaps,
     ThreadDefaults, ThreadSummary, ToolSurface, TrackedCadenceInput, TrackedDriverInput,
-    TriggerSpec, permission::SudoDecision,
+    TriggerSpec, TunableKind, TunableSpec, TunableValue, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -1775,6 +1775,12 @@ pub struct ChatApp {
     new_thread_knowledge_buckets: Option<Vec<String>>,
     new_thread_tool_surface: Option<ToolSurface>,
     new_thread_tool_surface_named_buf: String,
+    /// User-set values for backend-specific tunables on the new-thread
+    /// modal. Keyed by [`TunableSpec::key`] on the currently-picked
+    /// model. Always populated (no `Option`): empty means "no
+    /// overrides — inherit advertised defaults." Submitted as
+    /// `ThreadConfigOverride.tunables` only when non-empty.
+    new_thread_tunables: BTreeMap<String, TunableValue>,
     /// Full `PodConfig` cache, populated lazily via `GetPod` —
     /// `PodSummary` (what `PodList` carries) doesn't have the
     /// `allow.host_env` / `allow.mcp_hosts` tables the new-thread
@@ -2879,6 +2885,7 @@ impl ChatApp {
             new_thread_knowledge_buckets: None,
             new_thread_tool_surface: None,
             new_thread_tool_surface_named_buf: default_core_tools_text(),
+            new_thread_tunables: BTreeMap::new(),
             pod_configs: HashMap::new(),
             pending_pod_config_gets: HashMap::new(),
             pending_new_thread: None,
@@ -6938,6 +6945,11 @@ const NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY: &str =
     "new-thread:overrides:tool-surface:initial-listing";
 const NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY: &str =
     "new-thread:overrides:tool-surface:activation-surface";
+/// Routed-key prefix for backend-specific tunable controls in the new-
+/// thread overrides modal. The full key for one tunable is
+/// `{prefix}{tunable_key}` (e.g. `…:tunables:thinking`); radio groups
+/// further append `:radio:{variant_value}` via [`radio::radio_option_key`].
+const NEW_THREAD_TUNABLES_KEY_PREFIX: &str = "new-thread:overrides:tunables:";
 
 const PICKER_HOST_ENVS: &str = "picker:host-envs";
 const PICKER_HOST_ENVS_MODE: &str = "picker:host-envs:mode";
@@ -7265,6 +7277,8 @@ impl ChatApp {
             tools: self.new_thread_tools.clone(),
             knowledge_buckets: self.new_thread_knowledge_buckets.clone(),
             tool_surface: self.new_thread_tool_surface.clone(),
+            tunables: (!self.new_thread_tunables.is_empty())
+                .then(|| self.new_thread_tunables.clone()),
         };
         // Each binding field maps independently: `None` inherits,
         // `Some(empty)` explicitly replaces with no bindings, and
@@ -7325,6 +7339,7 @@ impl ChatApp {
         count += usize::from(self.new_thread_tools.is_some());
         count += usize::from(self.new_thread_knowledge_buckets.is_some());
         count += usize::from(self.new_thread_tool_surface.is_some());
+        count += usize::from(!self.new_thread_tunables.is_empty());
         count
     }
 
@@ -7359,12 +7374,52 @@ impl ChatApp {
         self.new_thread_knowledge_buckets = None;
         self.new_thread_tool_surface = None;
         self.new_thread_tool_surface_named_buf = default_core_tools_text();
+        self.new_thread_tunables.clear();
         self.new_thread_error = None;
     }
 
     fn picker_pod_config(&self) -> Option<&PodConfig> {
         let pod_id = self.picker_effective_pod_id()?;
         self.pod_configs.get(pod_id)
+    }
+
+    /// Resolve which `ModelSummary` the new-thread modal is currently
+    /// targeting, mirroring [`Self::build_creation_request`]'s fallback
+    /// chain (picked model → backend's default_model → first listed
+    /// model). Returns `None` when no backend is picked or no models
+    /// are cached for it. Used by the tunables section to decide what
+    /// controls to render.
+    fn picker_current_model_summary(&self) -> Option<&ModelSummary> {
+        let backend = self.picker_backend.as_ref()?;
+        let models = self.models_by_backend.get(backend)?;
+        let model_id = self.picker_model.as_deref().or_else(|| {
+            self.backends
+                .iter()
+                .find(|bs| &bs.name == backend)
+                .and_then(|bs| bs.default_model.as_deref())
+        });
+        match model_id {
+            Some(id) => models
+                .iter()
+                .find(|m| m.id == id)
+                .or_else(|| models.first()),
+            None => models.first(),
+        }
+    }
+
+    /// Effective value for one tunable on the new-thread modal — the
+    /// user's override if set, else the spec's advertised default.
+    /// Used by the render path so the displayed value tracks whatever
+    /// the user has touched without forcing the override map to carry
+    /// every default verbatim.
+    fn effective_tunable_value(&self, spec: &TunableSpec) -> TunableValue {
+        if let Some(v) = self.new_thread_tunables.get(&spec.key) {
+            return v.clone();
+        }
+        match &spec.kind {
+            TunableKind::Bool { default } => TunableValue::Bool(*default),
+            TunableKind::Enum { default, .. } => TunableValue::Enum(default.clone()),
+        }
     }
 
     fn seed_new_thread_compaction_override(&mut self) {
@@ -7874,6 +7929,63 @@ impl ChatApp {
             }
         }
 
+        if self.handle_new_thread_tunable_event(event) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Route a UI event into [`Self::new_thread_tunables`] for any
+    /// tunable advertised by the currently-picked model. Returns
+    /// `true` when the event matched a tunable control.
+    ///
+    /// Specs are cloned up front because the loop borrows `self`
+    /// mutably to update the override map; the tunables vec lives on
+    /// `models_by_backend` and is small enough that cloning the
+    /// handful of specs per event dispatch costs nothing measurable.
+    fn handle_new_thread_tunable_event(&mut self, event: &UiEvent) -> bool {
+        let specs: Vec<TunableSpec> = self
+            .picker_current_model_summary()
+            .map(|m| m.tunables.clone())
+            .unwrap_or_default();
+        for spec in &specs {
+            let key = format!("{NEW_THREAD_TUNABLES_KEY_PREFIX}{}", spec.key);
+            match &spec.kind {
+                TunableKind::Bool { default } => {
+                    if event.is_click_or_activate(&key) {
+                        let prev = self
+                            .new_thread_tunables
+                            .get(&spec.key)
+                            .and_then(|v| match v {
+                                TunableValue::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .unwrap_or(*default);
+                        self.new_thread_tunables
+                            .insert(spec.key.clone(), TunableValue::Bool(!prev));
+                        return true;
+                    }
+                }
+                TunableKind::Enum { variants, .. } => {
+                    let allowed: Vec<String> = variants.iter().map(|v| v.value.clone()).collect();
+                    let mut pick: Option<String> = None;
+                    if radio::apply_event(&mut pick, event, &key, |raw| {
+                        if allowed.iter().any(|v| v == raw) {
+                            Some(Some(raw.to_string()))
+                        } else {
+                            None
+                        }
+                    }) {
+                        if let Some(picked) = pick {
+                            self.new_thread_tunables
+                                .insert(spec.key.clone(), TunableValue::Enum(picked));
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
         false
     }
 
@@ -9597,9 +9709,20 @@ impl ChatApp {
             "Override how this thread presents and discovers tools.",
             self.render_new_thread_tool_surface_override(),
         );
+        let tunables_section = editor_section(
+            "Model Tunables",
+            "Backend-specific knobs advertised by the picked model. Frozen at thread creation.",
+            self.render_new_thread_tunables_override(),
+        );
 
         let body = editor_columns(
-            column([execution_section, bindings_section, compaction_section]).gap(tokens::SPACE_5),
+            column([
+                execution_section,
+                tunables_section,
+                bindings_section,
+                compaction_section,
+            ])
+            .gap(tokens::SPACE_5),
             column([
                 knowledge_access_section,
                 autoquery_section,
@@ -10154,6 +10277,72 @@ impl ChatApp {
                 )),
             ]),
         ])
+    }
+
+    /// Render one form_item per tunable advertised by the currently-
+    /// picked model. Bool tunables get a checkbox; Enum tunables get a
+    /// radio group over their variants. Empty list (or no model picked
+    /// yet) collapses to a quiet placeholder so the section still
+    /// hangs together when there's nothing to configure.
+    ///
+    /// Values displayed combine the user's overrides (if set) with the
+    /// model's advertised defaults — see [`Self::effective_tunable_value`].
+    fn render_new_thread_tunables_override(&self) -> El {
+        let Some(model) = self.picker_current_model_summary() else {
+            return paragraph("Pick a backend and model to see its tunables.")
+                .muted()
+                .small();
+        };
+        if model.tunables.is_empty() {
+            return paragraph("This model advertises no backend-specific tunables.")
+                .muted()
+                .small();
+        }
+        let items: Vec<El> = model
+            .tunables
+            .iter()
+            .map(|spec| self.render_tunable_form_item(spec))
+            .collect();
+        form(items)
+    }
+
+    fn render_tunable_form_item(&self, spec: &TunableSpec) -> El {
+        let label = spec.label.clone().unwrap_or_else(|| spec.key.clone());
+        let key = format!("{NEW_THREAD_TUNABLES_KEY_PREFIX}{}", spec.key);
+        let value = self.effective_tunable_value(spec);
+        let control: El = match &spec.kind {
+            TunableKind::Bool { .. } => {
+                let bool_value = matches!(value, TunableValue::Bool(true));
+                row([
+                    checkbox(bool_value).key(&key),
+                    text(label.clone()).muted().small(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+            }
+            TunableKind::Enum { variants, .. } => {
+                let current = match &value {
+                    TunableValue::Enum(s) => s.clone(),
+                    // Defensive: an out-of-sync bool stored where the
+                    // model now wants an enum still renders a stable
+                    // radio group instead of panicking.
+                    _ => String::new(),
+                };
+                let options: Vec<(String, String)> = variants
+                    .iter()
+                    .map(|v| {
+                        let lab = v.label.clone().unwrap_or_else(|| v.value.clone());
+                        (v.value.clone(), lab)
+                    })
+                    .collect();
+                radio_group(key.clone(), &current, options)
+            }
+        };
+        let mut item = vec![form_label(label), form_control(control)];
+        if let Some(desc) = spec.description.as_deref() {
+            item.push(form_description(desc));
+        }
+        form_item(item)
     }
 
     /// Destructive alert rendered above the new-thread card when a
@@ -20149,6 +20338,7 @@ fn fresh_pod_config_stub(name: String, mut backend_names: Vec<String>) -> PodCon
             autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
+            tunables: Default::default(),
         },
         limits: PodLimits::default(),
     }

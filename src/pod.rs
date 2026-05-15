@@ -327,6 +327,7 @@ mod tests {
                 autoquery: Default::default(),
                 caps: ThreadDefaultCaps::default(),
                 tool_surface: Default::default(),
+                tunables: Default::default(),
             },
             limits: PodLimits {
                 max_concurrent_threads: 10,

@@ -39,6 +39,8 @@ pub use tool_surface::{ActivationSurface, CoreTools, InitialListing, ToolSurface
 // crates can refer to it as `whisper_agent_protocol::SystemPromptChoice`.
 pub use sandbox::HostEnvSpec;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 // ---------- Task-level types ----------
@@ -76,6 +78,71 @@ impl Usage {
         self.cache_read_input_tokens += other.cache_read_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
+}
+
+/// Schema for one backend-specific knob a model exposes. Backends advertise
+/// these via `ModelInfo.tunables` (per-model), and the UI renders matching
+/// controls in the thread-creation flow. Values land back on
+/// [`ThreadConfig::tunables`] keyed by [`TunableSpec::key`] and ride every
+/// model call as part of [`crate::ModelRequest`]; each provider only
+/// interprets keys it advertised, ignoring the rest.
+///
+/// `kind` carries both the value shape and the default — separating "what
+/// this control is" from "what value to seed it with." Adding new shapes
+/// (Int, Float, String) later just extends the [`TunableKind`] enum.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TunableSpec {
+    /// Stable identifier used as the key in [`ThreadConfig::tunables`].
+    /// Backends must keep this stable across versions — UIs may persist
+    /// user choices by key.
+    pub key: String,
+    /// Short human label. UIs fall back to `key` when missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Longer help text (tooltip / inline hint). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub kind: TunableKind,
+}
+
+/// Shape + default for one tunable. v1 covers boolean toggles
+/// (`thinking on/off`, `fast mode`) and string-enums (reasoning effort
+/// `low | medium | high`); numeric / free-text kinds can land later.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TunableKind {
+    Bool {
+        default: bool,
+    },
+    Enum {
+        variants: Vec<TunableEnumVariant>,
+        /// Must match one of `variants[i].value`. UIs should validate
+        /// this; out-of-range defaults at the wire boundary fall back
+        /// to the first variant on the rendering side.
+        default: String,
+    },
+}
+
+/// One option in a [`TunableKind::Enum`] choice list. `value` is the
+/// wire payload sent back as [`TunableValue::Enum`]; `label` is the
+/// human-readable text the UI renders.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TunableEnumVariant {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Persisted value for a single tunable. Untagged so JSON / CBOR round-
+/// trip the value compactly (`true` / `"high"` rather than wrapping in
+/// a discriminator object). The two variants are disjoint in CBOR /
+/// JSON type space (bool vs string), so untagged deserialization is
+/// unambiguous.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum TunableValue {
+    Bool(bool),
+    Enum(String),
 }
 
 /// Diagnostic log of per-LLM-call metadata. Grows by one [`TurnEntry`]
@@ -143,6 +210,18 @@ pub struct ThreadConfig {
     /// [`ThreadConfigOverride.autoquery`].
     #[serde(default)]
     pub autoquery: KnowledgeAutoqueryConfig,
+    /// Backend-specific model-execution knobs, keyed by
+    /// [`TunableSpec::key`] as advertised on the bound model's
+    /// `ModelSummary.tunables`. Values are frozen at thread creation
+    /// (no runtime update path) and ride every model call. Each
+    /// provider only consumes keys it advertised; unknown keys are
+    /// ignored so the wire stays stable as new knobs land.
+    ///
+    /// Empty for threads created before the tunables surface existed
+    /// (via `#[serde(default)]`), and for threads whose bound model
+    /// advertises nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tunables: BTreeMap<String, TunableValue>,
 }
 
 impl ThreadConfig {
@@ -159,6 +238,7 @@ impl ThreadConfig {
             max_turns: defaults.max_turns,
             compaction: defaults.compaction.clone(),
             autoquery: defaults.autoquery.clone(),
+            tunables: defaults.tunables.clone(),
         }
     }
 
@@ -166,14 +246,24 @@ impl ThreadConfig {
     /// `None` fields inherit; `Some` fields replace. `system_prompt`
     /// is intentionally ignored here because it is resolved into the
     /// conversation prefix, not stored on `ThreadConfig`.
+    ///
+    /// `tunables` merges per-key — entries set in the override replace
+    /// the matching base entry, while keys absent from the override
+    /// inherit. This lets a user toggle a single backend knob without
+    /// having to repeat the entire pod-default tunable map.
     pub fn compose_override(self, ov: Option<ThreadConfigOverride>) -> Self {
         let Some(ov) = ov else { return self };
+        let mut tunables = self.tunables;
+        if let Some(extra) = ov.tunables {
+            tunables.extend(extra);
+        }
         Self {
             model: ov.model.unwrap_or(self.model),
             max_tokens: ov.max_tokens.unwrap_or(self.max_tokens),
             max_turns: ov.max_turns.unwrap_or(self.max_turns),
             compaction: self.compaction.compose_override(ov.compaction),
             autoquery: self.autoquery.compose_override(ov.autoquery),
+            tunables,
         }
     }
 }
@@ -230,6 +320,13 @@ pub struct ThreadConfigOverride {
     /// `thread_defaults.tool_surface`; `Some` replaces it wholesale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_surface: Option<ToolSurface>,
+    /// Backend-specific tunable values to layer onto the pod-default
+    /// `tunables` map. `None` inherits the pod defaults verbatim;
+    /// `Some` merges per-key (override entries win, absent keys
+    /// inherit). Keys correspond to [`TunableSpec::key`] entries on
+    /// the chosen model's advertisement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunables: Option<BTreeMap<String, TunableValue>>,
 }
 
 impl ThreadConfigOverride {
@@ -245,6 +342,7 @@ impl ThreadConfigOverride {
             && self.tools.is_none()
             && self.knowledge_buckets.is_none()
             && self.tool_surface.is_none()
+            && self.tunables.is_none()
     }
 }
 
@@ -781,6 +879,13 @@ pub struct ModelSummary {
     /// classified — treat that as "text only" at the UI layer.
     #[serde(default, skip_serializing_if = "ContentCapabilities_is_default")]
     pub capabilities: ContentCapabilities,
+    /// Backend-specific execution knobs this model exposes (e.g.
+    /// thinking on/off, reasoning effort, fast mode). Empty when the
+    /// backend declares nothing for this model. UIs render matching
+    /// controls in the thread-creation flow; selections land on
+    /// [`ThreadConfig::tunables`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunables: Vec<TunableSpec>,
 }
 
 #[allow(non_snake_case)]
@@ -2739,6 +2844,7 @@ mod tests {
             },
             caps: ThreadDefaultCaps::default(),
             tool_surface: ToolSurface::default(),
+            tunables: Default::default(),
         }
     }
 
@@ -2766,6 +2872,7 @@ mod tests {
             tools: None,
             knowledge_buckets: None,
             tool_surface: None,
+            tunables: None,
         }));
 
         assert_eq!(composed.model, "claude-override");
@@ -2783,6 +2890,60 @@ mod tests {
     }
 
     #[test]
+    fn thread_config_tunables_merge_per_key_on_override() {
+        // Pod-level defaults pin two knobs. The thread-creation override
+        // bumps one and adds a new one. The third (untouched) entry
+        // must survive into the composed thread config — merge per-key,
+        // not replace-wholesale.
+        let mut pod_defaults = sample_thread_defaults();
+        pod_defaults.tunables = BTreeMap::from_iter([
+            ("thinking".into(), TunableValue::Bool(true)),
+            ("effort".into(), TunableValue::Enum("medium".into())),
+        ]);
+        let base = ThreadConfig::from_thread_defaults(&pod_defaults);
+
+        let override_map = BTreeMap::from_iter([
+            ("effort".into(), TunableValue::Enum("high".into())),
+            ("fast_mode".into(), TunableValue::Bool(true)),
+        ]);
+        let composed = base.compose_override(Some(ThreadConfigOverride {
+            tunables: Some(override_map),
+            ..Default::default()
+        }));
+
+        // Pod's `thinking` survives untouched.
+        assert_eq!(
+            composed.tunables.get("thinking"),
+            Some(&TunableValue::Bool(true))
+        );
+        // Override wins over pod default.
+        assert_eq!(
+            composed.tunables.get("effort"),
+            Some(&TunableValue::Enum("high".into()))
+        );
+        // Override-only key lands too.
+        assert_eq!(
+            composed.tunables.get("fast_mode"),
+            Some(&TunableValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn tunable_value_untagged_round_trips_through_json() {
+        // Untagged serialization keeps the wire compact: bool stays a
+        // bool, enum stays a string. The deserializer disambiguates by
+        // JSON type without a discriminator wrapper.
+        let b = TunableValue::Bool(true);
+        let e = TunableValue::Enum("high".into());
+        assert_eq!(serde_json::to_string(&b).unwrap(), "true");
+        assert_eq!(serde_json::to_string(&e).unwrap(), "\"high\"");
+        let b2: TunableValue = serde_json::from_str("false").unwrap();
+        let e2: TunableValue = serde_json::from_str("\"low\"").unwrap();
+        assert_eq!(b2, TunableValue::Bool(false));
+        assert_eq!(e2, TunableValue::Enum("low".into()));
+    }
+
+    #[test]
     fn thread_override_empty_tracks_all_creation_axes() {
         assert!(ThreadConfigOverride::default().is_empty());
         assert!(
@@ -2791,6 +2952,17 @@ mod tests {
                 ..Default::default()
             }
             .is_empty()
+        );
+        assert!(
+            !ThreadConfigOverride {
+                tunables: Some(BTreeMap::from_iter([(
+                    "fast_mode".into(),
+                    TunableValue::Bool(true),
+                )])),
+                ..Default::default()
+            }
+            .is_empty(),
+            "tunables override must trip is_empty so the override survives serialization"
         );
 
         assert!(ThreadBindingsRequest::default().is_empty());

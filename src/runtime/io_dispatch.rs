@@ -8,11 +8,12 @@
 //! here so adding a new variant only touches this module plus the
 //! consumer (thread state machine).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use tracing::debug;
-use whisper_agent_protocol::ServerToClient;
+use whisper_agent_protocol::{ServerToClient, TunableValue};
 
 use crate::providers::model::{
     CacheBreakpoint, ModelEvent, ModelRequest, ToolSpec, default_cache_policy,
@@ -598,6 +599,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             tools: &owned_req.tools,
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
+            tunables: &owned_req.tunables,
         };
         let result =
             match stream_with_retry(provider.as_ref(), &req, &thread_id, &stream_tx, &cancel).await
@@ -1179,6 +1181,7 @@ struct OwnedModelRequest {
     tools: Vec<ToolSpec>,
     messages: Vec<whisper_agent_protocol::Message>,
     cache_breakpoints: Vec<CacheBreakpoint>,
+    tunables: BTreeMap<String, TunableValue>,
 }
 
 fn build_model_request(
@@ -1217,6 +1220,7 @@ fn build_model_request(
     };
     let max_tokens = task.config.max_tokens;
     let cache_breakpoints = default_cache_policy(&messages);
+    let tunables = task.config.tunables.clone();
     (
         OwnedModelRequest {
             model: model.clone(),
@@ -1225,6 +1229,7 @@ fn build_model_request(
             tools,
             messages,
             cache_breakpoints,
+            tunables,
         },
         model,
         backend_name,

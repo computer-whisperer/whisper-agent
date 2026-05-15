@@ -257,6 +257,7 @@ impl BehaviorThreadOverride {
             tools: None,
             knowledge_buckets: None,
             tool_surface: None,
+            tunables: None,
         };
         let config = (!config.is_empty()).then_some(config);
         (config, self.bindings.to_thread_bindings_request())

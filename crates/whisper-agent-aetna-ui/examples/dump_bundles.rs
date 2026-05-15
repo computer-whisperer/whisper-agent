@@ -1895,6 +1895,7 @@ fn mock_models() -> Vec<ModelSummary> {
             context_window: Some(1_000_000),
             max_output_tokens: Some(8192),
             capabilities: ContentCapabilities::default(),
+            tunables: Vec::new(),
         },
         ModelSummary {
             id: "claude-sonnet-4-6".into(),
@@ -1902,6 +1903,7 @@ fn mock_models() -> Vec<ModelSummary> {
             context_window: Some(200_000),
             max_output_tokens: Some(8192),
             capabilities: ContentCapabilities::default(),
+            tunables: Vec::new(),
         },
         ModelSummary {
             id: "claude-haiku-4-5".into(),
@@ -1909,6 +1911,7 @@ fn mock_models() -> Vec<ModelSummary> {
             context_window: Some(200_000),
             max_output_tokens: Some(8192),
             capabilities: ContentCapabilities::default(),
+            tunables: Vec::new(),
         },
     ]
 }
@@ -2451,6 +2454,7 @@ mcp_hosts = ["filesystem", "git"]
             autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
+            tunables: Default::default(),
         },
         limits: PodLimits::default(),
     };
@@ -2644,6 +2648,7 @@ fn mock_snapshot() -> ThreadSnapshot {
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
+            tunables: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride
@@ -2784,6 +2789,7 @@ fn base_snapshot(
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
+            tunables: Default::default(),
         },
         bindings: ThreadBindings::default(),
         state,
@@ -3134,6 +3140,7 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
+            tunables: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride

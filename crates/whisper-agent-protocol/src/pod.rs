@@ -173,6 +173,16 @@ pub struct ThreadDefaults {
     /// behavior.
     #[serde(default)]
     pub tool_surface: ToolSurface,
+    /// Pod-level defaults for backend-specific tunables (e.g.
+    /// thinking on/off). Threads created from this pod inherit these
+    /// values into [`crate::ThreadConfig::tunables`]; per-thread
+    /// overrides at creation time merge on top via
+    /// [`crate::ThreadConfigOverride::tunables`]. Keys correspond to
+    /// what each model advertises via `ModelSummary.tunables`; pods
+    /// that don't pin anything leave this empty and let the model's
+    /// advertised defaults apply.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tunables: std::collections::BTreeMap<String, crate::TunableValue>,
 }
 
 /// Per-cap starting value for a freshly-created thread. Defaults to

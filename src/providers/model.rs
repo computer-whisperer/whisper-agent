@@ -9,6 +9,7 @@
 //! types, which are Anthropic-content-block-shaped. Translating OpenAI-style messages
 //! into / out of this shape is the OpenAI backend's job, not the scheduler's.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
     ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec, ToolKind,
-    ToolSchema, Usage,
+    ToolSchema, TunableSpec, TunableValue, Usage,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -42,6 +43,14 @@ pub struct ModelRequest<'a> {
     /// list at 4 markers per request — the scheduler is responsible for staying
     /// under that limit.
     pub cache_breakpoints: &'a [CacheBreakpoint],
+    /// Backend-specific execution knobs, keyed by the spec keys the
+    /// provider advertised via `tunables_for(model_id)`. Each provider
+    /// only consumes keys it advertised; unknown keys are ignored so
+    /// the wire stays stable as new tunables land. Empty when the
+    /// thread carries no per-knob choices (either because the model
+    /// advertises nothing, or because the user accepted every
+    /// advertised default and the UI sent nothing back).
+    pub tunables: &'a BTreeMap<String, TunableValue>,
 }
 
 /// Logical positions at which a cache checkpoint can be attached. Translated into
@@ -116,6 +125,13 @@ pub struct ModelInfo {
     /// from a per-model table (vision support varies across each
     /// provider's catalog). Default is empty = text-only.
     pub capabilities: ContentCapabilities,
+    /// Backend-specific execution knobs this model exposes (thinking
+    /// on/off, reasoning effort, fast mode, …). Providers populate
+    /// this from their own per-model knowledge; empty means "no
+    /// advertised tunables." The scheduler copies this list onto
+    /// `ModelSummary.tunables` so UIs can render matching controls
+    /// in the thread-creation flow.
+    pub tunables: Vec<TunableSpec>,
 }
 
 #[derive(Debug, Error)]
@@ -335,6 +351,21 @@ pub trait ModelProvider: Send + Sync {
     /// conservative default).
     fn capabilities_for(&self, _model_id: &str) -> ContentCapabilities {
         ContentCapabilities::default()
+    }
+
+    /// Synchronous lookup of the backend-specific tunable schema for a
+    /// known model id. Used by the thread-creation flow to decide what
+    /// controls to render, and to validate that values landing on
+    /// [`crate::runtime::scheduler::Scheduler`] correspond to keys this
+    /// model actually advertises.
+    ///
+    /// Default returns an empty vec — backends opt in per-model when
+    /// they have knobs worth exposing. Should agree with whatever
+    /// `list_models()` returns for the same id (the scheduler treats
+    /// `list_models` as the catalog; this method is a fast path for
+    /// callers that already know the id).
+    fn tunables_for(&self, _model_id: &str) -> Vec<TunableSpec> {
+        Vec::new()
     }
 
     /// Replace the Codex `auth.json` contents for this provider, writing

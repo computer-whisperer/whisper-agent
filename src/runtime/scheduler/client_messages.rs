@@ -1310,6 +1310,7 @@ impl Scheduler {
                                     context_window: m.context_window,
                                     max_output_tokens: m.max_output_tokens,
                                     capabilities: m.capabilities,
+                                    tunables: m.tunables,
                                 })
                                 .collect();
                             let _ = outbound.send(ServerToClient::ModelsList {

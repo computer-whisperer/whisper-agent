@@ -1305,6 +1305,7 @@ mod tests {
             max_turns: 10,
             compaction: Default::default(),
             autoquery: Default::default(),
+            tunables: Default::default(),
         }
     }
 

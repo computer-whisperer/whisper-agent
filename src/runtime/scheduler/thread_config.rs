@@ -79,6 +79,7 @@ pub fn build_default_pod_config(
             autoquery: Default::default(),
             caps: Default::default(),
             tool_surface: Default::default(),
+            tunables: Default::default(),
         },
         limits: PodLimits::default(),
     }

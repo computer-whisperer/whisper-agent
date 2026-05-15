@@ -992,6 +992,7 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             autoquery: task.config.autoquery.clone(),
             caps: Default::default(),
             tool_surface: Default::default(),
+            tunables: task.config.tunables.clone(),
         },
         limits: PodLimits::default(),
     }
@@ -1039,6 +1040,7 @@ mod tests {
                 autoquery: Default::default(),
                 caps: Default::default(),
                 tool_surface: Default::default(),
+                tunables: Default::default(),
             },
             limits: PodLimits::default(),
         }
@@ -1051,6 +1053,7 @@ mod tests {
             max_turns: 50,
             compaction: Default::default(),
             autoquery: Default::default(),
+            tunables: Default::default(),
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),
