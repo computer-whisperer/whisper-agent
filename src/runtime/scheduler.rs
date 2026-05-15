@@ -2088,12 +2088,11 @@ impl Scheduler {
             // `sudo` is only meaningful with an interactive approver
             // attached and must be directly admitted. Listing sudo as
             // "askable via sudo" is recursive noise.
-            if tool.name == crate::tools::builtin_tools::SUDO {
-                if !escalation_available
-                    || name_admission != crate::runtime::tool_listing::ToolAdmission::Admitted
-                {
-                    continue;
-                }
+            if tool.name == crate::tools::builtin_tools::SUDO
+                && (!escalation_available
+                    || name_admission != crate::runtime::tool_listing::ToolAdmission::Admitted)
+            {
+                continue;
             }
             let cap_admission = builtin_cap_admission(
                 &tool.name,

@@ -6754,11 +6754,8 @@ fn set_tool_disposition(map: &mut AllowMap<String>, name: &str, disposition: Dis
 fn allowed_internal_tools(map: &AllowMap<String>) -> Vec<String> {
     INTERNAL_BUILTIN_TOOL_OPTIONS
         .iter()
-        .filter_map(|(name, _)| {
-            map.disposition(&(*name).to_string())
-                .admits()
-                .then(|| (*name).to_string())
-        })
+        .filter(|(name, _)| map.disposition(&(*name).to_string()).admits())
+        .map(|(name, _)| (*name).to_string())
         .collect()
 }
 
@@ -7760,8 +7757,8 @@ impl ChatApp {
             }
             return true;
         }
-        if let Some(caps) = self.new_thread_caps.as_mut() {
-            if radio::apply_event(
+        if let Some(caps) = self.new_thread_caps.as_mut()
+            && (radio::apply_event(
                 &mut caps.pod_modify,
                 event,
                 NEW_THREAD_CAPS_POD_MODIFY_KEY,
@@ -7776,9 +7773,9 @@ impl ChatApp {
                 event,
                 NEW_THREAD_CAPS_BEHAVIORS_KEY,
                 behaviors_cap_from_wire,
-            ) {
-                return true;
-            }
+            ))
+        {
+            return true;
         }
 
         if event.is_click_or_activate(NEW_THREAD_TOOLS_OVERRIDE_KEY) {
