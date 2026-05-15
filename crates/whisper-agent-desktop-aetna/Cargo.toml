@@ -1,7 +1,7 @@
 [package]
 name = "whisper-agent-desktop-aetna"
 description = "Native desktop client for whisper-agent (aetna + tokio-tungstenite)"
-version = "0.3.19"
+version = "0.3.20"
 edition.workspace = true
 license.workspace = true
 

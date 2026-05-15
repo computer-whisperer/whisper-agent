@@ -1,7 +1,7 @@
 [package]
 name = "whisper-agent-aetna-ui"
 description = "Browser + native chat UI for whisper-agent (aetna)"
-version = "0.3.19"
+version = "0.3.20"
 edition.workspace = true
 license.workspace = true
 
