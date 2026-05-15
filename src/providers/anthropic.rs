@@ -18,9 +18,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use whisper_agent_protocol::{
-    ContentBlock, Message, ProviderReplay, ToolResultContent, TunableKind, TunableSpec, Usage,
-};
+use whisper_agent_protocol::{ContentBlock, Message, ProviderReplay, ToolResultContent, Usage};
 
 use crate::providers::model::{
     BoxFuture, BoxStream, CacheBreakpoint, ModelError, ModelEvent, ModelInfo, ModelProvider,
@@ -32,26 +30,6 @@ const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const EXTENDED_CACHE_BETA: &str = "extended-cache-ttl-2025-04-11";
 const CACHE_TTL_1H: &str = "1h";
-
-/// Demo tunable advertised on every Anthropic model — proves the
-/// advertisement / persistence / wire path end-to-end without yet wiring
-/// a real backend knob. Remove together with the request-side debug log
-/// below when the first real Anthropic tunable lands (e.g. extended
-/// thinking on/off).
-const DEMO_TUNABLE_KEY: &str = "dummy_toggle";
-
-fn demo_tunable_spec() -> TunableSpec {
-    TunableSpec {
-        key: DEMO_TUNABLE_KEY.into(),
-        label: Some("Demo toggle".into()),
-        description: Some(
-            "Placeholder tunable used during the backend-tunables scaffold rollout. \
-             Has no effect on requests — delete when the first real Anthropic knob lands."
-                .into(),
-        ),
-        kind: TunableKind::Bool { default: false },
-    }
-}
 
 /// Identifier stored on [`ProviderReplay::provider`] for blobs minted by this
 /// backend. Anthropic `Thinking` blocks carry their opaque `signature` here on
@@ -235,8 +213,7 @@ impl AnthropicClient {
                 // listed on /v1/models anymore, so a blanket assignment
                 // here matches reality.
                 capabilities: crate::providers::model::standard_vision_capabilities(),
-                // Demo-only — see `demo_tunable_spec` for removal note.
-                tunables: vec![demo_tunable_spec()],
+                tunables: Vec::new(),
             })
             .collect())
     }
@@ -269,11 +246,6 @@ impl ModelProvider for AnthropicClient {
         // every entry with `standard_vision_capabilities`.
         crate::providers::model::standard_vision_capabilities()
     }
-
-    fn tunables_for(&self, _model_id: &str) -> Vec<TunableSpec> {
-        // Demo-only — see `demo_tunable_spec` for removal note.
-        vec![demo_tunable_spec()]
-    }
 }
 
 fn spec_to_anthropic_tool(t: &ToolSpec) -> AnthropicTool {
@@ -288,15 +260,6 @@ fn spec_to_anthropic_tool(t: &ToolSpec) -> AnthropicTool {
 /// Build the Anthropic wire body from a generic [`ModelRequest`], translating each
 /// [`CacheBreakpoint`] into `cache_control` markers on the appropriate element.
 fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a> {
-    // Demo-only — proves the tunable map reaches the provider end of
-    // the pipe. Emitted at info level so it's visible under the
-    // server's default `whisper_agent=info` filter without needing
-    // `RUST_LOG=debug`. Remove when the first real Anthropic tunable
-    // lands.
-    if let Some(v) = req.tunables.get(DEMO_TUNABLE_KEY) {
-        tracing::info!(model = req.model, tunable = ?v, "anthropic saw demo tunable");
-    }
-
     let cache_system = req
         .cache_breakpoints
         .iter()

@@ -125,12 +125,18 @@ pub enum TunableKind {
 
 /// One option in a [`TunableKind::Enum`] choice list. `value` is the
 /// wire payload sent back as [`TunableValue::Enum`]; `label` is the
-/// human-readable text the UI renders.
+/// human-readable text the UI renders; `description` is optional
+/// longer help text (tooltip / inline hint), populated when the
+/// backend has per-variant detail worth surfacing — the codex
+/// service-tier path uses this for the per-tier descriptions returned
+/// by the `/models` endpoint.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TunableEnumVariant {
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Persisted value for a single tunable. Untagged so JSON / CBOR round-

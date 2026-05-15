@@ -36,7 +36,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_auth::{ClientAuth, CodexAuth};
 use whisper_agent_protocol::{
-    ContentBlock, Message, ProviderReplay, Role, ToolResultContent, Usage,
+    ContentBlock, Message, ProviderReplay, Role, ToolResultContent, TunableEnumVariant,
+    TunableKind, TunableSpec, TunableValue, Usage,
 };
 
 use crate::providers::model::{
@@ -134,6 +135,7 @@ impl OpenAiResponsesClient {
             // "Stream must be set to true". api.openai.com accepts either; we
             // always stream and reassemble so both routes share one code path.
             stream: true,
+            service_tier: pick_service_tier(req.tunables),
         };
         // req.max_tokens is ignored: the ChatGPT-subscription route rejects
         // `max_output_tokens` outright, and Codex's own client doesn't send it
@@ -299,6 +301,9 @@ impl OpenAiResponsesClient {
                 .filter(|m| m.supported_in_api && m.visibility.as_deref() == Some("list"))
                 .map(|m| {
                     let capabilities = crate::providers::model::openai_vision_capabilities(&m.slug);
+                    let tunables = build_service_tier_tunable(&m)
+                        .map(|t| vec![t])
+                        .unwrap_or_default();
                     ModelInfo {
                         id: m.slug,
                         display_name: m.display_name,
@@ -307,7 +312,7 @@ impl OpenAiResponsesClient {
                         context_window: None,
                         max_output_tokens: None,
                         capabilities,
-                        tunables: Vec::new(),
+                        tunables,
                     }
                 })
                 .collect())
@@ -1347,6 +1352,13 @@ struct RspRequest<'a> {
     include: &'static [&'static str],
     store: bool,
     stream: bool,
+    /// Codex service-tier override (e.g. `"priority"` for Fast). Omitted
+    /// from the wire when `None` so default-tier requests stay
+    /// byte-identical to pre-tunable bodies — the chatgpt.com backend
+    /// 400s on unknown tiers, so we only send values the model
+    /// advertised in `/models`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'a str>,
 }
 
 /// Wire value for [`RspRequest::include`]. Constant because we always want the
@@ -1647,6 +1659,98 @@ struct RspCodexModel {
     /// create-message calls for.
     #[serde(default)]
     supported_in_api: bool,
+    /// Service tiers this model can run with — each tier becomes a
+    /// variant on the `service_tier` tunable advertised to the UI.
+    /// Empty for models that don't support any tier override.
+    #[serde(default)]
+    service_tiers: Vec<RspCodexServiceTier>,
+    /// Legacy shape for fast-mode-only models that pre-date
+    /// `service_tiers`. Codex's own `supports_fast_mode()` falls back
+    /// to checking this for `"fast"`; we mirror that so models on the
+    /// older metadata still pick up a Fast variant.
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
+}
+
+/// One entry in the codex `/models` response's `service_tiers` array.
+/// `id` is the wire value sent back as the request body's `service_tier`
+/// field; `name` and `description` are user-facing strings.
+#[derive(Deserialize, Debug)]
+struct RspCodexServiceTier {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Tunable key surfaced on every codex-mode model that supports a
+/// service tier. Stable identifier — UIs may persist user choices by
+/// this string. Matches the wire field name for clarity.
+const TUNABLE_KEY_SERVICE_TIER: &str = "service_tier";
+
+/// Build the `service_tier` tunable advertised for one codex model, or
+/// `None` when the model's metadata says no override is available.
+///
+/// Variants are pulled directly from the API: `service_tiers` for the
+/// modern shape (`id`, `name`, `description`), with a legacy
+/// `additional_speed_tiers: ["fast"]` fallback that maps to the same
+/// wire value (`"priority"`) so older metadata still surfaces the
+/// Fast option. A synthetic "Default" variant with empty `value`
+/// represents "omit the field entirely" on the wire.
+fn build_service_tier_tunable(m: &RspCodexModel) -> Option<TunableSpec> {
+    let mut variants: Vec<TunableEnumVariant> = vec![TunableEnumVariant {
+        value: String::new(),
+        label: Some("Default".into()),
+        description: Some("No service tier override.".into()),
+    }];
+    for tier in &m.service_tiers {
+        if tier.id.is_empty() || variants.iter().any(|v| v.value == tier.id) {
+            continue;
+        }
+        variants.push(TunableEnumVariant {
+            value: tier.id.clone(),
+            label: tier.name.clone(),
+            description: tier.description.clone(),
+        });
+    }
+    // `additional_speed_tiers: ["fast"]` is the older shape; codex
+    // itself maps that to the modern Fast tier whose wire id is
+    // "priority". Only synthesize a variant if the modern entry
+    // wasn't already pulled in above.
+    for legacy in &m.additional_speed_tiers {
+        if legacy.eq_ignore_ascii_case("fast") && !variants.iter().any(|v| v.value == "priority") {
+            variants.push(TunableEnumVariant {
+                value: "priority".into(),
+                label: Some("Fast".into()),
+                description: Some("Priority queue inference.".into()),
+            });
+        }
+    }
+    // Only the synthetic Default — model effectively has no choice,
+    // so don't render a control at all.
+    if variants.len() <= 1 {
+        return None;
+    }
+    Some(TunableSpec {
+        key: TUNABLE_KEY_SERVICE_TIER.into(),
+        label: Some("Service tier".into()),
+        description: Some("Inference queue for this model.".into()),
+        kind: TunableKind::Enum {
+            variants,
+            default: String::new(),
+        },
+    })
+}
+
+/// Translate the picked `service_tier` value into the wire field. Empty
+/// strings (the synthetic Default) and unset tunables both elide the
+/// field — the API treats both as "no override."
+fn pick_service_tier(tunables: &std::collections::BTreeMap<String, TunableValue>) -> Option<&str> {
+    match tunables.get(TUNABLE_KEY_SERVICE_TIER) {
+        Some(TunableValue::Enum(v)) if !v.is_empty() => Some(v.as_str()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1901,6 +2005,123 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
     }
 
     #[test]
+    fn build_service_tier_tunable_from_modern_payload() {
+        // Modern shape: each tier carries id + name + description. The
+        // synthetic Default variant is prepended so omitting the wire
+        // field stays expressible from the UI.
+        let body = r#"{
+            "models": [{
+                "slug": "gpt-5.4",
+                "display_name": "GPT-5.4",
+                "visibility": "list",
+                "supported_in_api": true,
+                "service_tiers": [
+                    {"id": "priority", "name": "Fast", "description": "Priority queue."}
+                ]
+            }]
+        }"#;
+        let parsed: RspCodexModelsResponse = serde_json::from_str(body).unwrap();
+        let m = &parsed.models[0];
+        let spec = build_service_tier_tunable(m).expect("model advertises a tier");
+        assert_eq!(spec.key, "service_tier");
+        match spec.kind {
+            TunableKind::Enum { variants, default } => {
+                assert_eq!(default, ""); // synthetic Default selected
+                assert_eq!(variants.len(), 2);
+                assert_eq!(variants[0].value, "");
+                assert_eq!(variants[1].value, "priority");
+                assert_eq!(variants[1].label.as_deref(), Some("Fast"));
+                assert_eq!(variants[1].description.as_deref(), Some("Priority queue."));
+            }
+            _ => panic!("expected Enum kind"),
+        }
+    }
+
+    #[test]
+    fn build_service_tier_tunable_legacy_additional_speed_tiers() {
+        // Older metadata: only `additional_speed_tiers: ["fast"]`.
+        // Codex's `supports_fast_mode()` treats this as equivalent to
+        // a modern `priority` tier — we mirror that mapping so the UI
+        // still surfaces the Fast option on grandfathered models.
+        let body = r#"{
+            "models": [{
+                "slug": "gpt-5-legacy",
+                "display_name": "GPT-5 (legacy)",
+                "visibility": "list",
+                "supported_in_api": true,
+                "additional_speed_tiers": ["fast"]
+            }]
+        }"#;
+        let parsed: RspCodexModelsResponse = serde_json::from_str(body).unwrap();
+        let m = &parsed.models[0];
+        let spec = build_service_tier_tunable(m).expect("legacy model still surfaces a tier");
+        match spec.kind {
+            TunableKind::Enum { variants, .. } => {
+                assert_eq!(variants.len(), 2);
+                assert_eq!(variants[1].value, "priority");
+                assert_eq!(variants[1].label.as_deref(), Some("Fast"));
+            }
+            _ => panic!("expected Enum kind"),
+        }
+    }
+
+    #[test]
+    fn build_service_tier_tunable_skips_models_without_tiers() {
+        // A model with neither service_tiers nor additional_speed_tiers
+        // should produce no tunable — synthesizing a "Default-only"
+        // control would be a dead-end UI surface.
+        let body = r#"{
+            "models": [{
+                "slug": "gpt-4.1",
+                "display_name": "GPT-4.1",
+                "visibility": "list",
+                "supported_in_api": true
+            }]
+        }"#;
+        let parsed: RspCodexModelsResponse = serde_json::from_str(body).unwrap();
+        let m = &parsed.models[0];
+        assert!(build_service_tier_tunable(m).is_none());
+    }
+
+    #[test]
+    fn pick_service_tier_omits_field_for_empty_and_unset() {
+        // The synthetic Default variant lands as `Enum("")`; both that
+        // and the absent-entirely case must elide the wire field.
+        let mut t = std::collections::BTreeMap::new();
+        assert_eq!(pick_service_tier(&t), None);
+        t.insert("service_tier".into(), TunableValue::Enum(String::new()));
+        assert_eq!(pick_service_tier(&t), None);
+        t.insert("service_tier".into(), TunableValue::Enum("priority".into()));
+        assert_eq!(pick_service_tier(&t), Some("priority"));
+    }
+
+    #[test]
+    fn request_body_service_tier_serializes_only_when_present() {
+        // Codex backend 400s on unknown tier strings, so the wire field
+        // must stay absent for default-tier calls instead of riding as
+        // null or empty string.
+        let body = RspRequest {
+            model: "gpt-5",
+            instructions: None,
+            input: Vec::new(),
+            tools: None,
+            include: REQUEST_INCLUDES,
+            store: false,
+            stream: true,
+            service_tier: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("service_tier").is_none(), "absent when None: {v}");
+
+        let body = RspRequest {
+            service_tier: Some("priority"),
+            ..body
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["service_tier"], serde_json::json!("priority"));
+    }
+
+    #[test]
     fn codex_models_response_filters_to_user_visible_api_supported() {
         let body = r#"{
             "models": [
@@ -1957,6 +2178,7 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             include: REQUEST_INCLUDES,
             store: false,
             stream: true,
+            service_tier: None,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(
