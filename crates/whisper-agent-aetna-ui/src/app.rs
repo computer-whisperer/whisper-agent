@@ -5658,6 +5658,12 @@ impl App for ChatApp {
                 }
                 return;
             }
+            if let Some(name) = key.strip_prefix(PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX) {
+                if let Some(entry) = self.picker_host_envs.iter_mut().find(|e| e.name == name) {
+                    entry.runas_draft.clear();
+                }
+                return;
+            }
             if let Some(name) = key.strip_prefix(PICKER_MCP_HOSTS_REMOVE_PREFIX) {
                 self.picker_mcp_hosts.retain(|n| n != name);
                 if self.picker_mcp_hosts.is_empty() {
@@ -5666,6 +5672,21 @@ impl App for ChatApp {
                 self.new_thread_error = None;
                 return;
             }
+        }
+
+        // Per-entry runas text input. Same shape as the workspace_root
+        // route handler below — checked first because its prefix would
+        // otherwise overlap with the wsroot one if we ever shortened
+        // the latter. Today they're disjoint, but explicit ordering
+        // makes the dispatch read top-down without surprise.
+        if let Some(target) = event.target_key()
+            && let Some(name) = target.strip_prefix(PICKER_HOST_ENVS_RUNAS_PREFIX)
+        {
+            let key = format!("{PICKER_HOST_ENVS_RUNAS_PREFIX}{name}");
+            if let Some(entry) = self.picker_host_envs.iter_mut().find(|e| e.name == name) {
+                text_input::apply_event(&mut entry.runas_draft, &mut self.selection, &key, &event);
+            }
+            return;
         }
 
         // Per-entry workspace_root text input. Route keys live under
@@ -5942,15 +5963,16 @@ fn chat_user_fork_key(msg_index: usize) -> String {
 }
 
 /// Per-entry picker state for a host-env binding selected for the next
-/// `CreateThread`. Pairs the catalog entry name with an editable string
-/// buffer for the optional workspace_root override; the buffer is what
-/// the inline text_input binds to. Converted back to the wire
-/// `HostEnvBindingRequest` (empty draft ⇒ `None`, else
-/// `Some(PathBuf::from(draft))`) in `build_creation_request`.
+/// `CreateThread`. Pairs the catalog entry name with editable string
+/// buffers for the optional workspace_root and runas overrides; the
+/// buffers are what the inline text_inputs bind to. Converted back to
+/// the wire `HostEnvBindingRequest` (empty draft ⇒ `None`) in
+/// `build_creation_request`.
 #[derive(Default, Clone)]
 struct PickerHostEnv {
     name: String,
     workspace_root_draft: String,
+    runas_draft: String,
 }
 
 /// Explicit inheritance mode for binding lists. The underlying wire
@@ -6385,6 +6407,10 @@ const HOST_ENV_EDITOR_NETWORK_PREFIX: &str = "pod-editor:host-env:network:";
 const HOST_ENV_EDITOR_NETWORK_HOST_ADD_PREFIX: &str = "pod-editor:host-env:network:host:add:";
 const HOST_ENV_EDITOR_NETWORK_HOST_PREFIX: &str = "pod-editor:host-env:network:host:";
 const HOST_ENV_EDITOR_NETWORK_HOST_DELETE_PREFIX: &str = "pod-editor:host-env:network:host:delete:";
+const HOST_ENV_EDITOR_RUNAS_ADD_KEY: &str = "pod-editor:host-env:runas:add";
+const HOST_ENV_EDITOR_RUNAS_PREFIX: &str = "pod-editor:host-env:runas:";
+const HOST_ENV_EDITOR_RUNAS_DELETE_PREFIX: &str = "pod-editor:host-env:runas:delete:";
+const HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY: &str = "pod-editor:host-env:runas:default";
 /// Defaults-tab field keys.
 const POD_EDITOR_DEFAULTS_BACKEND_KEY: &str = "pod-editor:defaults:backend";
 const POD_EDITOR_DEFAULTS_MODEL_KEY: &str = "pod-editor:defaults:model";
@@ -7143,6 +7169,14 @@ const PICKER_HOST_ENVS_WSROOT_PREFIX: &str = "picker:host-envs:wsroot:";
 /// expanded workspace_root input — clearing the draft is what restores
 /// the inherit-from-spec behavior.
 const PICKER_HOST_ENVS_DEFAULT_PREFIX: &str = "picker:host-envs:default:";
+/// Routed-key prefix for the per-entry runas text input. Same shape as
+/// `PICKER_HOST_ENVS_WSROOT_PREFIX` — suffix is the host-env entry
+/// name so apply_event finds the matching draft buffer.
+const PICKER_HOST_ENVS_RUNAS_PREFIX: &str = "picker:host-envs:runas:";
+/// Routed-key prefix for the "Default" reset button next to an expanded
+/// runas input. Clearing the draft falls back to the entry's
+/// `default_runas` server-side.
+const PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX: &str = "picker:host-envs:runas-default:";
 const PICKER_MCP_HOSTS: &str = "picker:mcp-hosts";
 const PICKER_MCP_HOSTS_MODE: &str = "picker:mcp-hosts:mode";
 const PICKER_MCP_HOSTS_REMOVE_PREFIX: &str = "picker:mcp-hosts:remove:";
@@ -7472,10 +7506,15 @@ impl ChatApp {
                         } else {
                             Some(std::path::PathBuf::from(entry.workspace_root_draft.trim()))
                         };
+                        let runas = if entry.runas_draft.trim().is_empty() {
+                            None
+                        } else {
+                            Some(entry.runas_draft.trim().to_string())
+                        };
                         HostEnvBindingRequest {
                             name: entry.name.clone(),
                             workspace_root,
-                            runas: None,
+                            runas,
                         }
                     })
                     .collect(),
@@ -8242,6 +8281,7 @@ impl ChatApp {
                     self.picker_host_envs.push(PickerHostEnv {
                         name: value,
                         workspace_root_draft: String::new(),
+                        runas_draft: String::new(),
                     });
                 }
                 self.picker_host_envs_open = false;
@@ -10689,7 +10729,7 @@ impl ChatApp {
                 host_env_chip(
                     &entry.name,
                     expanded,
-                    !entry.workspace_root_draft.is_empty(),
+                    !entry.workspace_root_draft.is_empty() || !entry.runas_draft.is_empty(),
                 )
             })
             .collect();
@@ -10727,51 +10767,93 @@ impl ChatApp {
         ])
     }
 
-    /// Inline workspace_root editor below the host-envs chip row when
-    /// a chip is expanded. Renders a text_input bound to the entry's
-    /// `workspace_root_draft` plus a "Default" reset button that
-    /// clears the draft (falling back to the spec's first-RW-path).
-    /// Returns `None` when no chip is expanded or the expanded name
-    /// no longer matches any picked entry.
+    /// Inline overrides editor below the host-envs chip row when a
+    /// chip is expanded. Renders two text inputs (workspace_root and
+    /// runas) each paired with a "Default" reset button. Returns `None`
+    /// when no chip is expanded or the expanded name no longer matches
+    /// any picked entry.
     fn host_envs_workspace_root_editor(&self) -> Option<El> {
         let name = self.picker_host_env_expanded.as_deref()?;
         let entry = self.picker_host_envs.iter().find(|e| e.name == name)?;
-        let key = format!("{PICKER_HOST_ENVS_WSROOT_PREFIX}{name}");
-        let default_key = format!("{PICKER_HOST_ENVS_DEFAULT_PREFIX}{name}");
-        let input = text_input(&entry.workspace_root_draft, &self.selection, &key);
-        let mut reset = button("Default").key(default_key).ghost();
-        if entry.workspace_root_draft.is_empty() {
-            reset = reset.disabled();
-        }
-        let label = text(format!("Workspace root for {name}")).muted().small();
-        let placeholder = self
+        let pod_entry = self
             .picker_pod_allow()
-            .and_then(|allow| allow.host_env.iter().find(|n| n.name == name))
-            .and_then(|n| match &n.spec {
-                whisper_agent_protocol::sandbox::HostEnvSpec::Landlock {
-                    allowed_paths, ..
-                } => allowed_paths
+            .and_then(|allow| allow.host_env.iter().find(|n| n.name == name));
+
+        // workspace_root row.
+        let ws_key = format!("{PICKER_HOST_ENVS_WSROOT_PREFIX}{name}");
+        let ws_default_key = format!("{PICKER_HOST_ENVS_DEFAULT_PREFIX}{name}");
+        let ws_input = text_input(&entry.workspace_root_draft, &self.selection, &ws_key);
+        let mut ws_reset = button("Default").key(ws_default_key).ghost();
+        if entry.workspace_root_draft.is_empty() {
+            ws_reset = ws_reset.disabled();
+        }
+        let ws_placeholder = pod_entry.and_then(|n| match &n.spec {
+            whisper_agent_protocol::sandbox::HostEnvSpec::Landlock { allowed_paths, .. } => {
+                allowed_paths
                     .iter()
                     .find(|p| p.mode == whisper_agent_protocol::sandbox::AccessMode::ReadWrite)
-                    .map(|p| p.path.clone()),
-                whisper_agent_protocol::sandbox::HostEnvSpec::Container { .. } => None,
-            });
-        let hint = match placeholder {
+                    .map(|p| p.path.clone())
+            }
+            whisper_agent_protocol::sandbox::HostEnvSpec::Container { .. } => None,
+        });
+        let ws_hint = match ws_placeholder {
             Some(p) => text(format!("defaults to {p}")).muted().small(),
             None => text("defaults to the entry's first RW allowed path")
                 .muted()
                 .small(),
         };
-        Some(
-            column([
-                label,
-                row([input, reset])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center),
-                hint,
-            ])
-            .gap(tokens::SPACE_1),
-        )
+
+        // runas row. Hidden when the entry's allow_runas is empty —
+        // there's nothing the user could pick anyway, and surfacing
+        // the input would tempt them to type a name that the scheduler
+        // will reject.
+        let allow_runas = pod_entry
+            .map(|n| n.allow_runas.as_slice())
+            .unwrap_or_default();
+        let runas_section = if allow_runas.is_empty() {
+            None
+        } else {
+            let runas_key = format!("{PICKER_HOST_ENVS_RUNAS_PREFIX}{name}");
+            let runas_default_key = format!("{PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX}{name}");
+            let runas_input = text_input(&entry.runas_draft, &self.selection, &runas_key);
+            let mut runas_reset = button("Default").key(runas_default_key).ghost();
+            if entry.runas_draft.is_empty() {
+                runas_reset = runas_reset.disabled();
+            }
+            let runas_default = pod_entry.and_then(|n| n.default_runas.clone());
+            let runas_label = text(format!("Run worker as (for {name})")).muted().small();
+            let allow_list = allow_runas.join(", ");
+            let hint_body = match &runas_default {
+                Some(d) => format!("defaults to {d} — allowed: [{allow_list}]"),
+                None => format!("defaults to the daemon's uid — allowed: [{allow_list}]"),
+            };
+            let runas_hint = text(hint_body).muted().small();
+            Some(
+                column([
+                    runas_label,
+                    row([runas_input, runas_reset])
+                        .gap(tokens::SPACE_2)
+                        .align(Align::Center),
+                    runas_hint,
+                ])
+                .gap(tokens::SPACE_1),
+            )
+        };
+
+        let ws_block = column([
+            text(format!("Workspace root for {name}")).muted().small(),
+            row([ws_input, ws_reset])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center),
+            ws_hint,
+        ])
+        .gap(tokens::SPACE_1);
+
+        let mut children = vec![ws_block];
+        if let Some(r) = runas_section {
+            children.push(r);
+        }
+        Some(column(children).gap(tokens::SPACE_3))
     }
 
     /// Render the MCP hosts row — same shape as
@@ -14464,6 +14546,47 @@ impl ChatApp {
             return true;
         }
 
+        // Spec-agnostic runas list controls — these apply to both
+        // Landlock and Container bindings, so check them before the
+        // spec-specific match below.
+        if event.is_click_or_activate(HOST_ENV_EDITOR_RUNAS_ADD_KEY) {
+            sub.entry.allow_runas.push(String::new());
+            sub.error = None;
+            return true;
+        }
+        if let Some(route) = event.route()
+            && let Some(raw) = route.strip_prefix(HOST_ENV_EDITOR_RUNAS_DELETE_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Ok(idx) = raw.parse::<usize>()
+            && idx < sub.entry.allow_runas.len()
+        {
+            sub.entry.allow_runas.remove(idx);
+            sub.error = None;
+            return true;
+        }
+        for (idx, name) in sub.entry.allow_runas.iter_mut().enumerate() {
+            let key = format!("{HOST_ENV_EDITOR_RUNAS_PREFIX}{idx}");
+            if event.target_key() == Some(key.as_str()) {
+                text_input::apply_event(name, &mut self.selection, &key, event);
+                sub.error = None;
+                return true;
+            }
+        }
+        if event.target_key() == Some(HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY) {
+            // Edit through an empty-string sentinel: an empty buffer
+            // serializes back to `None`, anything else to `Some(...)`.
+            let mut buf = sub.entry.default_runas.clone().unwrap_or_default();
+            text_input::apply_event(
+                &mut buf,
+                &mut self.selection,
+                HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
+                event,
+            );
+            sub.entry.default_runas = if buf.is_empty() { None } else { Some(buf) };
+            sub.error = None;
+            return true;
+        }
+
         match &mut sub.entry.spec {
             HostEnvSpec::Landlock {
                 allowed_paths,
@@ -14818,6 +14941,54 @@ impl ChatApp {
             editor.host_env_editor = Some(sub);
             return;
         }
+        // Mirror the server-side validators in `src/pod.rs::validate`:
+        // trim blanks, reject duplicates and empties in `allow_runas`,
+        // and require `default_runas` (if set) to appear in the list.
+        let mut trimmed_runas: Vec<String> = sub
+            .entry
+            .allow_runas
+            .iter()
+            .map(|u| u.trim().to_string())
+            .collect();
+        if trimmed_runas.iter().any(|u| u.is_empty()) {
+            sub.error = Some("allow_runas entries must not be blank".into());
+            editor.host_env_editor = Some(sub);
+            return;
+        }
+        let mut seen_runas = std::collections::BTreeSet::new();
+        if let Some(dup) = trimmed_runas
+            .iter()
+            .find(|u| !seen_runas.insert((*u).clone()))
+        {
+            sub.error = Some(format!("duplicate username `{dup}` in allow_runas"));
+            editor.host_env_editor = Some(sub);
+            return;
+        }
+        std::mem::swap(&mut sub.entry.allow_runas, &mut trimmed_runas);
+        let default_runas = sub
+            .entry
+            .default_runas
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(default) = &default_runas {
+            if sub.entry.allow_runas.is_empty() {
+                sub.error = Some(format!(
+                    "default_runas = `{default}` is set but allow_runas is empty"
+                ));
+                editor.host_env_editor = Some(sub);
+                return;
+            }
+            if !sub.entry.allow_runas.iter().any(|u| u == default) {
+                sub.error = Some(format!(
+                    "default_runas = `{default}` is not in allow_runas (valid: [{}])",
+                    sub.entry.allow_runas.join(", ")
+                ));
+                editor.host_env_editor = Some(sub);
+                return;
+            }
+        }
+        sub.entry.default_runas = default_runas;
         sub.entry.name = name.clone();
         sub.entry.provider = provider;
         match sub.index {
@@ -15769,7 +15940,8 @@ impl ChatApp {
                 env,
             } => self.render_host_env_container_body(editor, image, mounts, network, limits, env),
         };
-        let mut body_children = vec![top, spec_body];
+        let runas_body = self.render_host_env_runas_body(editor);
+        let mut body_children = vec![top, spec_body, runas_body];
         if let Some(err) = editor.error.as_deref() {
             body_children.push(
                 alert([
@@ -15790,6 +15962,67 @@ impl ChatApp {
             .block_pointer()
             .width(Size::Fixed(640.0))
             .height(Size::Fixed(600.0))
+    }
+
+    /// Editor section for the binding's `allow_runas` list and
+    /// `default_runas`. Spec-agnostic — runas applies to both Landlock
+    /// and Container bindings, so it lives next to the spec body
+    /// rather than inside either branch.
+    fn render_host_env_runas_body(&self, editor: &HostEnvEntryEditorState) -> El {
+        let mut runas_rows: Vec<El> = editor
+            .entry
+            .allow_runas
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let key = format!("{HOST_ENV_EDITOR_RUNAS_PREFIX}{idx}");
+                row([
+                    text_input(name, &self.selection, &key).width(Size::Fill(1.0)),
+                    icon_button(crate::icons::ICON_X.clone())
+                        .key(format!("{HOST_ENV_EDITOR_RUNAS_DELETE_PREFIX}{idx}"))
+                        .ghost(),
+                ])
+                .gap(tokens::SPACE_2)
+                .align(Align::Center)
+                .width(Size::Fill(1.0))
+            })
+            .collect();
+        if runas_rows.is_empty() {
+            runas_rows.push(
+                paragraph("(worker inherits the daemon's uid)")
+                    .muted()
+                    .small(),
+            );
+        }
+        runas_rows.push(
+            button("+ Add user")
+                .key(HOST_ENV_EDITOR_RUNAS_ADD_KEY)
+                .secondary(),
+        );
+        form([
+            form_item([
+                form_label("allow_runas"),
+                form_control(column(runas_rows).gap(tokens::SPACE_2)),
+                form_description(
+                    "Unix usernames a thread may run its worker as. Leave empty to \
+                     pin the worker to the daemon's own uid. The daemon must run as \
+                     root (or with CAP_SETUID) to switch to any user listed here.",
+                ),
+            ]),
+            form_item([
+                form_label("default_runas"),
+                form_control(text_input(
+                    editor.entry.default_runas.as_deref().unwrap_or(""),
+                    &self.selection,
+                    HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
+                )),
+                form_description(
+                    "Username seeded into a thread's binding when no explicit \
+                     runas is supplied at creation. Must appear in allow_runas; \
+                     leave empty for no default.",
+                ),
+            ]),
+        ])
     }
 
     fn render_host_env_landlock_body(
