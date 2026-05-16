@@ -60,7 +60,16 @@ pub async fn probe_tool_catalog(
     // since 9887b84 retired the daemon's spec-fallback heuristic. The
     // override has to live under one of the spec's RW paths, which
     // it does by construction (we grant it RW just above).
-    let worker = spawn(&spec, mcp_host_bin, Some(Path::new(probe_workspace))).await?;
+    // Probe runs as the daemon's own uid — there's no session, so
+    // there's no per-binding `runas` to honor.
+    let worker = spawn(
+        &spec,
+        mcp_host_bin,
+        Some(Path::new(probe_workspace)),
+        None,
+        None,
+    )
+    .await?;
     info!(count = worker.tools.len(), "probed worker tool catalog");
     // `worker` drops at end of scope → child gets killed via
     // `kill_on_drop`. The frame loop task finishes when the socket

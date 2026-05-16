@@ -123,6 +123,14 @@ pub enum WorkerError {
     Disconnected,
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Pre-exec setup failed. Covers parent-side resolution failures
+    /// (user lookup) AND any child-side `pre_exec` errors surfaced as
+    /// `Spawn` failures with a recognizable shape. Operator-facing
+    /// remedy is to fix the pod's `allow_runas` list or grant the
+    /// daemon enough privilege (CAP_SETUID / running as root) to
+    /// switch to the requested user.
+    #[error("pre-exec failed: {0}")]
+    PreExec(String),
 }
 
 fn format_stderr_suffix(tail: &str) -> String {
@@ -198,10 +206,20 @@ impl Worker {
 /// specific writable path from the spec when the spec advertises more
 /// than one. `None` ⇒ fall back to the first read-write path in the
 /// spec.
+///
+/// `runas` names the Unix user the worker process should run as. The
+/// daemon resolves the name (NSS / passwd lookup) in the parent and
+/// applies the `setuid`/`setgid`/`setgroups` chain in the forked
+/// child's `pre_exec` before exec, so every tool the worker dispatches
+/// inherits that identity. `None` ⇒ inherit the daemon's own uid.
+/// Resolution and `setuid` failures both surface as
+/// [`WorkerError::PreExec`].
 pub async fn spawn(
     spec: &HostEnvSpec,
     mcp_host_bin: &str,
     workspace_root_override: Option<&Path>,
+    runas: Option<&str>,
+    bash_timeout_secs: Option<u32>,
 ) -> Result<Worker, WorkerError> {
     match spec {
         HostEnvSpec::Landlock {
@@ -213,6 +231,8 @@ pub async fn spawn(
                 network,
                 mcp_host_bin,
                 workspace_root_override,
+                runas,
+                bash_timeout_secs,
             )
             .await
         }
@@ -278,6 +298,8 @@ async fn spawn_landlock(
     network: &NetworkPolicy,
     mcp_host_bin: &str,
     workspace_root_override: Option<&Path>,
+    runas: Option<&str>,
+    bash_timeout_secs: Option<u32>,
 ) -> Result<Worker, WorkerError> {
     let workspace_root_path = resolve_workspace_root(allowed_paths, workspace_root_override)?;
     let workspace_root = workspace_root_path.to_string_lossy().into_owned();
@@ -291,10 +313,23 @@ async fn spawn_landlock(
         );
     }
 
+    // Resolve the target user before forking — `getpwnam_r` walks NSS
+    // and is not async-signal-safe, so it cannot run inside `pre_exec`.
+    // Failures here mean the operator listed a name the daemon's user
+    // database doesn't know.
+    let runas_id = match runas {
+        Some(name) => Some(
+            crate::runas::lookup(name)
+                .map_err(|e| WorkerError::PreExec(format!("resolving runas `{name}`: {e}")))?,
+        ),
+        None => None,
+    };
+
     info!(
         %workspace_root,
         %bin_dir,
         paths = allowed_paths.len(),
+        runas = ?runas,
         "spawning landlock-sandboxed worker"
     );
 
@@ -311,6 +346,9 @@ async fn spawn_landlock(
 
     let mut cmd = Command::new(mcp_host_bin);
     cmd.args(["--workspace-root", &workspace_root]);
+    if let Some(secs) = bash_timeout_secs {
+        cmd.args(["--default-bash-timeout-secs", &secs.to_string()]);
+    }
     cmd.stdin(std::process::Stdio::null());
     // Worker emits no stdout in normal operation (logs go to stderr);
     // null'ing keeps a runaway println from blocking on a backed-up
@@ -321,14 +359,29 @@ async fn spawn_landlock(
 
     // SAFETY: `pre_exec` runs in the forked child between fork and
     // exec. The closure calls only async-signal-safe libc functions
-    // (dup2) plus the landlock ruleset application. `child_fd_raw`
-    // is the pre-fork value; valid in the child until we exec.
+    // (dup2, setgroups/setgid/setuid) plus the landlock ruleset
+    // application. `child_fd_raw` is the pre-fork value; valid in the
+    // child until we exec. `runas_id` is captured by move and owned by
+    // the closure — its `Vec<gid_t>` was allocated in the parent and
+    // is safe to read post-fork (the page tables are copy-on-write).
+    //
+    // Order: dup2 the IPC socket first (sandbox-independent), then
+    // drop privileges, then seal with landlock. setuid before landlock
+    // matches the "drop privileges as you seal up" convention.
     unsafe {
         cmd.pre_exec(move || {
             // Place the socket at FD 3. dup2 produces a new FD
             // without CLOEXEC, so it survives the upcoming exec.
             if libc::dup2(child_fd_raw, IPC_FD) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if let Some(id) = &runas_id {
+                crate::runas::apply_in_child(id).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("setuid to `{}`: {e}", id.name),
+                    )
+                })?;
             }
             apply_landlock(&allowed_paths_owned, &network_owned, &bin_dir).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
@@ -883,5 +936,39 @@ mod tests {
 
         drop(cmd_tx);
         let _ = loop_handle.await;
+    }
+
+    /// Parent-side runas lookup happens before fork; an unknown user
+    /// surfaces as `PreExec` without ever starting a worker process.
+    #[tokio::test]
+    async fn spawn_with_unknown_runas_fails_in_preexec_phase() {
+        // Path / binary don't matter — lookup fails first.
+        let spec = HostEnvSpec::Landlock {
+            allowed_paths: vec![PathAccess::read_write("/tmp")],
+            network: NetworkPolicy::Isolated,
+        };
+        let result = spawn(
+            &spec,
+            "/bin/true",
+            Some(Path::new("/tmp")),
+            Some("definitely_not_a_real_user_zzz_9217"),
+            None,
+        )
+        .await;
+        // Worker isn't Debug, so we can't use unwrap_err; map manually.
+        let err = match result {
+            Ok(_) => panic!("expected PreExec failure, got a worker"),
+            Err(e) => e,
+        };
+        match err {
+            WorkerError::PreExec(msg) => {
+                assert!(msg.contains("runas"), "unexpected: {msg}");
+                assert!(
+                    msg.contains("definitely_not_a_real_user_zzz_9217"),
+                    "unexpected: {msg}",
+                );
+            }
+            other => panic!("expected PreExec, got {other:?}"),
+        }
     }
 }

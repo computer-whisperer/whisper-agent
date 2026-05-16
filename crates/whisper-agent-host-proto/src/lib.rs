@@ -67,7 +67,7 @@ use serde::{Deserialize, Serialize};
 /// - **Add a field** with `#[serde(default)]` → no bump.
 /// - **Remove or repurpose a field, change a tag, change semantics**
 ///   → bump.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Top-level frame sent in either direction over the WebSocket.
 ///

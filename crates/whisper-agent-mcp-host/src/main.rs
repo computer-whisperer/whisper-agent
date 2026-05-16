@@ -21,8 +21,6 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod ipc;
-#[cfg(unix)]
-mod runas;
 mod tools;
 mod workspace;
 
@@ -38,6 +36,14 @@ struct Args {
     /// directory. Daemon-supplied per spawn.
     #[arg(long)]
     workspace_root: PathBuf,
+
+    /// Daemon-supplied default + ceiling for the bash tool's
+    /// `timeout_seconds`. `None` ⇒ bash falls back to its built-in
+    /// 120 s default. Comes from the scheduler's
+    /// `ThreadContext.bash_timeout_secs`, plumbed through the daemon
+    /// at session spawn.
+    #[arg(long)]
+    default_bash_timeout_secs: Option<u32>,
 }
 
 #[tokio::main]
@@ -53,10 +59,12 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let workspace = Workspace::new(&args.workspace_root)
-        .with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?;
+        .with_context(|| format!("invalid workspace root {:?}", args.workspace_root))?
+        .with_default_bash_timeout_secs(args.default_bash_timeout_secs);
     info!(
         version = env!("CARGO_PKG_VERSION"),
         root = %args.workspace_root.display(),
+        default_bash_timeout_secs = ?args.default_bash_timeout_secs,
         "whisper-agent-mcp-host starting"
     );
 

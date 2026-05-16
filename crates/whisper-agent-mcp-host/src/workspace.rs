@@ -24,6 +24,13 @@ pub enum WorkspaceError {
 #[derive(Debug)]
 pub struct Workspace {
     root: PathBuf,
+    /// Session-level cap on the bash tool's per-invocation timeout.
+    /// `None` ⇒ no daemon-supplied default; bash falls back to its
+    /// built-in 120 s. The scheduler's `ThreadContext.bash_timeout_secs`
+    /// is plumbed down to the worker via `--default-bash-timeout-secs`
+    /// at spawn and lands here; the bash tool reads it as both default
+    /// AND ceiling, overriding any model-supplied `timeout_seconds`.
+    default_bash_timeout_secs: Option<u32>,
 }
 
 impl Workspace {
@@ -37,11 +44,28 @@ impl Workspace {
         if !canonical.is_dir() {
             return Err(WorkspaceError::NotADirectory(canonical));
         }
-        Ok(Self { root: canonical })
+        Ok(Self {
+            root: canonical,
+            default_bash_timeout_secs: None,
+        })
+    }
+
+    /// Daemon-supplied bash-timeout default. Replaces the field; pass
+    /// `None` to clear.
+    pub fn with_default_bash_timeout_secs(mut self, secs: Option<u32>) -> Self {
+        self.default_bash_timeout_secs = secs;
+        self
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Session-level bash timeout if the daemon set one, else `None`.
+    /// `bash_stream` consults this both for the default when the model
+    /// omits `timeout_seconds` and as the ceiling when it supplies one.
+    pub fn default_bash_timeout_secs(&self) -> Option<u32> {
+        self.default_bash_timeout_secs
     }
 
     /// Absolute path → returned as-is. Relative path → joined against the

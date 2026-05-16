@@ -32,6 +32,7 @@ pub mod catalog;
 pub mod config;
 pub mod connection;
 pub mod credentials;
+pub mod runas;
 pub mod sessions;
 pub mod worker;
 

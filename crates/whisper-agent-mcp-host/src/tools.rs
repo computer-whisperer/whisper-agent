@@ -650,8 +650,7 @@ fn write_file_descriptor() -> Tool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path — absolute, or relative to the workspace root." },
-                "content": { "type": "string", "description": "File contents to write." },
-                "run_as": { "type": "string", "description": "Optional Unix username to write the file as. Parent directories are still created with the host's identity if missing; the leaf file itself is written by a child process running as the target user (so the file's owner is that user). Fails the call if the host lacks the privilege to assume that user." }
+                "content": { "type": "string", "description": "File contents to write." }
             },
             "required": ["path", "content"]
         }),
@@ -669,8 +668,6 @@ fn write_file_descriptor() -> Tool {
 struct WriteFileArgs {
     path: PathBuf,
     content: String,
-    #[serde(default)]
-    run_as: Option<String>,
 }
 
 async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
@@ -687,10 +684,6 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
     {
         return CallToolResult::error_text(format!("create_dir_all({}): {e}", parent.display()));
     }
-    #[cfg(unix)]
-    if let Some(name) = parsed.run_as.as_deref() {
-        return write_file_as_user(name, &path, &parsed.path, parsed.content.as_bytes()).await;
-    }
     match tokio::fs::write(&path, parsed.content.as_bytes()).await {
         Ok(()) => CallToolResult::text(format!(
             "wrote {} bytes to {}",
@@ -699,75 +692,6 @@ async fn write_file(workspace: &Arc<Workspace>, args: Value) -> CallToolResult {
         )),
         Err(e) => CallToolResult::error_text(format!("write_file({}): {e}", parsed.path.display())),
     }
-}
-
-/// Write `content` to `abs_path` as `user`. Spawns `tee <abs_path>` with
-/// `pre_exec` setuid so the leaf file's owner is the target user; the
-/// host-resolved `display_path` is only used for the success/error
-/// message so the model sees the same path it asked for.
-#[cfg(unix)]
-async fn write_file_as_user(
-    user: &str,
-    abs_path: &std::path::Path,
-    display_path: &std::path::Path,
-    content: &[u8],
-) -> CallToolResult {
-    use tokio::io::AsyncWriteExt;
-
-    let id = match crate::runas::lookup(user) {
-        Ok(id) => id,
-        Err(e) => return CallToolResult::error_text(format!("run_as `{user}`: {e}")),
-    };
-
-    let mut cmd = Command::new("tee");
-    cmd.arg(abs_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env("HOME", &id.home)
-        .env("USER", &id.name)
-        .env("LOGNAME", &id.name)
-        .kill_on_drop(true);
-    let id_for_child = id.clone();
-    // Safety: closure runs in the forked child between fork and exec,
-    // so it only changes the child's identity. Calls only async-signal-
-    // safe libc routines (setgroups/setgid/setuid).
-    unsafe {
-        cmd.pre_exec(move || crate::runas::apply_in_child(&id_for_child));
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return CallToolResult::error_text(format!("spawn tee as {}: {e}", id.name));
-        }
-    };
-
-    let mut stdin = child.stdin.take().expect("stdin piped");
-    if let Err(e) = stdin.write_all(content).await {
-        return CallToolResult::error_text(format!("write to tee stdin: {e}"));
-    }
-    drop(stdin); // close to signal EOF so tee exits
-
-    let output = match child.wait_with_output().await {
-        Ok(o) => o,
-        Err(e) => return CallToolResult::error_text(format!("wait tee: {e}")),
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let code = output.status.code().unwrap_or(-1);
-        return CallToolResult::error_text(format!(
-            "tee as {} exited {code}: {}",
-            id.name,
-            stderr.trim()
-        ));
-    }
-    CallToolResult::text(format!(
-        "wrote {} bytes to {} as {}",
-        content.len(),
-        display_path.display(),
-        id.name
-    ))
 }
 
 // ---------- edit_file ----------
@@ -1140,8 +1064,7 @@ fn bash_descriptor() -> Tool {
                 "command": { "type": "string", "description": "Command to run via `bash -c`." },
                 "cwd": { "type": "string", "description": "Optional cwd — absolute, or relative to the workspace root. Defaults to the workspace root." },
                 "timeout_seconds": { "type": "integer", "description": "Kill the command after this many seconds. Default 120, max 600." },
-                "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." },
-                "run_as": { "type": "string", "description": "Optional Unix username to run the command as. The host drops to that user's uid/gid/groups before exec, sets HOME/USER/LOGNAME accordingly, and fails the call if it lacks the privilege to assume that user. Omit to run with the host's default identity." }
+                "strip_ansi": { "type": "boolean", "description": "Strip ANSI escape sequences (colors, cursor codes) from stdout and stderr. Default true — only turn off if you specifically need the raw escape bytes." }
             },
             "required": ["command"]
         }),
@@ -1168,8 +1091,6 @@ struct BashArgs {
     timeout_seconds: Option<u64>,
     #[serde(default = "default_strip_ansi")]
     strip_ansi: bool,
-    #[serde(default)]
-    run_as: Option<String>,
 }
 
 static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
@@ -1315,26 +1236,20 @@ fn bash_stream(
             },
         };
 
-        let timeout_secs = parsed.timeout_seconds.unwrap_or(120).min(600);
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-
-        // Resolve `run_as` in the parent: NSS lookups aren't async-signal-safe
-        // and so can't run inside `pre_exec`. The actual setuid happens in the
-        // child between fork and exec; if the host can't assume that user, the
-        // libc error surfaces as a clean tool-result error from `cmd.spawn()`.
-        #[cfg(unix)]
-        let run_as_id = match parsed.run_as.as_deref() {
-            None => None,
-            Some(name) => match crate::runas::lookup(name) {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    yield ToolStreamItem::Final(CallToolResult::error_text(
-                        format!("run_as `{name}`: {e}"),
-                    ));
-                    return;
-                }
-            },
+        // Session-level cap (from the daemon's ThreadContext) is both
+        // default AND ceiling: it overrides the built-in 120 s default
+        // and the hard 600 s max, AND clamps any model-supplied value
+        // down to itself. That makes it the operator's authoritative
+        // word on "how long bash may run in this session." Without it,
+        // bash uses its baseline 120 s / 600 s shape.
+        let session_cap = workspace.default_bash_timeout_secs();
+        let timeout_secs = match (parsed.timeout_seconds, session_cap) {
+            (None, None) => 120,
+            (None, Some(cap)) => cap as u64,
+            (Some(model), None) => model.min(600),
+            (Some(model), Some(cap)) => model.min(cap as u64),
         };
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
         // Merge stdout+stderr at shell level so the model sees one interleaved
         // stream in shell-emission order (matching claude-code's bash envelope).
@@ -1353,23 +1268,6 @@ fn bash_stream(
             // it piped so we don't silently swallow those.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-
-        #[cfg(unix)]
-        if let Some(id) = &run_as_id {
-            // Override the env that bash and most CLI tools read to identify
-            // "who am I". Without these, e.g. `~` expansion would still point
-            // at the host user's home.
-            cmd.env("HOME", &id.home)
-                .env("USER", &id.name)
-                .env("LOGNAME", &id.name);
-            let id_for_child = id.clone();
-            // Safety: the closure runs in the forked child between fork and
-            // exec, so it only changes the child's identity. It calls only
-            // async-signal-safe libc routines (setgroups/setgid/setuid).
-            unsafe {
-                cmd.pre_exec(move || crate::runas::apply_in_child(&id_for_child));
-            }
-        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

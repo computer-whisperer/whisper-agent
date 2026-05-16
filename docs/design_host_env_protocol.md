@@ -64,8 +64,12 @@ bidirectional WebSocket carrying CBOR-framed RPCs. The scheduler asks that
 WebSocket to **open sessions** (each session is one provisioned sandbox for
 one thread); within a session, it issues **tool calls** that stream chunks
 back and **background-task** primitives that outlive a single call.
-Per-thread runtime configuration (env, runas, denylist) rides in the session
-context and can be mutated mid-flight. Sessions are not deduplicated across
+Per-thread runtime configuration (workspace_root, env, runas, denylist) rides
+in the session context. Mutable knobs (env, denylist, timeouts) can change
+mid-session via `UpdateSession`; sandbox-shaping fields (`workspace_root`,
+`runas`) are pinned at `OpenSession` time — changing them requires a fresh
+session because they shape the worker process's identity. Sessions are not
+deduplicated across
 threads — landlock is cheap; dedup management was not. Reachability is the
 existence of the WebSocket; tokens authenticate the daemon at WS upgrade
 against a dedicated `[[auth.daemons]]` table.
@@ -163,7 +167,7 @@ pub enum Frame {
         session_id: SessionId,                 // scheduler-assigned (UUID)
         thread_id: String,                     // for daemon-side logging only
         spec: HostEnvSpec,                     // landlock paths + network policy
-        context: ThreadContext,                // env, runas, denylist, etc.
+        context: ThreadContext,                // workspace_root, env, runas, denylist, etc.
     },
     UpdateSession {                            // S→D, mid-flight context change
         session_id: SessionId,
@@ -328,7 +332,12 @@ pub struct ThreadContext {
     /// Environment variables for processes the worker spawns (bash, etc.).
     pub env: BTreeMap<String, String>,
 
-    /// Drop to this user before exec in bash. `None` means daemon's uid.
+    /// Unix username the daemon `setuid`s the worker process to
+    /// before exec. Every tool the worker dispatches inherits this
+    /// identity; bash, file IO, MCP child processes — all run as the
+    /// named user. `None` ⇒ inherit the daemon's own uid. Pinned at
+    /// `OpenSession` time (can't be changed via `UpdateSession`);
+    /// chosen by the scheduler from the pod's `allow.host_env[].allow_runas`.
     pub runas: Option<String>,
 
     /// Tools the daemon refuses to invoke for this session. Hard refusal
@@ -621,10 +630,14 @@ or wire — operators on v1 must move to `[[auth.daemons]]` plus a running
    cleaning v1 internals before deletion is churn for no shipped value.
 
 5. **Per-thread control surface** *(landed).* `UpdateSession` with
-   denylist / runas / env / output cap. UI surfaces for editing thread
+   denylist / env / output cap. UI surfaces for editing thread
    context. This is the feature work that motivated the rework. The
    per-thread disconnect policy (`pause_until_reconnect` vs
    `continue_with_warning`) landed here as one of the editable fields.
+   `runas` is set at `OpenSession` and not mutable mid-session — the
+   worker process's uid is sealed at fork time. Per-binding
+   `allow_runas` / `default_runas` in pod config gate which usernames
+   a thread may pick.
 
 6. **Background tasks** *(landed at the IPC layer; user-visible tools
    pending).* Phase 6.0a/b ship `whisper-agent-worker-proto` and the

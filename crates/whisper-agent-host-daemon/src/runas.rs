@@ -9,7 +9,9 @@
 //! Whether `setuid` actually succeeds is left to the kernel: if the
 //! host process lacks the privilege to assume the requested user, the
 //! child returns the libc error and `Command::spawn` surfaces it as a
-//! clean tool-result error. There is no allowlist in this layer.
+//! clean session-failed error. There is no allowlist in this layer —
+//! the scheduler's pod config already enforces which usernames are
+//! permitted per binding; this code just executes the resolved choice.
 
 use std::ffi::{CStr, CString};
 use std::io;

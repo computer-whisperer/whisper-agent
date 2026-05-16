@@ -338,7 +338,6 @@ async fn handle_inbound(
                         .await?;
                         return Ok(ControlFlow::Continue);
                     }
-                    let arguments = apply_context_overrides(&tool_name, arguments, &target.context);
                     spawn_invoke_tool(
                         session_id,
                         call_id,
@@ -541,10 +540,14 @@ fn spawn_open_session(
     let _ = thread_id; // daemon-side logging only; the worker doesn't see it
     tokio::spawn(async move {
         let workspace_root_override = context.workspace_root.clone();
+        let runas_override = context.runas.clone();
+        let bash_timeout_secs = context.bash_timeout_secs;
         let result = worker::spawn(
             &spec,
             &runtime.mcp_host_bin,
             workspace_root_override.as_deref(),
+            runas_override.as_deref(),
+            bash_timeout_secs,
         )
         .await
         .map(|w| Session {
@@ -558,41 +561,6 @@ fn spawn_open_session(
             })
             .await;
     });
-}
-
-/// Inject session-level [`ThreadContext`] knobs into the per-call
-/// `arguments` blob. Today only `bash` has corresponding tool args
-/// (`run_as`, `timeout_seconds`); other tools are passed through
-/// unchanged. The session's value wins over whatever the model put
-/// in the call — that's the point of the daemon-side enforcement.
-///
-/// `env` and `output_byte_cap` need worker-side support and aren't
-/// applied yet; the session record retains them so a later sub-phase
-/// can wire them without another round-trip.
-pub(crate) fn apply_context_overrides(
-    tool_name: &str,
-    mut arguments: serde_json::Value,
-    context: &ThreadContext,
-) -> serde_json::Value {
-    if tool_name != "bash" {
-        return arguments;
-    }
-    let Some(obj) = arguments.as_object_mut() else {
-        return arguments;
-    };
-    if let Some(runas) = &context.runas {
-        obj.insert(
-            "run_as".to_string(),
-            serde_json::Value::String(runas.clone()),
-        );
-    }
-    if let Some(secs) = context.bash_timeout_secs {
-        obj.insert(
-            "timeout_seconds".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(secs)),
-        );
-    }
-    arguments
 }
 
 fn spawn_invoke_tool(
@@ -644,7 +612,8 @@ fn phase_of(err: &WorkerError) -> ProvisionPhase {
     match err {
         WorkerError::NoWorkspaceRoot
         | WorkerError::WorkspaceRootNotInSpec { .. }
-        | WorkerError::Unsupported(_) => ProvisionPhase::PreExec,
+        | WorkerError::Unsupported(_)
+        | WorkerError::PreExec(_) => ProvisionPhase::PreExec,
         WorkerError::Spawn(_) => ProvisionPhase::WorkerSpawn,
         WorkerError::ChildExited { .. }
         | WorkerError::StartupTimeout { .. }
@@ -715,7 +684,6 @@ fn frame_kind(f: &Frame) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn phase_of_classifies_errors() {
@@ -755,81 +723,9 @@ mod tests {
             WorkerHandshake
         );
         assert_eq!(phase_of(&WorkerError::Disconnected), WorkerHandshake);
-    }
-
-    fn ctx_with_runas(name: &str) -> ThreadContext {
-        ThreadContext {
-            runas: Some(name.to_string()),
-            ..ThreadContext::default()
-        }
-    }
-
-    fn ctx_with_bash_timeout(secs: u32) -> ThreadContext {
-        ThreadContext {
-            bash_timeout_secs: Some(secs),
-            ..ThreadContext::default()
-        }
-    }
-
-    #[test]
-    fn apply_context_overrides_passes_through_non_bash_tools() {
-        let ctx = ctx_with_runas("worker");
-        let args = json!({"path": "/etc/hostname"});
-        let out = apply_context_overrides("read_file", args.clone(), &ctx);
-        assert_eq!(out, args, "non-bash tools must pass through unchanged");
-    }
-
-    #[test]
-    fn apply_context_overrides_injects_runas_into_bash() {
-        let ctx = ctx_with_runas("worker");
-        let args = json!({"command": "id"});
-        let out = apply_context_overrides("bash", args, &ctx);
-        assert_eq!(out["run_as"], json!("worker"));
-        assert_eq!(out["command"], json!("id"));
-    }
-
-    #[test]
-    fn apply_context_overrides_runas_wins_over_model_supplied_value() {
-        // Defense-in-depth: the session's runas overrides whatever the
-        // model put in the call. A compromised model can't escape by
-        // supplying its own run_as.
-        let ctx = ctx_with_runas("worker");
-        let args = json!({"command": "id", "run_as": "root"});
-        let out = apply_context_overrides("bash", args, &ctx);
-        assert_eq!(out["run_as"], json!("worker"));
-    }
-
-    #[test]
-    fn apply_context_overrides_injects_bash_timeout() {
-        let ctx = ctx_with_bash_timeout(30);
-        let args = json!({"command": "sleep 60"});
-        let out = apply_context_overrides("bash", args, &ctx);
-        assert_eq!(out["timeout_seconds"], json!(30));
-    }
-
-    #[test]
-    fn apply_context_overrides_bash_timeout_wins_over_model_value() {
-        let ctx = ctx_with_bash_timeout(30);
-        let args = json!({"command": "sleep 60", "timeout_seconds": 600});
-        let out = apply_context_overrides("bash", args, &ctx);
-        assert_eq!(out["timeout_seconds"], json!(30));
-    }
-
-    #[test]
-    fn apply_context_overrides_default_context_does_not_mutate() {
-        let ctx = ThreadContext::default();
-        let args = json!({"command": "id", "run_as": "root", "timeout_seconds": 60});
-        let out = apply_context_overrides("bash", args.clone(), &ctx);
-        assert_eq!(out, args);
-    }
-
-    #[test]
-    fn apply_context_overrides_handles_non_object_arguments() {
-        // Pathological: scheduler shouldn't send non-object args, but
-        // we shouldn't panic if it does — just pass through.
-        let ctx = ctx_with_runas("worker");
-        let args = json!("not an object");
-        let out = apply_context_overrides("bash", args.clone(), &ctx);
-        assert_eq!(out, args);
+        assert_eq!(
+            phase_of(&WorkerError::PreExec("setuid: EPERM".into())),
+            PreExec,
+        );
     }
 }
