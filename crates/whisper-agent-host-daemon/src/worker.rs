@@ -317,11 +317,25 @@ async fn spawn_landlock(
     // and is not async-signal-safe, so it cannot run inside `pre_exec`.
     // Failures here mean the operator listed a name the daemon's user
     // database doesn't know.
+    //
+    // If the daemon is already running as the target user, skip the
+    // setuid chain entirely — it would be a no-op semantically, but
+    // `setgroups()` requires CAP_SETGID even when the resulting group
+    // list matches the current one. An unprivileged per-user daemon
+    // selecting its own user would otherwise fail to spawn.
     let runas_id = match runas {
-        Some(name) => Some(
-            crate::runas::lookup(name)
-                .map_err(|e| WorkerError::PreExec(format!("resolving runas `{name}`: {e}")))?,
-        ),
+        Some(name) => {
+            let id = crate::runas::lookup(name)
+                .map_err(|e| WorkerError::PreExec(format!("resolving runas `{name}`: {e}")))?;
+            // SAFETY: `geteuid` is async-signal-safe and has no
+            // observable side effects.
+            let current_uid = unsafe { libc::geteuid() };
+            if id.uid == current_uid {
+                None
+            } else {
+                Some(id)
+            }
+        }
         None => None,
     };
 

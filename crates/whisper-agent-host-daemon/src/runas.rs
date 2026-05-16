@@ -128,13 +128,19 @@ fn supplementary_groups(
 /// other concurrent work running in that process.
 pub unsafe fn apply_in_child(id: &UserIdentity) -> io::Result<()> {
     if unsafe { libc::setgroups(id.groups.len(), id.groups.as_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("setgroups({} groups): {e}", id.groups.len()),
+        ));
     }
     if unsafe { libc::setgid(id.gid) } != 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("setgid({}): {e}", id.gid)));
     }
     if unsafe { libc::setuid(id.uid) } != 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(e.kind(), format!("setuid({}): {e}", id.uid)));
     }
     Ok(())
 }
