@@ -55,6 +55,32 @@ pub(super) fn workspace_root_in_allowed_rw(
     }
 }
 
+/// Compose-time default for a binding's `runas`. Returns the named
+/// entry's `default_runas` (which itself may be `None` ⇒ "no override;
+/// worker inherits the daemon's uid").
+pub(super) fn default_runas_for(pod: &Pod, name: &str) -> Option<String> {
+    pod.config
+        .allow
+        .host_env
+        .iter()
+        .find(|nh| nh.name == name)
+        .and_then(|nh| nh.default_runas.clone())
+}
+
+/// True iff `candidate` is listed in the named entry's `allow_runas`.
+/// Used to validate operator-supplied `runas` overrides at thread
+/// creation time. Empty `allow_runas` returns false for any candidate
+/// — opting into per-thread runas requires opting in at the pod level.
+pub(super) fn runas_in_allow_list(pod: &Pod, name: &str, candidate: &str) -> bool {
+    pod.config
+        .allow
+        .host_env
+        .iter()
+        .find(|nh| nh.name == name)
+        .map(|nh| nh.allow_runas.iter().any(|u| u == candidate))
+        .unwrap_or(false)
+}
+
 /// Resolved binding-side choices for a fresh thread. Validated against
 /// the pod's `[allow]` cap (and the parent's scope, for dispatched
 /// children) before construction.
@@ -125,6 +151,7 @@ pub(super) fn resolve_bindings_choice(
             .map(|name| HostEnvBindingRequest {
                 name: name.clone(),
                 workspace_root: None,
+                runas: None,
             })
             .collect()
     });
@@ -134,6 +161,7 @@ pub(super) fn resolve_bindings_choice(
             let HostEnvBindingRequest {
                 name,
                 workspace_root,
+                runas,
             } = req;
             if !allow.host_env.iter().any(|nh| nh.name == name) {
                 return Err(format!(
@@ -173,9 +201,36 @@ pub(super) fn resolve_bindings_choice(
                 }
                 None => default_workspace_root_for(pod, &name),
             };
+            // runas: explicit request must be in `allow_runas`; otherwise
+            // fall back to the entry's `default_runas` (which itself may
+            // be None ⇒ worker inherits the daemon uid).
+            let runas = match runas {
+                Some(user) => {
+                    if !runas_in_allow_list(pod, &name, &user) {
+                        let valid = allow
+                            .host_env
+                            .iter()
+                            .find(|nh| nh.name == name)
+                            .map(|nh| nh.allow_runas.join(", "))
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "host env `{name}` runas `{user}` is not in the entry's \
+                             allow_runas ({})",
+                            if valid.is_empty() {
+                                "empty".into()
+                            } else {
+                                valid
+                            },
+                        ));
+                    }
+                    Some(user)
+                }
+                None => default_runas_for(pod, &name),
+            };
             Ok(HostEnvBinding::Named {
                 name,
                 workspace_root,
+                runas,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -268,6 +323,8 @@ mod tests {
                             allowed_paths: vec![PathAccess::read_write("/tmp/wide")],
                             network: NetworkPolicy::Unrestricted,
                         },
+                        allow_runas: Vec::new(),
+                        default_runas: None,
                     },
                     NamedHostEnv {
                         name: "narrow".into(),
@@ -276,6 +333,8 @@ mod tests {
                             allowed_paths: vec![PathAccess::read_only("/tmp/narrow")],
                             network: NetworkPolicy::Isolated,
                         },
+                        allow_runas: Vec::new(),
+                        default_runas: None,
                     },
                 ],
                 knowledge_buckets: Vec::new(),
@@ -369,6 +428,7 @@ mod tests {
             host_env: Some(vec![HostEnvBindingRequest {
                 name: "wide".into(),
                 workspace_root: None,
+                runas: None,
             }]),
             mcp_hosts: None,
         };
@@ -398,6 +458,7 @@ mod tests {
             host_env: Some(vec![HostEnvBindingRequest {
                 name: "narrow".into(),
                 workspace_root: None,
+                runas: None,
             }]),
             mcp_hosts: Some(vec!["search".into()]),
         };
@@ -432,10 +493,12 @@ mod tests {
                     HostEnvBindingRequest {
                         name: "wide".into(),
                         workspace_root: None,
+                        runas: None,
                     },
                     HostEnvBindingRequest {
                         name: "narrow".into(),
                         workspace_root: None,
+                        runas: None,
                     },
                 ]),
                 mcp_hosts: None,
@@ -474,5 +537,113 @@ mod tests {
         assert_eq!(resolved.backend_name, "anthropic");
         assert_eq!(resolved.host_env.len(), 1);
         assert_eq!(resolved.shared_host_names, vec!["fetch".to_string()]);
+    }
+
+    /// Pod with the `wide` host_env opted into multi-user mode. Used
+    /// for runas resolution tests below.
+    fn pod_with_runas_on_wide() -> Pod {
+        let mut pod = pod_with_two_backends_and_two_envs();
+        let wide = pod
+            .config
+            .allow
+            .host_env
+            .iter_mut()
+            .find(|nh| nh.name == "wide")
+            .unwrap();
+        wide.allow_runas = vec!["worker".into(), "nobody".into()];
+        wide.default_runas = Some("worker".into());
+        pod
+    }
+
+    #[test]
+    fn runas_default_applied_when_request_omits_it() {
+        let pod = pod_with_runas_on_wide();
+        // Default-pod request inherits thread_defaults (`host_env =
+        // ["wide"]`) without a per-thread override — resolution must
+        // seed `runas` from the entry's `default_runas`.
+        let resolved = resolve_bindings_choice(&pod, None, None).unwrap();
+        assert_eq!(resolved.host_env.len(), 1);
+        match &resolved.host_env[0] {
+            HostEnvBinding::Named { name, runas, .. } => {
+                assert_eq!(name, "wide");
+                assert_eq!(runas.as_deref(), Some("worker"));
+            }
+            other => panic!("expected Named binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runas_explicit_request_honored_when_in_allow_list() {
+        let pod = pod_with_runas_on_wide();
+        let req = ThreadBindingsRequest {
+            backend: None,
+            host_env: Some(vec![HostEnvBindingRequest {
+                name: "wide".into(),
+                workspace_root: None,
+                runas: Some("nobody".into()),
+            }]),
+            mcp_hosts: None,
+        };
+        let resolved = resolve_bindings_choice(&pod, Some(req), None).unwrap();
+        match &resolved.host_env[0] {
+            HostEnvBinding::Named { runas, .. } => {
+                assert_eq!(runas.as_deref(), Some("nobody"));
+            }
+            other => panic!("expected Named binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runas_outside_allow_list_rejected() {
+        let pod = pod_with_runas_on_wide();
+        let req = ThreadBindingsRequest {
+            backend: None,
+            host_env: Some(vec![HostEnvBindingRequest {
+                name: "wide".into(),
+                workspace_root: None,
+                runas: Some("root".into()),
+            }]),
+            mcp_hosts: None,
+        };
+        let err = resolve_bindings_choice(&pod, Some(req), None).unwrap_err();
+        assert!(
+            err.contains("allow_runas") && err.contains("root"),
+            "err was: {err}",
+        );
+    }
+
+    #[test]
+    fn runas_explicit_request_rejected_when_allow_list_empty() {
+        // `narrow` has no allow_runas — explicit runas requests against
+        // it must fail rather than silently fall through to default
+        // (which is also None).
+        let pod = pod_with_runas_on_wide();
+        let req = ThreadBindingsRequest {
+            backend: None,
+            host_env: Some(vec![HostEnvBindingRequest {
+                name: "narrow".into(),
+                workspace_root: None,
+                runas: Some("worker".into()),
+            }]),
+            mcp_hosts: None,
+        };
+        let err = resolve_bindings_choice(&pod, Some(req), None).unwrap_err();
+        assert!(err.contains("allow_runas"), "err was: {err}");
+    }
+
+    #[test]
+    fn runas_left_unset_when_entry_has_no_default() {
+        // `narrow` is unchanged — empty allow_runas, no default. Resolved
+        // binding for it gets `runas: None`, meaning "worker inherits the
+        // daemon uid."
+        let pod = pod_with_two_backends_and_two_envs();
+        let resolved = resolve_bindings_choice(&pod, None, None).unwrap();
+        match &resolved.host_env[0] {
+            HostEnvBinding::Named { name, runas, .. } => {
+                assert_eq!(name, "wide");
+                assert!(runas.is_none());
+            }
+            other => panic!("expected Named binding, got {other:?}"),
+        }
     }
 }

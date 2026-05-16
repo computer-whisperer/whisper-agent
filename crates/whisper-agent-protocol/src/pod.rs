@@ -105,6 +105,14 @@ impl Default for PodAllowCaps {
 /// `[[allow.host_env]]` entries (or zero) — threads then run with no
 /// host-env MCP connection.
 ///
+/// `allow_runas` declares the Unix usernames a thread may run its
+/// worker as for this binding. Empty ⇒ the worker runs as the daemon
+/// process's own uid and no per-thread override is permitted.
+/// Non-empty opts the binding into multi-user mode; the daemon will
+/// `setuid` to one of these names before exec. `default_runas` (if
+/// set) must appear in `allow_runas`; it seeds the per-thread default
+/// when the caller doesn't pick one.
+///
 /// TOML form:
 /// ```toml
 /// [[allow.host_env]]
@@ -113,6 +121,8 @@ impl Default for PodAllowCaps {
 /// type = "landlock"        # HostEnvSpec discriminator
 /// allowed_paths = ["/home/me/project:rw", "/:ro"]
 /// network = "isolated"
+/// allow_runas = ["worker", "nobody"]
+/// default_runas = "worker"
 /// ```
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NamedHostEnv {
@@ -120,6 +130,16 @@ pub struct NamedHostEnv {
     pub provider: String,
     #[serde(flatten)]
     pub spec: HostEnvSpec,
+    /// Permitted Unix usernames for the binding's worker process.
+    /// Empty disables per-thread runas selection entirely (the worker
+    /// inherits the daemon's uid).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_runas: Vec<String>,
+    /// Default username seeded into a thread's binding when no explicit
+    /// runas is supplied at creation time. Must appear in
+    /// `allow_runas`; pod-config validation rejects mismatches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_runas: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

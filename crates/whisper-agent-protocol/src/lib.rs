@@ -544,6 +544,12 @@ pub enum HostEnvBinding {
         /// scheduler fills it in on load.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workspace_root: Option<std::path::PathBuf>,
+        /// Unix username the daemon drops the worker to before exec.
+        /// `None` ⇒ inherit the daemon's own uid. Resolved at thread
+        /// compose time against the named entry's `allow_runas`; the
+        /// scheduler never lets an out-of-list value land here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runas: Option<String>,
     },
     /// Reserved: ad-hoc/subagent path — not constructable from any
     /// current wire request type.
@@ -551,8 +557,8 @@ pub enum HostEnvBinding {
 }
 
 /// Per-host-env-entry override carried in [`ThreadBindingsRequest`]. A
-/// bare string deserializes to `{ name, workspace_root: None }` — kept
-/// as a back-compat path so older clients (or hand-written
+/// bare string deserializes to `{ name, workspace_root: None, runas: None }`
+/// — kept as a back-compat path so older clients (or hand-written
 /// `dispatch_thread` calls) sending `host_env: ["foo", "bar"]` still
 /// resolve cleanly.
 #[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -563,6 +569,12 @@ pub struct HostEnvBindingRequest {
     /// default it to the named entry's first RW path at compose time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<std::path::PathBuf>,
+    /// Optional explicit Unix username to drop the worker to before
+    /// exec. `None` falls back to the named entry's `default_runas`
+    /// (which itself may be `None`). The scheduler rejects values that
+    /// are not in the entry's `allow_runas` list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runas: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for HostEnvBindingRequest {
@@ -578,19 +590,24 @@ impl<'de> Deserialize<'de> for HostEnvBindingRequest {
                 name: String,
                 #[serde(default)]
                 workspace_root: Option<std::path::PathBuf>,
+                #[serde(default)]
+                runas: Option<String>,
             },
         }
         Ok(match Shape::deserialize(d)? {
             Shape::Bare(name) => HostEnvBindingRequest {
                 name,
                 workspace_root: None,
+                runas: None,
             },
             Shape::Full {
                 name,
                 workspace_root,
+                runas,
             } => HostEnvBindingRequest {
                 name,
                 workspace_root,
+                runas,
             },
         })
     }
@@ -3162,6 +3179,7 @@ mod tests {
         let with = HostEnvBinding::Named {
             name: "default".into(),
             workspace_root: Some(std::path::PathBuf::from("/work/x")),
+            runas: None,
         };
         let s = serde_json::to_string(&with).unwrap();
         assert!(s.contains("workspace_root"));
@@ -3172,6 +3190,7 @@ mod tests {
         let without = HostEnvBinding::Named {
             name: "default".into(),
             workspace_root: None,
+            runas: None,
         };
         let s = serde_json::to_string(&without).unwrap();
         assert!(
@@ -3192,12 +3211,61 @@ mod tests {
             HostEnvBinding::Named {
                 name,
                 workspace_root,
+                runas,
             } => {
                 assert_eq!(name, "default");
                 assert!(workspace_root.is_none());
+                assert!(runas.is_none());
             }
             _ => panic!("expected Named"),
         }
+    }
+
+    #[test]
+    fn host_env_binding_named_runas_round_trips() {
+        // Round-trip + None-elision symmetry with workspace_root.
+        let with = HostEnvBinding::Named {
+            name: "default".into(),
+            workspace_root: None,
+            runas: Some("worker".into()),
+        };
+        let s = serde_json::to_string(&with).unwrap();
+        assert!(s.contains("runas"));
+        assert!(s.contains("worker"));
+        let back: HostEnvBinding = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, with);
+
+        let without = HostEnvBinding::Named {
+            name: "default".into(),
+            workspace_root: None,
+            runas: None,
+        };
+        let s = serde_json::to_string(&without).unwrap();
+        assert!(
+            !s.contains("runas"),
+            "None should serialize as omitted: {s}"
+        );
+    }
+
+    #[test]
+    fn host_env_binding_request_runas_round_trips_via_full_shape() {
+        // The full-shape decoder accepts an explicit runas field.
+        let json = r#"{ "name": "alpha", "runas": "worker" }"#;
+        let req: HostEnvBindingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "alpha");
+        assert_eq!(req.runas.as_deref(), Some("worker"));
+        assert!(req.workspace_root.is_none());
+    }
+
+    #[test]
+    fn host_env_binding_request_bare_string_clears_runas() {
+        // Bare-string back-compat: a plain string name still parses,
+        // with both workspace_root and runas defaulted to None.
+        let json = r#""alpha""#;
+        let req: HostEnvBindingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name, "alpha");
+        assert!(req.workspace_root.is_none());
+        assert!(req.runas.is_none());
     }
 
     #[test]

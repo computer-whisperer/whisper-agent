@@ -303,9 +303,11 @@ impl Scheduler {
                 whisper_agent_protocol::HostEnvBinding::Named {
                     name,
                     workspace_root,
+                    runas,
                 } => Some(whisper_agent_protocol::HostEnvBindingRequest {
                     name: name.clone(),
                     workspace_root: workspace_root.clone(),
+                    runas: runas.clone(),
                 }),
                 whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
             })

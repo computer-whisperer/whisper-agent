@@ -304,6 +304,7 @@ impl BehaviorBindingsOverride {
                     .map(|name| crate::HostEnvBindingRequest {
                         name: name.clone(),
                         workspace_root: None,
+                        runas: None,
                     })
                     .collect()
             }),

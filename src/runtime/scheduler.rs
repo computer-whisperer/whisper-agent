@@ -1228,29 +1228,32 @@ impl Scheduler {
     /// the disconnect via its own ToolFinal.
     /// Stamp a fresh `ThreadContext` per Named host-env binding into
     /// `V2ContextStore`, with the binding's persisted `workspace_root`
-    /// (filled in by the scheduler at compose time / load time — never
-    /// `None` for a binding the operator created via the current code
-    /// path). This makes the dispatcher's
+    /// and `runas` (filled in by the scheduler at compose time / load
+    /// time). This makes the dispatcher's
     /// `contexts.get_or_default(&thread, &binding)` return the explicit
-    /// value at every `OpenSession`, removing the daemon's fall-back
-    /// guess at the workspace root.
+    /// values at every `OpenSession`, removing the daemon's fall-back
+    /// guesses. Bindings with both fields `None` (the "no overrides
+    /// declared" shape) are skipped — `ThreadContext::default()` is
+    /// what `get_or_default` returns anyway.
     fn seed_v2_contexts_from_bindings(&self, task: &crate::runtime::thread::Thread) {
         for binding in &task.bindings.host_env {
             let HostEnvBinding::Named {
                 name,
                 workspace_root,
+                runas,
             } = binding
             else {
                 continue;
             };
-            let Some(workspace_root) = workspace_root.clone() else {
+            if workspace_root.is_none() && runas.is_none() {
                 continue;
-            };
+            }
             self.v2_contexts.set(
                 task.id.clone(),
                 name.clone(),
                 whisper_agent_host_proto::ThreadContext {
-                    workspace_root: Some(workspace_root),
+                    workspace_root: workspace_root.clone(),
+                    runas: runas.clone(),
                     ..whisper_agent_host_proto::ThreadContext::default()
                 },
             );
@@ -2895,8 +2898,14 @@ impl Scheduler {
                         });
                         match matching {
                             Some(name) => {
-                                let workspace_root = self.pods.get(&task.pod_id).and_then(|pod| {
+                                let pod = self.pods.get(&task.pod_id);
+                                let workspace_root = pod.and_then(|pod| {
                                     crate::runtime::scheduler::bindings::default_workspace_root_for(
+                                        pod, &name,
+                                    )
+                                });
+                                let runas = pod.and_then(|pod| {
+                                    crate::runtime::scheduler::bindings::default_runas_for(
                                         pod, &name,
                                     )
                                 });
@@ -2908,6 +2917,7 @@ impl Scheduler {
                                 migrated.push(HostEnvBinding::Named {
                                     name,
                                     workspace_root,
+                                    runas,
                                 });
                                 bindings_dirty = true;
                             }
@@ -2923,25 +2933,38 @@ impl Scheduler {
                     HostEnvBinding::Named {
                         name,
                         workspace_root,
+                        runas,
                     } => {
                         // Persisted thread.json files predating the
-                        // workspace_root field deserialize with `None`;
-                        // fill in from the spec so the field is always
-                        // explicit going forward.
-                        let was_none = workspace_root.is_none();
-                        let filled = workspace_root.or_else(|| {
+                        // workspace_root or runas fields deserialize with
+                        // `None`; fill in from the entry so subsequent
+                        // resolution sees explicit values. `runas`
+                        // defaults from the entry's `default_runas`,
+                        // which itself may be `None`.
+                        let ws_was_none = workspace_root.is_none();
+                        let filled_ws = workspace_root.or_else(|| {
                             self.pods.get(&task.pod_id).and_then(|pod| {
                                 crate::runtime::scheduler::bindings::default_workspace_root_for(
                                     pod, &name,
                                 )
                             })
                         });
-                        if was_none && filled.is_some() {
+                        if ws_was_none && filled_ws.is_some() {
+                            bindings_dirty = true;
+                        }
+                        let runas_was_none = runas.is_none();
+                        let filled_runas = runas.or_else(|| {
+                            self.pods.get(&task.pod_id).and_then(|pod| {
+                                crate::runtime::scheduler::bindings::default_runas_for(pod, &name)
+                            })
+                        });
+                        if runas_was_none && filled_runas.is_some() {
                             bindings_dirty = true;
                         }
                         migrated.push(HostEnvBinding::Named {
                             name,
-                            workspace_root: filled,
+                            workspace_root: filled_ws,
+                            runas: filled_runas,
                         });
                     }
                 }
@@ -2982,6 +3005,7 @@ impl Scheduler {
                             crate::runtime::scheduler::bindings::default_workspace_root_for(
                                 pod, name,
                             ),
+                        runas: crate::runtime::scheduler::bindings::default_runas_for(pod, name),
                     })
                     .collect();
                 warn!(
@@ -3555,6 +3579,7 @@ impl Scheduler {
                     whisper_agent_protocol::HostEnvBinding::Named {
                         name,
                         workspace_root,
+                        runas: _,
                     } => Some(crate::runtime::memory_snapshot::HostEnvInfo {
                         name: name.as_str(),
                         workspace_root: workspace_root.as_deref(),

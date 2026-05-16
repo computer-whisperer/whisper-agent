@@ -1995,6 +1995,8 @@ impl HostEnvEntryEditorState {
                     allowed_paths: Vec::new(),
                     network: NetworkPolicy::default(),
                 },
+                allow_runas: Vec::new(),
+                default_runas: None,
             },
             error: None,
             limits_cpus_buf: String::new(),
@@ -3963,6 +3965,7 @@ impl ChatApp {
                         whisper_agent_protocol::HostEnvBinding::Named {
                             name,
                             workspace_root,
+                            runas: _,
                         } => match workspace_root {
                             Some(p) => format!("{name} (cwd: {})", p.display()),
                             None => name.clone(),
@@ -7472,6 +7475,7 @@ impl ChatApp {
                         HostEnvBindingRequest {
                             name: entry.name.clone(),
                             workspace_root,
+                            runas: None,
                         }
                     })
                     .collect(),

@@ -2415,6 +2415,8 @@ mcp_hosts = ["filesystem", "git"]
                         ],
                         network: NetworkPolicy::Isolated,
                     },
+                    allow_runas: Vec::new(),
+                    default_runas: None,
                 },
                 NamedHostEnv {
                     name: "browser".into(),
@@ -2436,6 +2438,8 @@ mcp_hosts = ["filesystem", "git"]
                         }),
                         env: Default::default(),
                     },
+                    allow_runas: Vec::new(),
+                    default_runas: None,
                 },
             ],
             knowledge_buckets: vec!["wiki".into()],
@@ -2699,6 +2703,7 @@ fn mock_inspector_snapshot() -> ThreadSnapshot {
             workspace_root: Some(std::path::PathBuf::from(
                 "/home/user/workspace/whisper-agent",
             )),
+            runas: None,
         }],
         mcp_hosts: vec!["filesystem".into(), "memory".into()],
         ..ThreadBindings::default()

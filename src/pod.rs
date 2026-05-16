@@ -123,6 +123,19 @@ pub enum PodConfigError {
         default: String,
         ceiling: String,
     },
+    #[error(
+        "[[allow.host_env]] `{host_env}`: default_runas = `{value}` is not in allow_runas \
+         (valid: [{valid}])"
+    )]
+    HostEnvDefaultRunasNotInAllow {
+        host_env: String,
+        value: String,
+        valid: String,
+    },
+    #[error(
+        "[[allow.host_env]] `{host_env}`: default_runas = `{value}` is set but allow_runas is empty"
+    )]
+    HostEnvDefaultRunasWithoutAllow { host_env: String, value: String },
 }
 
 /// Validate a `[[allow.host_env]]` entry's name. Names are used as tool-
@@ -184,6 +197,26 @@ pub fn validate(config: &PodConfig) -> Result<(), PodConfigError> {
                 name: nss.name.clone(),
                 reason,
             });
+        }
+        // runas policy: `default_runas` must appear in `allow_runas`,
+        // and `allow_runas` must be non-empty if `default_runas` is set.
+        // The latter catches the "I picked a default but forgot to list
+        // it as allowed" misconfiguration — silent fallback would be
+        // worse than a parse-time rejection.
+        if let Some(default) = nss.default_runas.as_deref() {
+            if nss.allow_runas.is_empty() {
+                return Err(PodConfigError::HostEnvDefaultRunasWithoutAllow {
+                    host_env: nss.name.clone(),
+                    value: default.to_string(),
+                });
+            }
+            if !nss.allow_runas.iter().any(|u| u == default) {
+                return Err(PodConfigError::HostEnvDefaultRunasNotInAllow {
+                    host_env: nss.name.clone(),
+                    value: default.to_string(),
+                    valid: nss.allow_runas.join(", "),
+                });
+            }
         }
     }
 
@@ -296,6 +329,8 @@ mod tests {
                             allowed_paths: vec![PathAccess::read_write("/home/me/project")],
                             network: NetworkPolicy::Unrestricted,
                         },
+                        allow_runas: Vec::new(),
+                        default_runas: None,
                     },
                     NamedHostEnv {
                         name: "landlock-ro".into(),
@@ -304,6 +339,8 @@ mod tests {
                             allowed_paths: vec![PathAccess::read_only("/home/me/project")],
                             network: NetworkPolicy::Isolated,
                         },
+                        allow_runas: Vec::new(),
+                        default_runas: None,
                     },
                 ],
                 knowledge_buckets: Vec::new(),
@@ -399,6 +436,8 @@ max_turns = 50
                 allowed_paths: vec![],
                 network: NetworkPolicy::Unrestricted,
             },
+            allow_runas: Vec::new(),
+            default_runas: None,
         });
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, PodConfigError::DuplicateSandboxName(_)));
@@ -449,6 +488,56 @@ max_turns = 50
             matches!(err, PodConfigError::HostEnvDefaultRequired { .. }),
             "expected HostEnvDefaultRequired, got {err:?}"
         );
+    }
+
+    #[test]
+    fn accepts_named_host_env_runas_default_in_allow_list() {
+        let mut cfg = sample_config();
+        cfg.allow.host_env[0].allow_runas = vec!["worker".into(), "nobody".into()];
+        cfg.allow.host_env[0].default_runas = Some("worker".into());
+        validate(&cfg).expect("valid runas pairing");
+    }
+
+    #[test]
+    fn accepts_empty_allow_runas_with_no_default() {
+        let mut cfg = sample_config();
+        // Empty allow_runas + None default is the today-default shape:
+        // worker inherits daemon uid, no per-thread override permitted.
+        cfg.allow.host_env[0].allow_runas.clear();
+        cfg.allow.host_env[0].default_runas = None;
+        validate(&cfg).expect("baseline shape must validate");
+    }
+
+    #[test]
+    fn rejects_default_runas_outside_allow_list() {
+        let mut cfg = sample_config();
+        cfg.allow.host_env[0].allow_runas = vec!["worker".into()];
+        cfg.allow.host_env[0].default_runas = Some("root".into());
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            PodConfigError::HostEnvDefaultRunasNotInAllow {
+                host_env, value, ..
+            } => {
+                assert_eq!(host_env, cfg.allow.host_env[0].name);
+                assert_eq!(value, "root");
+            }
+            other => panic!("expected HostEnvDefaultRunasNotInAllow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_default_runas_with_empty_allow_list() {
+        let mut cfg = sample_config();
+        cfg.allow.host_env[0].allow_runas.clear();
+        cfg.allow.host_env[0].default_runas = Some("worker".into());
+        let err = validate(&cfg).unwrap_err();
+        match err {
+            PodConfigError::HostEnvDefaultRunasWithoutAllow { host_env, value } => {
+                assert_eq!(host_env, cfg.allow.host_env[0].name);
+                assert_eq!(value, "worker");
+            }
+            other => panic!("expected HostEnvDefaultRunasWithoutAllow, got {other:?}"),
+        }
     }
 
     #[test]
