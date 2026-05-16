@@ -1789,10 +1789,6 @@ pub struct ChatApp {
     /// the backend's `/models` returns).
     picker_model: Option<String>,
     picker_model_open: bool,
-    /// Pod id the new thread should land in. `None` routes to the
-    /// server's `compose_pod_id` default.
-    picker_pod: Option<String>,
-    picker_pod_open: bool,
     /// Host-env bindings picked for the next `CreateThread`. Empty
     /// is interpreted through `picker_host_env_mode`: inherit ignores
     /// this vec, none sends an explicit empty override, custom sends
@@ -2920,8 +2916,6 @@ impl ChatApp {
             picker_backend_open: false,
             picker_model: None,
             picker_model_open: false,
-            picker_pod: None,
-            picker_pod_open: false,
             picker_host_env_mode: BindingListMode::Inherit,
             picker_host_envs: Vec::new(),
             picker_host_envs_open: false,
@@ -3416,7 +3410,6 @@ impl ChatApp {
                     // rather than the stale picker state.
                     self.picker_backend = None;
                     self.picker_model = None;
-                    self.picker_pod = None;
                     self.picker_host_env_mode = BindingListMode::Inherit;
                     self.picker_host_envs.clear();
                     self.picker_host_env_expanded = None;
@@ -5056,17 +5049,29 @@ impl App for ChatApp {
             },
         );
         if pod_tab_changed {
+            // The new-thread pane scopes its host_envs / mcp_hosts to
+            // the active tab's pod allow list. Clear them when the tab
+            // changes so the user re-picks against the right surface;
+            // partial-validity is too clever for v1. Only matters while
+            // the new-thread pane is showing — once a thread is selected
+            // the picker state is invisible.
+            if self.selected.is_none() {
+                self.picker_host_env_mode = BindingListMode::Inherit;
+                self.picker_host_envs.clear();
+                self.picker_host_env_expanded = None;
+                self.picker_mcp_hosts_mode = BindingListMode::Inherit;
+                self.picker_mcp_hosts.clear();
+                self.ensure_pod_config_for_picker();
+            }
             return;
         }
 
-        // "+ New thread" entry point: clear the selection and
-        // pre-bind the active pod in the new-thread compose form's
-        // pod picker so the compose pane opens scoped to where the
-        // user clicked. No wire round-trip — the actual `CreateThread`
-        // fires when the user hits Start in the compose card.
+        // "+ New thread" entry point: clear the selection so the
+        // new-thread pane renders. The active sidebar pod tab is the
+        // source of truth for which pod the next `CreateThread` lands
+        // in — no separate seed needed.
         if event.is_click_or_activate(SIDEBAR_NEW_THREAD_KEY) {
             self.selected = None;
-            self.picker_pod = self.pod_tab.clone();
             return;
         }
 
@@ -5580,10 +5585,6 @@ impl App for ChatApp {
             self.handle_model_pick(action);
             return;
         }
-        if let Some(action) = classify_select_event(&event, PICKER_POD) {
-            self.handle_pod_pick(action);
-            return;
-        }
         if let Some(action) = classify_select_event(&event, PICKER_HOST_ENVS) {
             self.handle_host_envs_pick(action);
             return;
@@ -5592,7 +5593,7 @@ impl App for ChatApp {
             self.handle_mcp_hosts_pick(action);
             return;
         }
-        if radio::apply_event(
+        if toggle::apply_event_single(
             &mut self.picker_host_env_mode,
             &event,
             PICKER_HOST_ENVS_MODE,
@@ -5607,7 +5608,7 @@ impl App for ChatApp {
             self.new_thread_error = None;
             return;
         }
-        if radio::apply_event(
+        if toggle::apply_event_single(
             &mut self.picker_mcp_hosts_mode,
             &event,
             PICKER_MCP_HOSTS_MODE,
@@ -5989,7 +5990,7 @@ impl BindingListMode {
 }
 
 fn binding_mode_group(key: &str, mode: BindingListMode) -> El {
-    radio_group(
+    toggle_group(
         key,
         &mode.wire_value(),
         [
@@ -7055,13 +7056,12 @@ fn retention_kind_label(p: &RetentionPolicy) -> &'static str {
     }
 }
 
-// Routed keys for the new-thread compose form's three `select_trigger`
+// Routed keys for the new-thread compose form's `select_trigger`
 // pickers. Each `select_menu` in the build pass shares its trigger key
 // so the popover anchors below the trigger; the same key is what we
 // classify on in `on_event`.
 const PICKER_BACKEND: &str = "picker:backend";
 const PICKER_MODEL: &str = "picker:model";
-const PICKER_POD: &str = "picker:pod";
 
 /// Routed keys for the multi-select chip pickers — host envs and MCP
 /// hosts. `*_TRIGGER` is the "+ Add" button at the end of the chip
@@ -7494,7 +7494,7 @@ impl ChatApp {
         (
             (!config_override.is_empty()).then_some(config_override),
             bindings_request,
-            self.picker_pod.clone(),
+            self.pod_tab.clone(),
         )
     }
 
@@ -7756,7 +7756,7 @@ impl ChatApp {
         }
 
         let mut prompt_mode: Option<String> = None;
-        if radio::apply_event(
+        if toggle::apply_event_single(
             &mut prompt_mode,
             event,
             NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
@@ -7909,7 +7909,7 @@ impl ChatApp {
                 return true;
             }
             let mut source_pick = autoquery.query_source;
-            if radio::apply_event(
+            if toggle::apply_event_single(
                 &mut source_pick,
                 event,
                 NEW_THREAD_AUTOQUERY_SOURCE_KEY,
@@ -7987,17 +7987,17 @@ impl ChatApp {
             return true;
         }
         if let Some(caps) = self.new_thread_caps.as_mut()
-            && (radio::apply_event(
+            && (toggle::apply_event_single(
                 &mut caps.pod_modify,
                 event,
                 NEW_THREAD_CAPS_POD_MODIFY_KEY,
                 pod_modify_cap_from_wire,
-            ) || radio::apply_event(
+            ) || toggle::apply_event_single(
                 &mut caps.dispatch,
                 event,
                 NEW_THREAD_CAPS_DISPATCH_KEY,
                 dispatch_cap_from_wire,
-            ) || radio::apply_event(
+            ) || toggle::apply_event_single(
                 &mut caps.behaviors,
                 event,
                 NEW_THREAD_CAPS_BEHAVIORS_KEY,
@@ -8059,7 +8059,7 @@ impl ChatApp {
         }
         if let Some(surface) = self.new_thread_tool_surface.as_mut() {
             let mut core_tools_pick: Option<String> = None;
-            if radio::apply_event(
+            if toggle::apply_event_single(
                 &mut core_tools_pick,
                 event,
                 NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
@@ -8088,12 +8088,12 @@ impl ChatApp {
                 ));
                 return true;
             }
-            if radio::apply_event(
+            if toggle::apply_event_single(
                 &mut surface.initial_listing,
                 event,
                 NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY,
                 initial_listing_from_wire,
-            ) || radio::apply_event(
+            ) || toggle::apply_event_single(
                 &mut surface.activation_surface,
                 event,
                 NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
@@ -8144,7 +8144,7 @@ impl ChatApp {
                 TunableKind::Enum { variants, .. } => {
                     let allowed: Vec<String> = variants.iter().map(|v| v.value.clone()).collect();
                     let mut pick: Option<String> = None;
-                    if radio::apply_event(&mut pick, event, &key, |raw| {
+                    if toggle::apply_event_single(&mut pick, event, &key, |raw| {
                         if allowed.iter().any(|v| v == raw) {
                             Some(Some(raw.to_string()))
                         } else {
@@ -8208,35 +8208,6 @@ impl ChatApp {
                     Some(value)
                 };
                 self.picker_model_open = false;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_pod_pick(&mut self, action: SelectAction) {
-        match action {
-            SelectAction::Toggle => {
-                self.close_other_pickers(PICKER_POD);
-                self.picker_pod_open = !self.picker_pod_open;
-            }
-            SelectAction::Dismiss => self.picker_pod_open = false,
-            SelectAction::Pick(value) => {
-                self.picker_pod = if value == PICKER_INHERIT {
-                    None
-                } else {
-                    Some(value)
-                };
-                self.picker_pod_open = false;
-                // Pod changed → previously-picked host_envs / mcp_hosts
-                // may no longer be in the new pod's allow list. Clear
-                // both so the user re-picks against the right surface;
-                // partial-validity is too clever for v1.
-                self.picker_host_env_mode = BindingListMode::Inherit;
-                self.picker_host_envs.clear();
-                self.picker_host_env_expanded = None;
-                self.picker_mcp_hosts_mode = BindingListMode::Inherit;
-                self.picker_mcp_hosts.clear();
-                self.ensure_pod_config_for_picker();
             }
             _ => {}
         }
@@ -8332,9 +8303,6 @@ impl ChatApp {
         }
         if keep_open != PICKER_MODEL {
             self.picker_model_open = false;
-        }
-        if keep_open != PICKER_POD {
-            self.picker_pod_open = false;
         }
         if keep_open != PICKER_HOST_ENVS {
             self.picker_host_envs_open = false;
@@ -9778,7 +9746,6 @@ impl ChatApp {
     fn new_thread_pane(&self) -> El {
         let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
         let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
-        let pod_trigger = select_trigger(PICKER_POD, self.pod_label_for_picker());
 
         let buf = self.active_compose_text();
         let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(140.0));
@@ -9789,14 +9756,26 @@ impl ChatApp {
             send = send.disabled();
         }
 
-        // Right-aligned action row inside `card_footer`.
-        let footer = row([spacer(), send])
+        // Footer: advanced-overrides entry point on the left, Start on
+        // the right. The active-override count rides on the button so
+        // the user can see modal state without opening it.
+        let count = self.new_thread_override_count();
+        let overrides_label = if count == 0 {
+            "Edit overrides…".to_string()
+        } else {
+            format!("Edit overrides… · {count} active")
+        };
+        let overrides_btn = button(overrides_label)
+            .key(NEW_THREAD_OVERRIDES_OPEN_KEY)
+            .ghost();
+        let footer = row([overrides_btn, spacer(), send])
+            .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0))
             .align(Align::Center);
 
-        // Top row: three side-by-side pickers (Backend / Model / Pod).
-        // Each lives in its own `form_item` so the label+control+hint
-        // stack is consistent with single-column rows below.
+        // Top row: Backend + Model. The sidebar's active pod tab is the
+        // source of truth for pod selection — `picker_effective_pod_id`
+        // reads `pod_tab` directly.
         let top_row = row([
             form_item([
                 form_label("Backend"),
@@ -9808,11 +9787,6 @@ impl ChatApp {
                 form_control(model_trigger),
                 form_description(self.model_hint()),
             ]),
-            form_item([
-                form_label("Pod"),
-                form_control(pod_trigger),
-                form_description(self.pod_hint_for_picker()),
-            ]),
         ])
         .gap(tokens::SPACE_4)
         .width(Size::Fill(1.0))
@@ -9822,13 +9796,13 @@ impl ChatApp {
             card_header([
                 card_title("Start a new conversation"),
                 card_description(
-                    "Pick the conversation's main runtime target. Empty backend and \
-                     model pickers fall through to the selected pod defaults.",
+                    "Pick the conversation's main runtime target. Empty pickers \
+                     fall through to the active pod's defaults.",
                 ),
             ]),
             card_content([form([
                 top_row,
-                self.new_thread_overrides_summary_row(),
+                self.host_envs_picker_row(),
                 form_item([form_label("Message"), form_control(editor)]),
             ])]),
             card_footer([footer]),
@@ -9853,40 +9827,6 @@ impl ChatApp {
         .align(Align::Center)
         .width(Size::Fill(1.0))
         .height(Size::Fill(1.0))
-    }
-
-    fn new_thread_overrides_summary_row(&self) -> El {
-        let count = self.new_thread_override_count();
-        let summary = if count == 0 {
-            "Using pod thread defaults".to_string()
-        } else {
-            format!(
-                "{count} thread default override{} active",
-                if count == 1 { "" } else { "s" }
-            )
-        };
-        let mut reset = button("Reset").key(NEW_THREAD_OVERRIDES_RESET_KEY).ghost();
-        if count == 0 {
-            reset = reset.disabled();
-        }
-        form_item([
-            form_label("Thread overrides"),
-            form_control(
-                row([
-                    paragraph(summary).muted().small().width(Size::Fill(1.0)),
-                    reset,
-                    button("Edit overrides")
-                        .key(NEW_THREAD_OVERRIDES_OPEN_KEY)
-                        .secondary(),
-                ])
-                .gap(tokens::SPACE_2)
-                .align(Align::Center)
-                .width(Size::Fill(1.0)),
-            ),
-            form_description(
-                "Optional create-time overrides for the selected pod's thread defaults.",
-            ),
-        ])
     }
 
     fn render_new_thread_overrides_modal(&self) -> Option<El> {
@@ -9931,7 +9871,7 @@ impl ChatApp {
         };
         let prompt_control: El = match self.new_thread_system_prompt.as_ref() {
             Some(SystemPromptChoice::File { .. }) => column([
-                radio_group(
+                toggle_group(
                     NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
                     &prompt_mode,
                     [
@@ -9949,7 +9889,7 @@ impl ChatApp {
             .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0)),
             Some(SystemPromptChoice::Text { .. }) => column([
-                radio_group(
+                toggle_group(
                     NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
                     &prompt_mode,
                     [
@@ -9967,7 +9907,7 @@ impl ChatApp {
             ])
             .gap(tokens::SPACE_2)
             .width(Size::Fill(1.0)),
-            None => radio_group(
+            None => toggle_group(
                 NEW_THREAD_SYSTEM_PROMPT_MODE_KEY,
                 &prompt_mode,
                 [
@@ -10013,9 +9953,9 @@ impl ChatApp {
         );
 
         let bindings_section = editor_section(
-            "Runtime Bindings",
-            "Override host-env and shared MCP sessions for this thread.",
-            form([self.host_envs_picker_row(), self.mcp_hosts_picker_row()]),
+            "Shared MCP hosts",
+            "Override the shared MCP host sessions bound to this thread.",
+            form([self.mcp_hosts_picker_row()]),
         );
 
         let compaction_section = editor_section(
@@ -10324,7 +10264,7 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("query source"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_AUTOQUERY_SOURCE_KEY,
                     &autoquery_source_label(
                         autoquery
@@ -10415,7 +10355,7 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("pod_modify"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_CAPS_POD_MODIFY_KEY,
                     &pod_modify_cap_label(caps.pod_modify),
                     [
@@ -10428,7 +10368,7 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("dispatch"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_CAPS_DISPATCH_KEY,
                     &dispatch_cap_label(caps.dispatch),
                     [("none", "None"), ("within_scope", "Within scope")],
@@ -10436,7 +10376,7 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("behaviors"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_CAPS_BEHAVIORS_KEY,
                     &behaviors_cap_label(caps.behaviors),
                     [
@@ -10548,7 +10488,7 @@ impl ChatApp {
         let is_all = matches!(surface.core_tools, CoreTools::All);
         let core_tools = if is_all {
             column([
-                radio_group(
+                toggle_group(
                     NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
                     &"all",
                     [
@@ -10564,7 +10504,7 @@ impl ChatApp {
             .width(Size::Fill(1.0))
         } else {
             column([
-                radio_group(
+                toggle_group(
                     NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_KEY,
                     &"named",
                     [
@@ -10596,7 +10536,7 @@ impl ChatApp {
             form_item([form_label("core tools"), form_control(core_tools)]),
             form_item([
                 form_label("initial listing"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_TOOL_SURFACE_INITIAL_LISTING_KEY,
                     &initial_listing_label(surface.initial_listing),
                     [
@@ -10608,7 +10548,7 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("activation"),
-                form_control(radio_group(
+                form_control(toggle_group(
                     NEW_THREAD_TOOL_SURFACE_ACTIVATION_SURFACE_KEY,
                     &activation_surface_label(surface.activation_surface),
                     [
@@ -10666,7 +10606,7 @@ impl ChatApp {
                     TunableValue::Enum(s) => s.clone(),
                     // Defensive: an out-of-sync bool stored where the
                     // model now wants an enum still renders a stable
-                    // radio group instead of panicking.
+                    // toggle group instead of panicking.
                     _ => String::new(),
                 };
                 let options: Vec<(String, String)> = variants
@@ -10676,7 +10616,7 @@ impl ChatApp {
                         (v.value.clone(), lab)
                     })
                     .collect();
-                radio_group(key.clone(), &current, options)
+                toggle_group(key.clone(), &current, options)
             }
         };
         let mut item = vec![form_label(label), form_control(control)];
@@ -10700,13 +10640,11 @@ impl ChatApp {
         alert([head, alert_description(detail.to_string())]).destructive()
     }
 
-    /// Resolve the picker's effective pod_id — either the explicitly
-    /// picked one or the server-default pod when the user is on the
-    /// inherit row. `None` while we haven't received a `PodList` yet.
+    /// Resolve the picker's effective pod_id — the sidebar's active pod
+    /// tab, falling back to the server-default pod when no tab is set
+    /// yet. `None` while we haven't received a `PodList` yet.
     fn picker_effective_pod_id(&self) -> Option<&str> {
-        self.picker_pod
-            .as_deref()
-            .or(self.default_pod_id.as_deref())
+        self.pod_tab.as_deref().or(self.default_pod_id.as_deref())
     }
 
     /// Pod-allow snapshot for the currently-targeted pod, or `None`
@@ -10716,24 +10654,6 @@ impl ChatApp {
     fn picker_pod_allow(&self) -> Option<&PodAllow> {
         let pod_id = self.picker_effective_pod_id()?;
         self.pod_configs.get(pod_id).map(|c| &c.allow)
-    }
-
-    /// One-line hint under the Pod picker — surfaces what the picker
-    /// allows after compose-time defaults are applied. Mirrors the
-    /// Backend / Model hints so the three columns read symmetrically.
-    fn pod_hint_for_picker(&self) -> String {
-        match self.picker_effective_pod_id() {
-            None => "no pods loaded yet".to_string(),
-            Some(pid) => match self.pods.get(pid) {
-                Some(p) if p.archived => "archived pod".to_string(),
-                Some(_) => format!(
-                    "{} pod{} configured",
-                    self.pods.len(),
-                    if self.pods.len() == 1 { "" } else { "s" }
-                ),
-                None => format!("unknown pod `{pid}`"),
-            },
-        }
     }
 
     /// Render the Host envs row — chip list of picked entries + an
@@ -11024,17 +10944,6 @@ impl ChatApp {
         }
     }
 
-    fn pod_label_for_picker(&self) -> String {
-        match self.picker_pod.as_deref() {
-            None => "default pod".to_string(),
-            Some(id) => self
-                .pods
-                .get(id)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| id.to_string()),
-        }
-    }
-
     /// Build the popover layer list for [`overlays`]. Exactly one
     /// menu can be open at a time (enforced by `close_other_pickers`),
     /// but the iterator shape lets us extend this to e.g. a settings
@@ -11052,9 +10961,6 @@ impl ChatApp {
         }
         if self.picker_model_open {
             out.push(Some(self.model_menu()));
-        }
-        if self.picker_pod_open {
-            out.push(Some(self.pod_menu()));
         }
         if self.picker_host_envs_open {
             out.push(Some(self.host_envs_menu()));
@@ -20206,17 +20112,6 @@ impl ChatApp {
             }
         }
         select_menu(PICKER_MODEL, options)
-    }
-
-    fn pod_menu(&self) -> El {
-        let mut options: Vec<(String, String)> =
-            vec![(PICKER_INHERIT.to_string(), "Default pod".to_string())];
-        let mut pods: Vec<&PodSummary> = self.pods.values().filter(|p| !p.archived).collect();
-        pods.sort_by(|a, b| a.name.cmp(&b.name));
-        for p in pods {
-            options.push((p.pod_id.clone(), p.name.clone()));
-        }
-        select_menu(PICKER_POD, options)
     }
 
     /// Popover listing host-env entries from the active pod's
