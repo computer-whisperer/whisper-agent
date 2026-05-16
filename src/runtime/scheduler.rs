@@ -661,6 +661,20 @@ pub struct StreamUpdate {
     pub event: ServerToClient,
 }
 
+/// Backend-level usage snapshot pushed from a dispatched I/O future
+/// back to the scheduler. Distinct from [`StreamUpdate`] because this
+/// payload mutates per-backend registry state (not per-thread state) —
+/// the receiver in `run` routes it to
+/// [`Scheduler::apply_backend_usage`] which updates
+/// [`crate::pod::resources::BackendEntry`] and re-broadcasts via the
+/// shared `ResourceUpdated` channel. Today the only producers are the
+/// OpenAI Responses provider's streaming path (header scrape) and the
+/// `RefreshBackendUsage` handler (active poll).
+pub struct BackendUsageUpdate {
+    pub backend_name: String,
+    pub usage: whisper_agent_protocol::BackendUsage,
+}
+
 pub struct Scheduler {
     /// MCP host URL passed through to threads when their pod doesn't carry a
     /// Pod the scheduler picks when `CreateThread` doesn't name one. Always
@@ -801,6 +815,14 @@ pub struct Scheduler {
     /// lives on the scheduler's run loop.
     stream_tx: mpsc::UnboundedSender<StreamUpdate>,
 
+    /// Sender half of the backend-usage update channel; cloned by
+    /// dispatched I/O futures that observe a backend usage snapshot
+    /// (header scrape on the model-call path, active poll on the
+    /// usage-refresh path). The receiver lives on the scheduler's run
+    /// loop and routes each update through
+    /// [`Scheduler::apply_backend_usage`].
+    usage_tx: mpsc::UnboundedSender<BackendUsageUpdate>,
+
     /// In-flight bucket builds, keyed by `BucketKey` so server-scope and
     /// pod-scope buckets coexist without collision (two pods can each
     /// have a bucket named `memory` building concurrently). The token
@@ -891,6 +913,7 @@ impl Scheduler {
     ) -> anyhow::Result<(
         Self,
         mpsc::UnboundedReceiver<StreamUpdate>,
+        mpsc::UnboundedReceiver<BackendUsageUpdate>,
         mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
         mpsc::UnboundedReceiver<(Option<String>, String)>,
     )> {
@@ -948,6 +971,7 @@ impl Scheduler {
         pods.insert(default_pod_id.clone(), default_pod);
 
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+        let (usage_tx, usage_rx) = mpsc::unbounded_channel();
         let (bucket_task_tx, bucket_task_rx) = mpsc::unbounded_channel();
         // Outbound channel from FeedWorker resync-cadence ticks back
         // to this scheduler's run loop. Each message is a
@@ -995,6 +1019,7 @@ impl Scheduler {
                 dirty: HashSet::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
+                usage_tx,
                 active_bucket_builds: HashMap::new(),
                 active_bucket_progress: HashMap::new(),
                 active_bucket_load_progress: HashMap::new(),
@@ -1005,6 +1030,7 @@ impl Scheduler {
                 admin_connections: HashSet::new(),
             },
             stream_rx,
+            usage_rx,
             bucket_task_rx,
             resync_request_rx,
         ))
@@ -1016,6 +1042,31 @@ impl Scheduler {
     /// router.
     pub(crate) fn stream_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
         self.stream_tx.clone()
+    }
+
+    /// Clone of the backend-usage sender. Dispatched I/O futures grab
+    /// one of these when they may observe a usage snapshot (model-call
+    /// path via response headers, usage-refresh path via the explicit
+    /// poll endpoint) and push (backend_name, snapshot) updates to the
+    /// scheduler. The run loop applies each via
+    /// [`Self::apply_backend_usage`].
+    pub(crate) fn usage_sender(&self) -> mpsc::UnboundedSender<BackendUsageUpdate> {
+        self.usage_tx.clone()
+    }
+
+    /// Mutate the registry's cached usage snapshot for `backend_name`
+    /// and broadcast the updated entry to subscribed clients via the
+    /// existing `ResourceUpdated` channel. No-op when the backend isn't
+    /// in the registry — a missing entry means the catalog was reloaded
+    /// out from under an in-flight update, not a bug worth surfacing.
+    pub(crate) fn apply_backend_usage(
+        &mut self,
+        backend_name: &str,
+        usage: whisper_agent_protocol::BackendUsage,
+    ) {
+        let id = BackendId::for_name(backend_name);
+        self.resources.set_backend_usage(&id, usage);
+        self.emit_backend_updated(&id);
     }
 
     /// Clone of the bucket-task sender. Detached build tasks grab one
@@ -4969,6 +5020,7 @@ pub async fn run(
     mut scheduler: Scheduler,
     mut inbox: mpsc::UnboundedReceiver<SchedulerMsg>,
     mut stream_rx: mpsc::UnboundedReceiver<StreamUpdate>,
+    mut usage_rx: mpsc::UnboundedReceiver<BackendUsageUpdate>,
     mut bucket_task_rx: mpsc::UnboundedReceiver<buckets::BucketTaskUpdate>,
     mut resync_request_rx: mpsc::UnboundedReceiver<(Option<String>, String)>,
 ) {
@@ -5046,6 +5098,9 @@ pub async fn run(
                 // unsubscribed thread's deltas cost us nothing beyond
                 // the channel push.
                 scheduler.router.broadcast_to_subscribers(&update.thread_id, update.event);
+            }
+            Some(update) = usage_rx.recv() => {
+                scheduler.apply_backend_usage(&update.backend_name, update.usage);
             }
             Some(update) = bucket_task_rx.recv() => {
                 scheduler.apply_bucket_task_update(update).await;

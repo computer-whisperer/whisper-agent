@@ -654,6 +654,61 @@ impl Scheduler {
                     }
                 }
             }
+            ClientToServer::RefreshBackendUsage {
+                correlation_id,
+                backend,
+            } => {
+                let Some(entry) = self.backends.get(&backend) else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("refresh_backend_usage: unknown backend `{backend}`"),
+                        },
+                    );
+                    return;
+                };
+                let provider = entry.provider.clone();
+                let Some(outbound) = self.router.client_outbound(conn_id) else {
+                    // Client disconnected between send and dispatch —
+                    // skip the work; the in-memory snapshot doesn't
+                    // change either way.
+                    return;
+                };
+                let usage_tx = self.usage_sender();
+                tokio::spawn(async move {
+                    let event = match provider.fetch_usage().await {
+                        Ok(Some(snapshot)) => {
+                            // Route through the same channel the
+                            // header-scrape path uses, so the cached
+                            // entry update + ResourceUpdated broadcast
+                            // happen exactly once and in the scheduler's
+                            // own loop.
+                            let _ = usage_tx.send(crate::runtime::scheduler::BackendUsageUpdate {
+                                backend_name: backend.clone(),
+                                usage: snapshot,
+                            });
+                            ServerToClient::BackendUsageRefreshed {
+                                correlation_id,
+                                backend,
+                                had_snapshot: true,
+                            }
+                        }
+                        Ok(None) => ServerToClient::BackendUsageRefreshed {
+                            correlation_id,
+                            backend,
+                            had_snapshot: false,
+                        },
+                        Err(e) => ServerToClient::Error {
+                            correlation_id,
+                            thread_id: None,
+                            message: format!("refresh_backend_usage: {e}"),
+                        },
+                    };
+                    let _ = outbound.send(event);
+                });
+            }
             ClientToServer::UpdateCodexAuth {
                 correlation_id,
                 backend,

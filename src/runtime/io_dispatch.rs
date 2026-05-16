@@ -18,7 +18,7 @@ use whisper_agent_protocol::{ServerToClient, TunableValue};
 use crate::providers::model::{
     CacheBreakpoint, ModelEvent, ModelRequest, ToolSpec, default_cache_policy,
 };
-use crate::runtime::scheduler::{Scheduler, StreamUpdate};
+use crate::runtime::scheduler::{BackendUsageUpdate, Scheduler, StreamUpdate};
 use crate::runtime::thread::{IoRequest, IoResult, OpId};
 use crate::tools::mcp::McpSession;
 
@@ -589,6 +589,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
         }
     };
     let stream_tx = scheduler.stream_sender();
+    let usage_tx = scheduler.usage_sender();
     let cancel = scheduler.cancel_token_or_default(&thread_id);
     Box::pin(async move {
         debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching streaming model call");
@@ -601,12 +602,20 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             cache_breakpoints: &owned_req.cache_breakpoints,
             tunables: &owned_req.tunables,
         };
-        let result =
-            match stream_with_retry(provider.as_ref(), &req, &thread_id, &stream_tx, &cancel).await
-            {
-                Ok(resp) => IoResult::ModelCall(Ok(resp)),
-                Err(e) => IoResult::ModelCall(Err(e.to_string())),
-            };
+        let result = match stream_with_retry(
+            provider.as_ref(),
+            &req,
+            &thread_id,
+            &backend_name,
+            &stream_tx,
+            &usage_tx,
+            &cancel,
+        )
+        .await
+        {
+            Ok(resp) => IoResult::ModelCall(Ok(resp)),
+            Err(e) => IoResult::ModelCall(Err(e.to_string())),
+        };
         SchedulerCompletion::Io(IoCompletion {
             thread_id,
             op_id,
@@ -643,7 +652,9 @@ async fn stream_with_retry(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
+    backend_name: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
+    usage_tx: &tokio::sync::mpsc::UnboundedSender<BackendUsageUpdate>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<crate::providers::model::ModelResponse, crate::providers::model::ModelError> {
     let mut attempt = 0u32;
@@ -652,7 +663,17 @@ async fn stream_with_retry(
         if cancel.is_cancelled() {
             return Err(crate::providers::model::ModelError::Cancelled);
         }
-        match consume_stream(provider, req, thread_id, stream_tx, cancel).await {
+        match consume_stream(
+            provider,
+            req,
+            thread_id,
+            backend_name,
+            stream_tx,
+            usage_tx,
+            cancel,
+        )
+        .await
+        {
             Ok(resp) => return Ok(resp),
             Err(FirstEventError::RateLimited { retry_after, body })
                 if retry_after <= MAX_RATE_LIMIT_WAIT && attempt < MAX_FIRST_EVENT_RETRIES =>
@@ -738,7 +759,9 @@ async fn consume_stream(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
+    backend_name: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
+    usage_tx: &tokio::sync::mpsc::UnboundedSender<BackendUsageUpdate>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<crate::providers::model::ModelResponse, FirstEventError> {
     let mut stream = provider.create_message_streaming(req, cancel);
@@ -806,6 +829,23 @@ async fn consume_stream(
                         name,
                         args_chars,
                     },
+                });
+            }
+            Ok(ModelEvent::ProviderUsage { snapshot }) => {
+                // Per-backend account/quota snapshot from the provider
+                // (today: Codex header scrape). Forward off-thread to
+                // the scheduler so it can update the registry entry and
+                // broadcast `ResourceUpdated`. Does not set
+                // `any_delta_emitted` — the snapshot rides the response
+                // headers, no real model output has happened yet, so a
+                // rate-limit error landing right after is still
+                // retry-eligible. Channel send is fire-and-forget: if
+                // the scheduler is mid-shutdown the receiver is closed,
+                // and there's nothing useful to surface to the model
+                // call about that.
+                let _ = usage_tx.send(BackendUsageUpdate {
+                    backend_name: backend_name.to_string(),
+                    usage: snapshot,
                 });
             }
             Ok(ModelEvent::PrefillProgress {

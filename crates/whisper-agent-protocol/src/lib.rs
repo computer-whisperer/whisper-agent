@@ -963,7 +963,89 @@ pub enum ResourceSnapshot {
         pinned: bool,
         created_at: String,
         last_used: String,
+        /// Most recent account/quota snapshot for this backend.
+        /// Populated only by backends that expose usage data (today:
+        /// the Codex / ChatGPT-subscription path); other backends carry
+        /// `None`. Updated implicitly from response headers on each
+        /// model turn, or explicitly via a client refresh request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<BackendUsage>,
     },
+}
+
+/// Live snapshot of a backend's account/usage state — what a user-facing
+/// UI displays for "how much of my quota have I used." Different backends
+/// expose different parts of this; fields are independently optional.
+///
+/// Today only the Codex (ChatGPT subscription) backend populates this.
+/// Two update sources:
+/// - [`UsageSource::Headers`]: scraped from `/responses` response headers
+///   on every model turn. No extra request; carries window utilizations.
+/// - [`UsageSource::Poll`]: explicit fetch of the backend's usage
+///   endpoint (Codex: `/backend-api/wham/usage`). Triggered by the UI
+///   when the dropdown opens. Adds credits balance + plan type that the
+///   header path doesn't carry.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct BackendUsage {
+    /// Short-window quota (Codex: 5h). `None` when the backend
+    /// doesn't expose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<UsageWindow>,
+    /// Long-window quota (Codex: weekly). `None` when not exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<UsageWindow>,
+    /// Pay-as-you-go credit balance. Headers omit this; populated only
+    /// by the active poll path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<UsageCredits>,
+    /// Free-form plan identifier (Codex: `"free"`, `"plus"`, `"pro"`,
+    /// `"team"`, …). Populated only by the active poll path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// When this snapshot was taken, RFC-3339 UTC. UIs may use this to
+    /// fade stale data or label a "last refreshed N min ago" line.
+    pub captured_at: String,
+    /// Where this snapshot came from. Headers update implicitly per
+    /// turn; polls are explicit user-initiated refreshes.
+    pub source: UsageSource,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    Headers,
+    Poll,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct UsageWindow {
+    /// Fraction of the window's allotment consumed, normalized to
+    /// 0.0–100.0 at parse time so UI code can render with `{:.0}%`
+    /// without remembering each backend's unit (Codex emits percent in
+    /// both headers and JSON; future providers like Anthropic emit 0–1
+    /// in headers vs 0–100 in JSON — adapters normalize before this
+    /// type is constructed).
+    pub used_percent: f32,
+    /// Length of the rolling window in minutes (Codex: `300` for 5h,
+    /// `10080` for 7d). `None` when not exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u32>,
+    /// Unix epoch seconds at which the window resets. `None` when not
+    /// known. UIs format relative to the user's timezone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_epoch: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct UsageCredits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    /// Raw decimal string from upstream (Codex returns e.g. `"5.42"`).
+    /// String, not `f32`, because the upstream emits it as a string and
+    /// round-tripping through float would risk display weirdness on
+    /// tiny balances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
 }
 
 impl ResourceSnapshot {
@@ -1674,6 +1756,21 @@ pub enum ClientToServer {
         /// `cat ~/.codex/auth.json` on a machine that just ran
         /// `codex login`.
         contents: String,
+    },
+
+    /// Trigger an out-of-band poll of `backend`'s usage endpoint and
+    /// refresh the cached snapshot on the registry entry. Used by the
+    /// header usage dropdown — opening the panel fires one of these so
+    /// the user sees fresh quota / credits / plan data without waiting
+    /// for the next model turn to refresh the headers. Server responds
+    /// with `BackendUsageRefreshed` on success or `Error` on failure;
+    /// the fresh snapshot also broadcasts as a normal `ResourceUpdated`
+    /// event so other connected clients pick it up too. Not admin-only
+    /// — every client that can see the backend can refresh it.
+    RefreshBackendUsage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        backend: String,
     },
 
     // --- Pod registry (Phase 2d.i — wire surface only; the scheduler
@@ -2388,6 +2485,19 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         backend: String,
+    },
+    /// ACK for `RefreshBackendUsage`. The fresh snapshot has already
+    /// been broadcast via a normal `ResourceUpdated` event ahead of
+    /// this reply — UIs can drop their spinner on receipt without
+    /// having to wait for or parse the snapshot payload itself.
+    /// `had_snapshot` is `false` when the backend's usage endpoint
+    /// returned an empty payload (enterprise opt-out, etc.), so the
+    /// UI can show "no data" instead of "still loading".
+    BackendUsageRefreshed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        backend: String,
+        had_snapshot: bool,
     },
     /// A new entry appeared in the registry.
     ResourceCreated {

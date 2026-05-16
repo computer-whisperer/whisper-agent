@@ -54,6 +54,15 @@ const PROVIDER_TAG: &str = "openai_responses";
 /// not by plain API keys. Serves the same Responses API surface at `/responses`.
 pub const CHATGPT_CODEX_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
+/// ChatGPT subscription usage / quota endpoint. Sibling to
+/// [`CHATGPT_CODEX_BASE`] — note it lives under `/backend-api/wham/`,
+/// *not* under `/backend-api/codex/`. Reuses the same OAuth access
+/// token and `chatgpt-account-id` header as the `/responses` route.
+/// Hardcoded rather than derived from the configured `base_url`
+/// because any non-default `base_url` (test fakegateways, etc.) would
+/// not have a matching `wham` surface anyway.
+pub const CHATGPT_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
 /// `client_version` query param advertised on the Codex-route `/models` call.
 /// The ChatGPT backend gates visibility of newer models behind a minimum Codex
 /// client version (e.g. gpt-5.4 requires >= 0.98.0) so we lie in this
@@ -221,6 +230,17 @@ impl OpenAiResponsesClient {
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
             let resp = self.send_request(req, cancel).await?;
+            // Extract Codex-route usage headers before the response is
+            // consumed by `bytes_stream` — these are the per-account
+            // 5h/weekly utilization counters the ChatGPT backend ships
+            // on every reply. Returns `None` on the API-key route,
+            // where the headers don't exist; the snapshot ride is
+            // skipped silently in that case.
+            if let Some(snapshot) =
+                crate::providers::codex_usage::parse_codex_headers(resp.headers())
+            {
+                yield ModelEvent::ProviderUsage { snapshot };
+            }
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
             let mut state = RspStreamState::default();
@@ -373,6 +393,47 @@ impl ModelProvider for OpenAiResponsesClient {
 
     fn capabilities_for(&self, model_id: &str) -> whisper_agent_protocol::ContentCapabilities {
         crate::providers::model::openai_vision_capabilities(model_id)
+    }
+
+    /// Only meaningful for `ClientAuth::Codex` — the API-key route
+    /// has no equivalent OAuth-only usage endpoint and returns
+    /// `Ok(None)`. Hits [`CHATGPT_WHAM_USAGE_URL`] with the same
+    /// bearer + `chatgpt-account-id` header used for `/responses`.
+    fn fetch_usage<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<Option<whisper_agent_protocol::BackendUsage>, ModelError>> {
+        Box::pin(async move {
+            let slot = match &self.auth {
+                ClientAuth::ApiKey(_) => return Ok(None),
+                ClientAuth::Codex(s) => s,
+            };
+            let (bearer, extras) = slot
+                .prepare(&self.http)
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            let mut builder = self.http.get(CHATGPT_WHAM_USAGE_URL).bearer_auth(&bearer);
+            for (k, v) in &extras {
+                builder = builder.header(*k, v);
+            }
+            let resp = builder
+                .send()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(ModelError::Api {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            crate::providers::codex_usage::parse_wham_usage_response(&body)
+                .map_err(|e| ModelError::Transport(format!("wham/usage parse: {e}")))
+        })
     }
 
     /// Only meaningful for `ClientAuth::Codex` — API-key clients have

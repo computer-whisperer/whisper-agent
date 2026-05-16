@@ -235,7 +235,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     let live_daemon_registry = Arc::new(LiveDaemonRegistry::new());
     live_daemon_registry.admit_names(config.auth_daemons.iter().map(|d| d.name.clone()));
 
-    let (mut scheduler, stream_rx, bucket_task_rx, resync_request_rx) = Scheduler::new(
+    let (mut scheduler, stream_rx, usage_rx, bucket_task_rx, resync_request_rx) = Scheduler::new(
         default_pod,
         config.host_id,
         config.backends,
@@ -290,6 +290,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         scheduler,
         inbox_rx,
         stream_rx,
+        usage_rx,
         bucket_task_rx,
         resync_request_rx,
     ));

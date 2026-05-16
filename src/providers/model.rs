@@ -19,8 +19,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{
-    ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec, ToolKind,
-    ToolSchema, TunableSpec, TunableValue, Usage,
+    BackendUsage, ContentBlock, ContentCapabilities, ImageMime, MediaSupport, Message, ParamSpec,
+    ToolKind, ToolSchema, TunableSpec, TunableValue, Usage,
 };
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -261,6 +261,14 @@ pub enum ModelEvent {
     ///
     /// Ephemeral: not persisted.
     OutputTokensProgress { output_tokens: u32 },
+    /// Backend-level account/quota snapshot extracted from response
+    /// headers or other provider side-channels at the start of a turn.
+    /// Routed by the scheduler into the backend's registry entry rather
+    /// than the thread state — the snapshot is *per backend account*,
+    /// not per turn. Emitted at most once per stream by the providers
+    /// that expose this data (today: OpenAI Responses on the Codex
+    /// route); silent for all others.
+    ProviderUsage { snapshot: BackendUsage },
     /// Terminal event. `content` is the assistant-turn content block list the
     /// scheduler should persist. Deltas emitted before this are strictly for
     /// broadcast; the canonical state comes from here.
@@ -366,6 +374,27 @@ pub trait ModelProvider: Send + Sync {
     /// callers that already know the id).
     fn tunables_for(&self, _model_id: &str) -> Vec<TunableSpec> {
         Vec::new()
+    }
+
+    /// Explicitly poll the backend's account/quota endpoint for a
+    /// fresh usage snapshot. Triggered by the UI's "refresh" affordance
+    /// in the per-backend usage dropdown — distinct from the implicit
+    /// header-scrape on `create_message_streaming` paths, which carries
+    /// only the bits the upstream attaches to every response (window
+    /// utilizations). The poll path carries the richer bits the
+    /// header path doesn't include (plan type, credit balance on the
+    /// Codex backend).
+    ///
+    /// Default returns `Ok(None)` — backends that don't expose a
+    /// dedicated usage endpoint opt out by not overriding. `Ok(None)`
+    /// is also the right return when the upstream returns an empty
+    /// payload (e.g. enterprise accounts opted out of the metered
+    /// surface) — distinct from `Err(_)` which signals network / auth
+    /// failure the UI should surface.
+    fn fetch_usage<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<Option<whisper_agent_protocol::BackendUsage>, ModelError>> {
+        Box::pin(async { Ok(None) })
     }
 
     /// Replace the Codex `auth.json` contents for this provider, writing

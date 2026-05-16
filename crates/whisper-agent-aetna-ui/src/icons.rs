@@ -78,6 +78,19 @@ pub static ICON_DATABASE: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(LUCIDE_DATABASE).expect("lucide database svg parses")
 });
 
+/// Speedometer gauge — header trigger for the per-backend usage /
+/// quota dropdown. Distinct visual cue from the model chip's text,
+/// so the user reads it as "load meter" rather than just another
+/// piece of identity chrome.
+pub static ICON_GAUGE: LazyLock<SvgIcon> =
+    LazyLock::new(|| SvgIcon::parse_current_color(LUCIDE_GAUGE).expect("lucide gauge svg parses"));
+
+/// Circular refresh arrows — manual "refresh now" button inside the
+/// usage dropdown. Lucide's `refresh-cw` (clockwise) shape.
+pub static ICON_REFRESH_CW: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(LUCIDE_REFRESH_CW).expect("lucide refresh-cw svg parses")
+});
+
 const LUCIDE_ZAP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>"##;
 
 const LUCIDE_PLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>"##;
@@ -101,3 +114,7 @@ const LUCIDE_SERVER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox=
 const LUCIDE_CORNER_DOWN_LEFT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>"##;
 
 const LUCIDE_DATABASE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg>"##;
+
+const LUCIDE_GAUGE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>"##;
+
+const LUCIDE_REFRESH_CW: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>"##;

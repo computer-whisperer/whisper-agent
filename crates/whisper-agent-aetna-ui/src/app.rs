@@ -59,17 +59,18 @@ use whisper_agent_protocol::sandbox::{
     AccessMode, HostEnvSpec, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
 use whisper_agent_protocol::{
-    ActivationSurface, AllowMap, Attachment, BackendSummary, BehaviorConfig, BehaviorSummary,
-    BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase, BucketCreateInput,
-    BucketLoadOutcome, BucketLoadPhase, BucketSourceInput, BucketSummary, CatchUp, ClientToServer,
-    ContentBlock, CoreTools, Disposition, EmbeddingProviderInfo, FsEntry, HostEnvBindingRequest,
-    HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing, KnowledgeAutoquerySource,
-    ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits, PodSummary,
-    QuantizationInput, RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput,
-    SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel,
-    SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaultCaps,
-    ThreadDefaults, ThreadSummary, ToolSurface, TrackedCadenceInput, TrackedDriverInput,
-    TriggerSpec, TunableKind, TunableSpec, TunableValue, permission::SudoDecision,
+    ActivationSurface, AllowMap, Attachment, BackendSummary, BackendUsage, BehaviorConfig,
+    BehaviorSummary, BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase,
+    BucketCreateInput, BucketLoadOutcome, BucketLoadPhase, BucketSourceInput, BucketSummary,
+    CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition, EmbeddingProviderInfo, FsEntry,
+    HostEnvBindingRequest, HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing,
+    KnowledgeAutoquerySource, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
+    PodSummary, QuantizationInput, ResourceSnapshot, RetentionPolicy, Role, ServerToClient,
+    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput,
+    SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride,
+    ThreadDefaultCaps, ThreadDefaults, ThreadSummary, ToolSurface, TrackedCadenceInput,
+    TrackedDriverInput, TriggerSpec, TunableKind, TunableSpec, TunableValue,
+    permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -380,6 +381,40 @@ fn thread_usage_chip(usage: &whisper_agent_protocol::Usage) -> Option<El> {
         ));
     }
     Some(text(parts.join(" \u{00B7} ")).caption().muted())
+}
+
+/// One window row inside the backend-usage popover panel: a small
+/// "5h window — 43%" line, a progress bar underneath, and a caption
+/// for the reset time when known. Colour ramps from `INFO` (cool) to
+/// `WARNING` (warm) past 75% so a near-full window reads at a glance.
+fn usage_window_row(label: &str, w: &whisper_agent_protocol::UsageWindow) -> El {
+    let pct = w.used_percent.clamp(0.0, 100.0);
+    let bar_color = if pct >= 90.0 {
+        tokens::DESTRUCTIVE
+    } else if pct >= 75.0 {
+        tokens::WARNING
+    } else {
+        tokens::INFO
+    };
+    let label_row = row([
+        text(label.to_string()).caption().width(Size::Fill(1.0)),
+        text(format!("{pct:.0}%")).caption().muted(),
+    ])
+    .gap(tokens::SPACE_2)
+    .align(Align::Center)
+    .width(Size::Fill(1.0));
+    let bar = progress(pct / 100.0, bar_color)
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(6.0));
+    let mut rows: Vec<El> = vec![label_row, bar];
+    if let Some(epoch) = w.resets_at_epoch {
+        rows.push(
+            text(format!("resets {}", format_reset_in(epoch)))
+                .xsmall()
+                .muted(),
+        );
+    }
+    column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
 }
 
 /// `12345` → `12,345`. Cheap enough per-rebuild that a dedicated
@@ -1613,6 +1648,32 @@ pub struct ChatApp {
     /// `BackendsList`; drives the new-thread `Backend` picker. Entries
     /// arrive in the server's configured order.
     backends: Vec<BackendSummary>,
+    /// Latest per-backend account/quota snapshot, keyed by backend
+    /// name. Populated from `ResourceList` (cold-start) and
+    /// `ResourceUpdated` / `ResourceCreated` (deltas). Entries absent
+    /// when the backend has never reported usage data (Codex hasn't
+    /// served a turn yet) or doesn't expose any (every non-Codex
+    /// backend today). Drives the header usage chip + dropdown.
+    backend_usage: HashMap<String, BackendUsage>,
+    /// In-flight `RefreshBackendUsage` requests from this client,
+    /// keyed by correlation id with the backend name as value. Stamped
+    /// when the user clicks the refresh button in the usage dropdown,
+    /// cleared when the matching `BackendUsageRefreshed` or `Error`
+    /// reply lands (the success reply matches by correlation; the
+    /// error reply matches the same way). Drives the disabled state +
+    /// spinner on the dropdown's refresh button so repeated clicks
+    /// don't pile up duplicate requests. A `HashSet<backend>` would
+    /// race when two clients refresh the same backend, but more
+    /// importantly the `Error` reply doesn't echo back the backend
+    /// name — only the correlation id — so we couldn't reliably
+    /// uncheck a stuck spinner without this indirection.
+    backend_usage_refresh_inflight: HashMap<String, String>,
+    /// Whether the per-backend usage popover is currently open in the
+    /// header. Single global slot — only the currently-selected
+    /// thread's bound backend can be inspected, so a per-backend map
+    /// would just track one entry. Cleared by an outside-click on the
+    /// popover's scrim or another click on the trigger chip.
+    backend_usage_popover_open: bool,
     /// Shared-MCP-host catalog. Populated from
     /// `SharedMcpHostsList`. Read by the structured pod editor's
     /// Allow tab (multi-check over names) and the behavior editor's
@@ -2834,6 +2895,9 @@ impl ChatApp {
             expanded_behaviors: HashSet::new(),
             delete_armed_behavior: None,
             backends: Vec::new(),
+            backend_usage: HashMap::new(),
+            backend_usage_refresh_inflight: HashMap::new(),
+            backend_usage_popover_open: false,
             shared_mcp_hosts: Vec::new(),
             host_env_daemons: Vec::new(),
             buckets: Vec::new(),
@@ -2944,6 +3008,10 @@ impl ChatApp {
                 // the local mirror so re-selecting a thread re-asks
                 // for its snapshot.
                 self.subscribed.clear();
+                // In-flight refresh-usage requests are lost on
+                // disconnect — their replies will never arrive — so
+                // flush the inflight set to let the user retry.
+                self.backend_usage_refresh_inflight.clear();
                 // Same story for the per-backend `ListModels` dedup —
                 // a fresh socket means we have to re-fetch whatever
                 // the user picks.
@@ -2969,6 +3037,14 @@ impl ChatApp {
                         correlation_id: None,
                     });
                     self.send(ClientToServer::ListBackends {
+                        correlation_id: None,
+                    });
+                    // Resource registry — backends ride in `backends`
+                    // (catalog tier) and here (live tier with usage
+                    // snapshots). The two are independent — `backends`
+                    // never carries usage data — so the header chip
+                    // depends on this list landing.
+                    self.send(ClientToServer::ListResources {
                         correlation_id: None,
                     });
                     // Catalog tier consumed by the structured pod
@@ -3368,6 +3444,52 @@ impl ChatApp {
             }
             ServerToClient::EmbeddingProvidersList { providers, .. } => {
                 self.embedding_providers = providers;
+            }
+            ServerToClient::ResourceList { resources, .. } => {
+                // Cold-start hydration: walk the snapshot and stash
+                // every backend's usage block. McpHost entries are
+                // ignored — the UI doesn't surface MCP usage today.
+                for snap in resources {
+                    if let ResourceSnapshot::Backend { name, usage, .. } = snap
+                        && let Some(u) = usage
+                    {
+                        self.backend_usage.insert(name, u);
+                    }
+                }
+            }
+            ServerToClient::ResourceCreated { resource }
+            | ServerToClient::ResourceUpdated { resource } => {
+                if let ResourceSnapshot::Backend { name, usage, .. } = resource {
+                    match usage {
+                        Some(u) => {
+                            self.backend_usage.insert(name, u);
+                        }
+                        None => {
+                            // Server cleared the snapshot (rare —
+                            // would happen if a backend reset its
+                            // tracker). Mirror locally so a stale
+                            // chip doesn't keep showing.
+                            self.backend_usage.remove(&name);
+                        }
+                    }
+                }
+            }
+            ServerToClient::BackendUsageRefreshed {
+                correlation_id: Some(id),
+                backend: _,
+                had_snapshot: _,
+            } => {
+                // Drop the spinner; the fresh snapshot (if any) has
+                // already landed via a sibling `ResourceUpdated`
+                // broadcast that the scheduler emits before this ack.
+                self.backend_usage_refresh_inflight.remove(&id);
+            }
+            ServerToClient::BackendUsageRefreshed {
+                correlation_id: None,
+                ..
+            } => {
+                // No correlation id — broadcast-shaped ack from a
+                // refresh triggered elsewhere. Nothing local to clear.
             }
             ServerToClient::SharedMcpHostsList { hosts, .. } => {
                 self.shared_mcp_hosts = hosts;
@@ -4285,6 +4407,17 @@ impl ChatApp {
                 // the form re-enables for retry. `consumed`
                 // gates the thread-scoped fallback so a single
                 // Error can't double-fire onto both layers.
+                // Usage-refresh failures are fire-and-forget from the
+                // user's perspective: drop the spinner and bail
+                // before the modal-error fallthrough chain runs. The
+                // popover may not even be open anymore by the time
+                // the error round-trips, so surfacing the message
+                // text is more noise than help.
+                if let Some(corr) = correlation_id.as_ref()
+                    && self.backend_usage_refresh_inflight.remove(corr).is_some()
+                {
+                    return;
+                }
                 let mut consumed = false;
                 if let Some(corr) = correlation_id.as_ref() {
                     if let Some(modal) = self.new_pod_modal.as_mut()
@@ -5098,6 +5231,35 @@ impl App for ChatApp {
                 (Some(open), Some(sel)) if open == sel => None,
                 _ => target,
             };
+            return;
+        }
+        if event.is_click_or_activate(BACKEND_USAGE_TRIGGER_KEY) {
+            self.backend_usage_popover_open = !self.backend_usage_popover_open;
+            return;
+        }
+        if event.is_click_or_activate(&format!("{BACKEND_USAGE_POPOVER_KEY}:dismiss")) {
+            self.backend_usage_popover_open = false;
+            return;
+        }
+        if event.is_click_or_activate(BACKEND_USAGE_REFRESH_KEY) {
+            // Fire `RefreshBackendUsage` for the bound backend of
+            // the currently-selected thread. The button is only
+            // visible inside the popover, which only opens when
+            // there's a selected thread with a non-empty backend
+            // binding — so the lookup chain here is defensive
+            // rather than failure-prone.
+            if let Some(view) = self.selected.as_deref().and_then(|tid| self.views.get(tid))
+                && !view.backend.is_empty()
+            {
+                let backend = view.backend.clone();
+                let corr = self.next_correlation_id();
+                self.backend_usage_refresh_inflight
+                    .insert(corr.clone(), backend.clone());
+                self.send(ClientToServer::RefreshBackendUsage {
+                    correlation_id: Some(corr),
+                    backend,
+                });
+            }
             return;
         }
         if event.is_click_or_activate(SIDEBAR_NEW_POD_KEY) {
@@ -5955,6 +6117,18 @@ const SIDEBAR_SERVER_SETTINGS_KEY: &str = "sidebar:server-settings";
 /// thread id and `None`; the renderer paints an inline detail
 /// panel between the header and the chat log when set.
 const CHAT_INSPECTOR_TOGGLE_KEY: &str = "chat:inspector-toggle";
+
+/// Per-backend usage chip in the thread sub-line — click flips
+/// [`ChatApp::backend_usage_popover_open`] and anchors the dropdown
+/// panel below this trigger. Only rendered when the bound backend
+/// has a cached [`whisper_agent_protocol::BackendUsage`].
+const BACKEND_USAGE_TRIGGER_KEY: &str = "backend-usage:trigger";
+/// Popover layer key — also doubles as the dismiss-event prefix
+/// (the dismiss scrim emits `{key}:dismiss` on outside click).
+const BACKEND_USAGE_POPOVER_KEY: &str = "backend-usage:popover";
+/// Refresh button inside the popover panel — click fires
+/// `ClientToServer::RefreshBackendUsage` for the bound backend.
+const BACKEND_USAGE_REFRESH_KEY: &str = "backend-usage:refresh";
 
 /// Sidebar footer database icon — opens the knowledge-buckets modal.
 /// Always visible, since buckets span both server-scope and pod-
@@ -9211,6 +9385,165 @@ impl ChatApp {
         )
     }
 
+    /// Header trigger for the per-backend usage dropdown. Renders a
+    /// gauge icon plus a compact percent summary
+    /// (`{primary}% · {secondary}%`) when the bound backend has a
+    /// cached snapshot. Clicking toggles
+    /// [`Self::backend_usage_popover_open`]; the popover layer (built
+    /// by [`Self::backend_usage_popover_layer`]) anchors below this
+    /// trigger.
+    ///
+    /// Returns `None` (chip suppressed) for backends with no cached
+    /// snapshot — almost every non-Codex backend today, plus a Codex
+    /// backend that hasn't served a turn yet. A dead "?% · ?%" chip
+    /// would be more noise than signal in those cases.
+    fn backend_usage_chip(&self, backend_name: &str) -> Option<El> {
+        let usage = self.backend_usage.get(backend_name)?;
+        let primary = usage
+            .primary
+            .as_ref()
+            .map(|w| format!("{:.0}%", w.used_percent));
+        let secondary = usage
+            .secondary
+            .as_ref()
+            .map(|w| format!("{:.0}%", w.used_percent));
+        let summary = match (primary, secondary) {
+            (Some(p), Some(s)) => format!("{p} · {s}"),
+            (Some(p), None) => p,
+            (None, Some(s)) => s,
+            // No window data and no plan/credits — nothing the chip
+            // can usefully summarize; fall back to the icon alone.
+            (None, None) => "·".to_string(),
+        };
+        // NOTE: do NOT chain `.icon_size(...)` on a `button_with_icon`
+        // here — that method's a destructive shorthand that overwrites
+        // the *element's* `width` and `height` to `Size::Fixed(size)`,
+        // collapsing the whole chip's hit/hover rect to a single icon
+        // square while leaving the actual icon child + text label
+        // overflowing to the right. Resize the inner icon by rebuilding
+        // the children if a smaller glyph is needed; the outer button
+        // takes the default `CONTROL_HEIGHT` row, ghost-styled, so the
+        // hover envelope wraps the whole "icon + percent" pill.
+        Some(
+            button_with_icon(crate::icons::ICON_GAUGE.clone(), summary)
+                .key(BACKEND_USAGE_TRIGGER_KEY)
+                .ghost(),
+        )
+    }
+
+    /// Build the per-backend usage popover layer for
+    /// [`Self::popover_layers`]. Returns `None` when the popover is
+    /// closed or there's no selected thread / cached snapshot to
+    /// render — in either case the caller skips appending a layer.
+    fn backend_usage_popover_layer(&self) -> Option<El> {
+        if !self.backend_usage_popover_open {
+            return None;
+        }
+        let view = self
+            .selected
+            .as_deref()
+            .and_then(|tid| self.views.get(tid))?;
+        let backend_name = view.backend.clone();
+        if backend_name.is_empty() {
+            return None;
+        }
+        let usage = self.backend_usage.get(&backend_name)?;
+        let panel = self.backend_usage_panel(&backend_name, usage);
+        Some(popover(
+            BACKEND_USAGE_POPOVER_KEY,
+            Anchor::below_key(BACKEND_USAGE_TRIGGER_KEY),
+            panel,
+        ))
+    }
+
+    /// Render the popover panel body. Header row: plan badge (or
+    /// backend name) + refresh button. Then one row per
+    /// primary/secondary window with a labelled progress bar and a
+    /// "resets in X" caption. Credits row (when present). Footer:
+    /// "Updated Xs ago · header scrape / fresh poll".
+    fn backend_usage_panel(&self, backend_name: &str, usage: &BackendUsage) -> El {
+        let inflight = self
+            .backend_usage_refresh_inflight
+            .values()
+            .any(|b| b == backend_name);
+
+        let plan_label = usage
+            .plan_type
+            .as_deref()
+            .map(|p| format!("ChatGPT {p}"))
+            .unwrap_or_else(|| backend_name.to_string());
+        let header = row([
+            text(plan_label).label().width(Size::Fill(1.0)),
+            icon_button(crate::icons::ICON_REFRESH_CW.clone())
+                .key(BACKEND_USAGE_REFRESH_KEY)
+                .ghost()
+                .icon_size(tokens::ICON_XS),
+        ])
+        .gap(tokens::SPACE_2)
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        let mut body: Vec<El> = vec![header];
+
+        if let Some(w) = usage.primary.as_ref() {
+            body.push(usage_window_row("5h window", w));
+        }
+        if let Some(w) = usage.secondary.as_ref() {
+            body.push(usage_window_row("7d window", w));
+        }
+
+        if let Some(c) = usage.credits.as_ref() {
+            let label = if c.unlimited {
+                "Credits: unlimited".to_string()
+            } else if let Some(bal) = c.balance.as_deref() {
+                format!("Credits: ${bal}")
+            } else if c.has_credits {
+                "Credits available".to_string()
+            } else {
+                "No credits".to_string()
+            };
+            body.push(
+                text(label)
+                    .caption()
+                    .muted()
+                    .wrap_text()
+                    .width(Size::Fill(1.0)),
+            );
+        }
+
+        // Shortened source labels — "from response headers" was long
+        // enough to overflow the panel's right edge at xsmall caption
+        // size when combined with a double-digit minute count. The
+        // wrap_text + fill_width call below is the belt-and-braces:
+        // if the string still doesn't fit on one line it reflows
+        // instead of clipping out of the panel.
+        let source_label = match usage.source {
+            whisper_agent_protocol::UsageSource::Headers => "from headers",
+            whisper_agent_protocol::UsageSource::Poll => "polled",
+        };
+        let rel = format_relative(&usage.captured_at);
+        let footer_text = if rel.is_empty() {
+            source_label.to_string()
+        } else if inflight {
+            format!("Updated {rel} ago · refreshing…")
+        } else {
+            format!("Updated {rel} ago · {source_label}")
+        };
+        body.push(
+            text(footer_text)
+                .xsmall()
+                .muted()
+                .wrap_text()
+                .width(Size::Fill(1.0)),
+        );
+
+        let inner = column(body)
+            .gap(tokens::SPACE_2)
+            .padding(Sides::all(tokens::SPACE_3))
+            .width(Size::Fixed(280.0));
+        popover_panel([inner])
+    }
+
     fn prefill_indicator(&self, thread_id: &str) -> Option<El> {
         let &(processed, total) = self.prefill.get(thread_id)?;
         if total == 0 {
@@ -9289,6 +9622,14 @@ impl ChatApp {
             }
             if let Some(usage_chip) = thread_usage_chip(&v.total_usage) {
                 sub_line.push(usage_chip);
+            }
+            // Backend-quota chip — only renders when a cached
+            // snapshot exists for the bound backend (today: Codex
+            // after its first turn).
+            if !v.backend.is_empty()
+                && let Some(quota_chip) = self.backend_usage_chip(&v.backend)
+            {
+                sub_line.push(quota_chip);
             }
         }
         let mut header_rows: Vec<El> = vec![
@@ -10705,6 +11046,9 @@ impl ChatApp {
         }
         if self.picker_backend_open {
             out.push(Some(self.backend_menu()));
+        }
+        if let Some(usage_popover) = self.backend_usage_popover_layer() {
+            out.push(Some(usage_popover));
         }
         if self.picker_model_open {
             out.push(Some(self.model_menu()));
@@ -20371,6 +20715,42 @@ fn short_id(id: &str) -> String {
     let mut head: String = id.chars().take(HEAD).collect();
     head.push('…');
     head
+}
+
+/// "resets in 2h 14m" / "resets in 47s" / "resetting now" — formats
+/// a future epoch as a compact countdown string. Bounded resolution:
+/// shows seconds under 1 min, single-unit minutes under 1 hour, then
+/// `h m` and `d h` pairs. Past-due epochs collapse to `"now"` rather
+/// than going negative.
+fn format_reset_in(epoch: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = epoch.saturating_sub(now);
+    if delta <= 0 {
+        return "now".to_string();
+    }
+    if delta < 60 {
+        return format!("in {delta}s");
+    }
+    let mins = delta / 60;
+    if mins < 60 {
+        return format!("in {mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        let rem = mins % 60;
+        return if rem == 0 {
+            format!("in {hours}h")
+        } else {
+            format!("in {hours}h {rem}m")
+        };
+    }
+    let days = hours / 24;
+    let rem = hours % 24;
+    if rem == 0 {
+        format!("in {days}d")
+    } else {
+        format!("in {days}d {rem}h")
+    }
 }
 
 /// egui sibling's `format_relative_time`. Returns `"just now"` for

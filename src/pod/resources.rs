@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use whisper_agent_protocol::{ResourceSnapshot, ResourceStateLabel};
+use whisper_agent_protocol::{BackendUsage, ResourceSnapshot, ResourceStateLabel};
 
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor};
 
@@ -137,6 +137,11 @@ pub struct BackendEntry {
     pub pinned: bool,
     pub created_at: DateTime<Utc>,
     pub last_used: DateTime<Utc>,
+    /// Most recent account/quota snapshot. `None` until either a
+    /// model call comes back with usage headers (Codex path) or a
+    /// client requests an explicit refresh. Backends that don't
+    /// expose usage data stay `None` forever.
+    pub usage: Option<BackendUsage>,
 }
 
 /// Two flat registries owned by the scheduler. v1 host envs are gone;
@@ -177,6 +182,7 @@ impl BackendEntry {
             pinned: self.pinned,
             created_at: self.created_at.to_rfc3339(),
             last_used: self.last_used.to_rfc3339(),
+            usage: self.usage.clone(),
         }
     }
 }
@@ -230,9 +236,21 @@ impl ResourceRegistry {
                 pinned: true,
                 created_at: now,
                 last_used: now,
+                usage: None,
             },
         );
         id
+    }
+
+    /// Replace the cached usage snapshot for a backend. Used by the
+    /// model-call path (header scrape) and the active refresh path
+    /// (polling the backend's usage endpoint). No-op if the backend
+    /// is unknown — a missing entry means the catalog was reloaded
+    /// out from under an in-flight update, not a bug worth surfacing.
+    pub fn set_backend_usage(&mut self, id: &BackendId, usage: BackendUsage) {
+        if let Some(entry) = self.backends.get_mut(id) {
+            entry.usage = Some(usage);
+        }
     }
 
     /// Insert a Ready shared MCP host entry. Idempotent on `id`.

@@ -17,6 +17,7 @@
 //! sibling MCP daemons can use it too.
 
 pub mod anthropic;
+pub mod codex_usage;
 pub mod embedding;
 pub mod gemini;
 pub mod gemini_auth;
