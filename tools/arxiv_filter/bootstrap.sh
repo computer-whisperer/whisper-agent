@@ -18,6 +18,8 @@ PANDOC_VERSION="${PANDOC_VERSION:-3.6}"
 WORK_USER="${WORK_USER:-$(logname 2>/dev/null || echo ec2-user)}"
 WORK_HOME="$(getent passwd "$WORK_USER" | cut -d: -f6)"
 INSTALL_DIR="$WORK_HOME/arxiv_filter"
+SHARDS="${SHARDS:-4}"                 # number of concurrent drive.py instances
+AUTO_RUN="${AUTO_RUN:-1}"             # 0 to skip auto-launch (manual mode)
 
 echo "[bootstrap] user=$WORK_USER home=$WORK_HOME install_dir=$INSTALL_DIR"
 echo "[bootstrap] staging bucket: $STAGING_BUCKET"
@@ -74,13 +76,14 @@ pandoc --version | head -1
 python3 -m pip install --break-system-packages zstandard 2>&1 | tail -3 || \
     python3 -m pip install zstandard 2>&1 | tail -3
 
-# 6. Pull filter.py + drive.py from staging
+# 6. Pull filter.py + drive.py + watchdog.sh from staging
 mkdir -p "$INSTALL_DIR"
-aws s3 cp "s3://$STAGING_BUCKET/scripts/filter.py" "$INSTALL_DIR/filter.py"
-aws s3 cp "s3://$STAGING_BUCKET/scripts/drive.py"  "$INSTALL_DIR/drive.py"
-chown -R "$WORK_USER:$WORK_USER" "$INSTALL_DIR"
-chmod +x "$INSTALL_DIR"/*.py
-echo "[bootstrap] installed scripts: $(ls "$INSTALL_DIR")"
+aws s3 cp "s3://$STAGING_BUCKET/scripts/filter.py"   "$INSTALL_DIR/filter.py"
+aws s3 cp "s3://$STAGING_BUCKET/scripts/drive.py"    "$INSTALL_DIR/drive.py"
+aws s3 cp "s3://$STAGING_BUCKET/scripts/watchdog.sh" "$WORK_HOME/watchdog.sh"
+chown -R "$WORK_USER:$WORK_USER" "$INSTALL_DIR" "$WORK_HOME/watchdog.sh"
+chmod +x "$INSTALL_DIR"/*.py "$WORK_HOME/watchdog.sh"
+echo "[bootstrap] installed scripts: $(ls "$INSTALL_DIR") watchdog.sh"
 
 # 7. Verify AWS access via instance metadata
 echo "[bootstrap] verifying AWS access via instance profile..."
@@ -90,11 +93,46 @@ aws s3api head-object --bucket arxiv --key src/arXiv_src_manifest.xml \
     --request-payer requester >/dev/null
 echo "[bootstrap] AWS access OK"
 
-echo
-echo "[bootstrap] done. Next step (as $WORK_USER):"
-echo "  cd $INSTALL_DIR"
-echo "  python3 drive.py --profile '' --staging-bucket $STAGING_BUCKET --select all"
-echo
-echo "Suggested wrapper for resumability + logging:"
-echo "  nohup python3 drive.py --profile '' --select all >drive.log 2>&1 &"
-echo "  tail -f drive.log"
+if [[ "$AUTO_RUN" != "1" ]]; then
+    echo
+    echo "[bootstrap] AUTO_RUN=0 — skipping auto-launch. To start manually:"
+    echo "  for n in \$(seq 0 $((SHARDS-1))); do"
+    echo "    sudo -u $WORK_USER setsid nohup python3 $INSTALL_DIR/drive.py \\"
+    echo "      --profile '' --staging-bucket $STAGING_BUCKET --select all \\"
+    echo "      --shard \$n/$SHARDS -j \$(( \$(nproc) / $SHARDS )) \\"
+    echo "      --workdir /tmp/arxiv_drive/shard\$n \\"
+    echo "      </dev/null >$WORK_HOME/drive-\$n.log 2>&1 &"
+    echo "  done"
+    echo "  sudo -u $WORK_USER setsid nohup bash $WORK_HOME/watchdog.sh \\"
+    echo "    </dev/null >>$WORK_HOME/watchdog.log 2>&1 &"
+    exit 0
+fi
+
+# 8. Auto-launch SHARDS drive instances + the watchdog
+CORES_PER_SHARD=$(( $(nproc) / SHARDS ))
+if [[ "$CORES_PER_SHARD" -lt 1 ]]; then CORES_PER_SHARD=1; fi
+echo "[bootstrap] launching $SHARDS drive shards × $CORES_PER_SHARD cores each"
+
+mkdir -p /tmp/arxiv_drive
+chown "$WORK_USER:$WORK_USER" /tmp/arxiv_drive
+
+for n in $(seq 0 $((SHARDS - 1))); do
+    workdir="/tmp/arxiv_drive/shard$n"
+    mkdir -p "$workdir"
+    chown "$WORK_USER:$WORK_USER" "$workdir"
+    log="$WORK_HOME/drive-$n.log"
+    sudo -u "$WORK_USER" bash -c "setsid nohup python3 $INSTALL_DIR/drive.py \
+        --profile '' --staging-bucket $STAGING_BUCKET --select all \
+        --shard $n/$SHARDS -j $CORES_PER_SHARD \
+        --workdir $workdir \
+        </dev/null >$log 2>&1 &"
+done
+
+echo "[bootstrap] launching watchdog"
+sudo -u "$WORK_USER" bash -c "setsid nohup bash $WORK_HOME/watchdog.sh \
+    </dev/null >>$WORK_HOME/watchdog.log 2>&1 &"
+
+sleep 3
+echo "[bootstrap] running processes:"
+ps -ef | grep -E "drive.py|watchdog" | grep -v grep | awk '{print " ", $2, $8, $9, $10, $11, $12, $13}'
+echo "[bootstrap] done."

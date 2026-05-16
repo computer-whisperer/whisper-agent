@@ -179,6 +179,9 @@ def main():
                     help="staging bucket for filtered output + markers")
     ap.add_argument("--select", default="last:1",
                     help="selector: 'last:N' | 'yymm:NNNN' | 'from:YYMM' | 'all'")
+    ap.add_argument("--shard", default=None,
+                    help="shard spec 'N/M': process only tarballs where index % M == N. "
+                         "Markers in staging deduplicate across shards.")
     ap.add_argument("--workdir", type=Path, default=Path("/tmp/arxiv_drive"),
                     help="local scratch dir for tarballs in flight")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 8,
@@ -196,6 +199,16 @@ def main():
     print(f"[drive] manifest has {len(files):,} tarballs")
 
     selected = select_files(files, args.select)
+    if args.shard:
+        try:
+            n_str, m_str = args.shard.split("/")
+            shard_n, shard_m = int(n_str), int(m_str)
+        except ValueError:
+            raise SystemExit(f"invalid --shard '{args.shard}', expected 'N/M'")
+        if not 0 <= shard_n < shard_m:
+            raise SystemExit(f"--shard N must be in [0, M); got {shard_n}/{shard_m}")
+        selected = [f for i, f in enumerate(selected) if i % shard_m == shard_n]
+        print(f"[drive] shard {shard_n}/{shard_m}: kept {len(selected)} tarballs")
     total_size = sum(f["size"] for f in selected)
     print(f"[drive] selected {len(selected)} tarballs ({total_size/1e9:.1f} GB total)")
     if args.dry_run:

@@ -45,9 +45,12 @@ while true; do
 
     if [[ "$count" -ge "$TARGET" ]]; then
         echo "[$(date -u +%FT%TZ)] [watchdog] target reached. syncing logs + terminating."
-        # Upload final logs before pulling the rug
-        aws s3 cp /home/ec2-user/drive.log    "s3://$BUCKET/logs/drive-final.log"    || true
-        aws s3 cp "$LOG"                       "s3://$BUCKET/logs/watchdog-final.log" || true
+        # Upload all shard logs (drive-N.log) plus a single drive.log if present
+        for f in /home/ec2-user/drive.log /home/ec2-user/drive-*.log; do
+            [[ -f "$f" ]] || continue
+            aws s3 cp "$f" "s3://$BUCKET/logs/$(basename "$f")" || true
+        done
+        aws s3 cp "$LOG" "s3://$BUCKET/logs/watchdog-final.log" || true
         # 30s grace so the log uploads above show up if you're tailing
         sleep 30
         aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID"
