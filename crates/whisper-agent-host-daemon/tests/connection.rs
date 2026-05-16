@@ -101,6 +101,7 @@ fn config(port: u16) -> connection::ConnectionConfig {
         capabilities: cap(),
         mcp_host_bin: "whisper-agent-mcp-host".into(),
         tls_connector: None,
+        publish_credentials: Vec::new(),
     }
 }
 

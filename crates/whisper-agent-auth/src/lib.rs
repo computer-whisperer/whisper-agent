@@ -17,5 +17,5 @@ mod client;
 mod codex;
 
 pub use auth::{Auth, ChatgptSubscriptionSource, GoogleOauthSource};
-pub use client::ClientAuth;
-pub use codex::CodexAuth;
+pub use client::{ClientAuth, CodexAuthSlot, SlotUpdateError};
+pub use codex::{CodexAuth, default_path as default_codex_auth_path};

@@ -15,6 +15,7 @@ use serde::Deserialize;
 /// auth = { mode = "api_key", env  = "ANTHROPIC_API_KEY" }
 /// auth = { mode = "chatgpt_subscription", source = "codex" }
 /// auth = { mode = "chatgpt_subscription", source = "codex", path = "/custom/auth.json" }
+/// auth = { mode = "chatgpt_subscription", source = "codex", manager = "laptop-daemon" }
 /// ```
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -28,11 +29,24 @@ pub enum Auth {
     /// Use a ChatGPT subscription's OAuth tokens instead of an API key. Today
     /// the only `source` is `codex` — we read the credentials file that the
     /// Codex CLI maintains at `~/.codex/auth.json`.
+    ///
+    /// When `manager` names a v2 host-env daemon (one admitted via
+    /// `[[auth.daemons]]`), this backend's credential file is owned by
+    /// that daemon: the daemon keeps it fresh and pushes updates over
+    /// the host-env link. The server starts even if the file is absent
+    /// at boot — requests against the backend fail with a clear
+    /// "awaiting publication" message until the first publish arrives.
+    /// Locally-administered backends omit `manager` and behave as
+    /// before (file required at startup; admin-paste rotation only).
     ChatgptSubscription {
         source: ChatgptSubscriptionSource,
         /// Override the default file location for the chosen `source`.
         #[serde(default)]
         path: Option<PathBuf>,
+        /// Daemon allowed to publish refreshes for this backend's
+        /// credential file. Must match a name in `[[auth.daemons]]`.
+        #[serde(default)]
+        manager: Option<String>,
     },
     /// Use Google OAuth tokens minted by a companion tool. Today the only
     /// `source` is `gemini_cli` — we read `~/.gemini/oauth_creds.json`.
@@ -66,6 +80,17 @@ impl Auth {
             Auth::ApiKey { .. } => "api_key",
             Auth::ChatgptSubscription { .. } => "chatgpt_subscription",
             Auth::GoogleOauth { .. } => "google_oauth",
+        }
+    }
+
+    /// Name of the daemon authorized to manage this credential, if
+    /// any. Today only the `chatgpt_subscription` variant carries a
+    /// manager; future credential families (Google OAuth, etc.) will
+    /// extend this with their own fields.
+    pub fn credential_manager(&self) -> Option<&str> {
+        match self {
+            Auth::ChatgptSubscription { manager, .. } => manager.as_deref(),
+            Auth::ApiKey { .. } | Auth::GoogleOauth { .. } => None,
         }
     }
 

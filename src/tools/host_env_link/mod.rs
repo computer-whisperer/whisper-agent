@@ -42,6 +42,21 @@ pub use endpoint::link_handler;
 
 use connection::Command;
 
+/// Combined state the `/v1/host_env_link` endpoint needs at upgrade
+/// time. Bundled into one type so the axum router stores a single
+/// `Arc` rather than two parallel `State`s — also makes it easy to
+/// thread test fixtures (a stub inbox + a live registry) through
+/// the upgrade path.
+pub struct HostEnvLinkState {
+    pub registry: Arc<LiveDaemonRegistry>,
+    /// Scheduler inbox. The connection task forwards
+    /// `Frame::PublishCredential` here as
+    /// `SchedulerMsg::DaemonPublishCredential` so the scheduler can
+    /// authorize and dispatch through the same `update_codex_auth`
+    /// path the admin paste rotation uses.
+    pub scheduler_inbox: mpsc::UnboundedSender<crate::runtime::scheduler::SchedulerMsg>,
+}
+
 /// Errors surfaced through the v2 host-env link to consumers.
 #[derive(Debug, Error)]
 pub enum LinkError {

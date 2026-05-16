@@ -28,9 +28,12 @@ use futures::{SinkExt, StreamExt, stream::SplitSink, stream::SplitStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use whisper_agent_host_proto::{
-    CallId, CallToolResult, ContentBlock, DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec,
-    PROTOCOL_VERSION, ProvisionPhase, SessionId, ThreadContext,
+    CallId, CallToolResult, ContentBlock, CredentialAckResult, CredentialPayload,
+    DaemonCapabilities, Frame, GoodbyeReason, HostEnvSpec, PROTOCOL_VERSION, ProvisionPhase,
+    SessionId, ThreadContext,
 };
+
+use crate::runtime::scheduler::SchedulerMsg;
 
 use super::{InsertOutcome, LiveDaemonHandle, LiveDaemonRegistry, unix_millis_now};
 
@@ -127,6 +130,7 @@ pub(super) async fn run_connection(
     name: String,
     socket: WebSocket,
     registry: Arc<LiveDaemonRegistry>,
+    scheduler_inbox: mpsc::UnboundedSender<SchedulerMsg>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let handshake = match handshake(&name, &mut sink, &mut stream).await {
@@ -180,7 +184,7 @@ pub(super) async fn run_connection(
         "v2 host-env daemon connected"
     );
 
-    event_loop(&handle, &mut sink, &mut stream, cmd_rx).await;
+    event_loop(&handle, &mut sink, &mut stream, cmd_rx, scheduler_inbox).await;
 
     // ptr-eq guard: if this task was superseded, the registry slot
     // already points at the replacement and we leave it alone.
@@ -270,6 +274,7 @@ async fn event_loop(
     sink: &mut SplitSink<WebSocket, Message>,
     stream: &mut SplitStream<WebSocket>,
     mut cmd_rx: mpsc::Receiver<Command>,
+    scheduler_inbox: mpsc::UnboundedSender<SchedulerMsg>,
 ) {
     let name = handle.name();
     let mut sessions: HashMap<SessionId, SessionState> = HashMap::new();
@@ -309,6 +314,26 @@ async fn event_loop(
                 Some(Ok(Message::Binary(bytes))) => {
                     handle.touch_active();
                     match Frame::decode_cbor(&bytes) {
+                        Ok(Frame::PublishCredential { backend, payload }) => {
+                            // Forward to the scheduler for authorization +
+                            // dispatch, then ack the daemon. Inlined here
+                            // (rather than dispatched through `handle_frame`)
+                            // because the ack is async and needs `sink`.
+                            let ack = handle_publish_credential(
+                                name,
+                                &scheduler_inbox,
+                                backend.clone(),
+                                payload,
+                            )
+                            .await;
+                            if let Err(e) = send_frame(sink, Frame::CredentialAck {
+                                backend,
+                                result: ack,
+                            }).await {
+                                warn!(daemon = %name, error = %e, "ack send failed; closing");
+                                return;
+                            }
+                        }
                         Ok(frame) => handle_frame(name, frame, &mut sessions),
                         Err(e) => {
                             warn!(daemon = %name, error = %e, "frame decode failed; closing");
@@ -476,6 +501,46 @@ async fn handle_command(
     }
 }
 
+/// Forward a [`Frame::PublishCredential`] to the scheduler for
+/// authorization and dispatch, returning the [`CredentialAckResult`]
+/// the connection task should send back. Channel errors fold into
+/// [`CredentialAckResult::Rejected`] so the daemon always sees a
+/// terminal ack — the only "no reply" case is a scheduler-down
+/// scenario where the WS itself is about to drop anyway.
+async fn handle_publish_credential(
+    daemon_name: &str,
+    scheduler_inbox: &mpsc::UnboundedSender<SchedulerMsg>,
+    backend: String,
+    payload: CredentialPayload,
+) -> CredentialAckResult {
+    let CredentialPayload::Codex { contents } = payload;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let msg = SchedulerMsg::DaemonPublishCredential {
+        daemon_name: daemon_name.to_string(),
+        backend: backend.clone(),
+        contents,
+        reply: reply_tx,
+    };
+    if scheduler_inbox.send(msg).is_err() {
+        return CredentialAckResult::Rejected {
+            reason: "scheduler inbox closed".into(),
+        };
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => {
+            info!(daemon = daemon_name, %backend, "credential publish applied");
+            CredentialAckResult::Accepted
+        }
+        Ok(Err(e)) => {
+            warn!(daemon = daemon_name, %backend, reason = %e, "rejecting credential publish");
+            CredentialAckResult::Rejected { reason: e }
+        }
+        Err(_) => CredentialAckResult::Rejected {
+            reason: "scheduler dropped reply without sending".into(),
+        },
+    }
+}
+
 fn handle_frame(name: &str, frame: Frame, sessions: &mut HashMap<SessionId, SessionState>) {
     match frame {
         Frame::SessionReady { session_id } => {
@@ -554,11 +619,22 @@ fn handle_frame(name: &str, frame: Frame, sessions: &mut HashMap<SessionId, Sess
         | Frame::CloseSession { .. }
         | Frame::InvokeTool { .. }
         | Frame::CancelCall { .. }
-        | Frame::ListBackgroundTasks { .. } => {
+        | Frame::ListBackgroundTasks { .. }
+        | Frame::CredentialAck { .. } => {
             warn!(
                 daemon = %name,
                 "unexpected scheduler-bound frame from daemon: {:?}",
                 frame_kind(&frame)
+            );
+        }
+        // PublishCredential is intercepted by the event loop (it
+        // needs `sink` to ack). If one reaches here something
+        // upstream miswired the dispatch — log loudly so the
+        // misroute is visible rather than silently dropped.
+        Frame::PublishCredential { .. } => {
+            warn!(
+                daemon = %name,
+                "PublishCredential reached handle_frame — event-loop dispatch misrouted; ignoring"
             );
         }
     }
@@ -612,5 +688,7 @@ fn frame_kind(f: &Frame) -> &'static str {
         Frame::ListBackgroundTasks { .. } => "ListBackgroundTasks",
         Frame::BackgroundTaskList { .. } => "BackgroundTaskList",
         Frame::HookEvent { .. } => "HookEvent",
+        Frame::PublishCredential { .. } => "PublishCredential",
+        Frame::CredentialAck { .. } => "CredentialAck",
     }
 }

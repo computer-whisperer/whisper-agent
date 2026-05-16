@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 
-use super::LiveDaemonRegistry;
+use super::HostEnvLinkState;
 use super::auth::AdmittedDaemon;
 use super::connection;
 
@@ -19,11 +19,17 @@ use super::connection;
 /// success; the auth middleware has already returned 401 / 503 if the
 /// bearer didn't resolve.
 pub async fn link_handler(
-    State(registry): State<Arc<LiveDaemonRegistry>>,
+    State(state): State<Arc<HostEnvLinkState>>,
     Extension(daemon): Extension<AdmittedDaemon>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
-        connection::run_connection(daemon.name, socket, registry).await;
+        connection::run_connection(
+            daemon.name,
+            socket,
+            state.registry.clone(),
+            state.scheduler_inbox.clone(),
+        )
+        .await;
     })
 }

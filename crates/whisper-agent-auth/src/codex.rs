@@ -127,6 +127,34 @@ impl CodexAuth {
         }
     }
 
+    /// Wall-clock instant at which a background refresher should wake
+    /// next. `lead` is how far ahead of expiry the caller wants the
+    /// refresh attempted; for the host-daemon publisher this is a few
+    /// minutes so the refreshed token reaches the scheduler well
+    /// before the old one rolls over.
+    ///
+    /// `None` means "refresh right now" — either the expiry is
+    /// already inside the lead window or the `exp` claim couldn't be
+    /// parsed and the conservative move is to refresh immediately
+    /// and re-check.
+    pub fn next_refresh_at(&self, lead: Duration) -> Option<DateTime<Utc>> {
+        let exp = self.exp?;
+        let target = exp - lead;
+        if target <= Utc::now() {
+            None
+        } else {
+            Some(target)
+        }
+    }
+
+    /// Token expiry timestamp as parsed from the access-token JWT's
+    /// `exp` claim. `None` means we couldn't parse it (the file may
+    /// have been hand-edited or come from a future Codex variant);
+    /// callers should treat it as "refresh immediately."
+    pub fn exp(&self) -> Option<DateTime<Utc>> {
+        self.exp
+    }
+
     async fn refresh(&mut self, http: &reqwest::Client) -> Result<()> {
         let tokens = self
             .data
@@ -199,7 +227,11 @@ impl CodexAuth {
     }
 }
 
-fn default_path() -> Result<PathBuf> {
+/// `$HOME/.codex/auth.json` — Codex CLI's default credentials location.
+/// Public so callers that need to resolve the path *before* the file
+/// exists (e.g. the host-daemon-managed "awaiting publication" path)
+/// don't have to duplicate the env-var read.
+pub fn default_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set; cannot locate ~/.codex/auth.json")?;
     Ok(PathBuf::from(home).join(".codex/auth.json"))
 }

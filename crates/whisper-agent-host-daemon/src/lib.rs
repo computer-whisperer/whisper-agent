@@ -29,7 +29,9 @@
 //!   they land in phases 5/6.
 
 pub mod catalog;
+pub mod config;
 pub mod connection;
+pub mod credentials;
 pub mod sessions;
 pub mod worker;
 

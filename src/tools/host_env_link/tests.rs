@@ -21,27 +21,44 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsClientMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use whisper_agent_host_proto::{
-    CallToolResult, ContentBlock, DaemonCapabilities, Frame, HostEnvSpec, HostEnvSpecKind,
-    PROTOCOL_VERSION, ProvisionPhase, SessionEndReason, ThreadContext, ToolDescriptor,
+    CallToolResult, ContentBlock, CredentialAckResult, CredentialPayload, DaemonCapabilities,
+    Frame, HostEnvSpec, HostEnvSpecKind, PROTOCOL_VERSION, ProvisionPhase, SessionEndReason,
+    ThreadContext, ToolDescriptor,
 };
+
+use crate::runtime::scheduler::SchedulerMsg;
 use whisper_agent_protocol::sandbox::{NetworkPolicy, PathAccess};
 
 use crate::pod::config::AuthDaemon;
 
 use super::auth::{DaemonAuthState, require_daemon_auth};
-use super::{LinkError, LiveDaemonRegistry, link_handler};
+use super::{HostEnvLinkState, LinkError, LiveDaemonRegistry, link_handler};
 
 /// Build the axum app the test mounts: just `/v1/host_env_link` plus
 /// the daemon-auth middleware. No webui assets, no scheduler — only
-/// the wire surface we're testing.
+/// the wire surface we're testing. Tests that don't exercise the
+/// credential-publish path get a dummy inbox whose receiver is held
+/// alive in the test scope to avoid `send` errors during the run.
 fn build_app(registry: Arc<LiveDaemonRegistry>, auth: Arc<DaemonAuthState>) -> Router {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // Detach the receiver into a task that keeps it alive for the
+    // lifetime of the test process. The tests in this file don't
+    // exercise PublishCredential so the channel stays empty.
+    tokio::spawn(async move {
+        let mut rx = rx;
+        while rx.recv().await.is_some() {}
+    });
+    let state = Arc::new(HostEnvLinkState {
+        registry,
+        scheduler_inbox: tx,
+    });
     Router::new()
         .route("/v1/host_env_link", get(link_handler))
         .route_layer(middleware::from_fn_with_state(
             auth.clone(),
             require_daemon_auth,
         ))
-        .with_state(registry)
+        .with_state(state)
 }
 
 /// Bind to 127.0.0.1:0, return the bound address + a shutdown signal
@@ -531,6 +548,164 @@ async fn surfaces_session_failed_to_consumer() {
 
     let _ = tokio::time::timeout(Duration::from_secs(2), daemon_task).await;
     let _ = shutdown.send(());
+}
+
+/// Variant of [`build_app`] that returns the scheduler-inbox receiver
+/// to the test rather than draining it silently. Tests that exercise
+/// the `Frame::PublishCredential` path use this to stand in for the
+/// scheduler and decide whether to accept or reject each publish.
+fn build_app_with_inbox(
+    registry: Arc<LiveDaemonRegistry>,
+    auth: Arc<DaemonAuthState>,
+) -> (Router, tokio::sync::mpsc::UnboundedReceiver<SchedulerMsg>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let state = Arc::new(HostEnvLinkState {
+        registry,
+        scheduler_inbox: tx,
+    });
+    let router = Router::new()
+        .route("/v1/host_env_link", get(link_handler))
+        .route_layer(middleware::from_fn_with_state(
+            auth.clone(),
+            require_daemon_auth,
+        ))
+        .with_state(state);
+    (router, rx)
+}
+
+#[tokio::test]
+async fn publish_credential_routes_to_scheduler_and_acks_accepted() {
+    // Stands in for the scheduler: pull DaemonPublishCredential off
+    // the inbox, send a successful reply, and confirm the daemon
+    // receives `CredentialAck::Accepted`.
+    let registry = Arc::new(LiveDaemonRegistry::new());
+    registry.admit_names(["alpha".to_string()]);
+    let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
+        name: "alpha".into(),
+        token: "tok-alpha".into(),
+    }]));
+    let (app, mut inbox_rx) = build_app_with_inbox(registry.clone(), auth);
+    let (addr, shutdown) = spawn_server(app).await;
+
+    // Drive the fake scheduler in parallel — accept any inbound
+    // DaemonPublishCredential for backend "openai-sub", reject others.
+    let scheduler_task = tokio::spawn(async move {
+        loop {
+            match inbox_rx.recv().await {
+                Some(SchedulerMsg::DaemonPublishCredential {
+                    daemon_name,
+                    backend,
+                    contents,
+                    reply,
+                }) => {
+                    let res = if daemon_name == "alpha" && backend == "openai-sub" {
+                        assert!(contents.contains("test-payload"));
+                        Ok(())
+                    } else {
+                        Err(format!("unexpected pairing {daemon_name}/{backend}"))
+                    };
+                    let _ = reply.send(res);
+                }
+                Some(_) | None => return,
+            }
+        }
+    });
+
+    // Daemon side.
+    let req = ws_request_with_token(addr, "tok-alpha");
+    let (mut ws, _) = connect_async(req).await.unwrap();
+    send_frame(
+        &mut ws,
+        Frame::Hello {
+            daemon_version: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: sample_capabilities(),
+        },
+    )
+    .await;
+    let _ = recv_frame(&mut ws).await; // Welcome
+
+    send_frame(
+        &mut ws,
+        Frame::PublishCredential {
+            backend: "openai-sub".into(),
+            payload: CredentialPayload::Codex {
+                contents: r#"{"tokens":{"_test_marker":"test-payload"}}"#.into(),
+            },
+        },
+    )
+    .await;
+
+    match recv_frame(&mut ws).await {
+        Frame::CredentialAck { backend, result } => {
+            assert_eq!(backend, "openai-sub");
+            assert!(matches!(result, CredentialAckResult::Accepted));
+        }
+        other => panic!("expected CredentialAck, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+    scheduler_task.abort();
+}
+
+#[tokio::test]
+async fn publish_credential_forwards_rejection_to_daemon() {
+    // Fake scheduler always rejects; daemon should see the reason
+    // verbatim. Exercises the negative ack path.
+    let registry = Arc::new(LiveDaemonRegistry::new());
+    registry.admit_names(["alpha".to_string()]);
+    let auth = Arc::new(DaemonAuthState::new(vec![AuthDaemon {
+        name: "alpha".into(),
+        token: "tok-alpha".into(),
+    }]));
+    let (app, mut inbox_rx) = build_app_with_inbox(registry.clone(), auth);
+    let (addr, shutdown) = spawn_server(app).await;
+
+    let scheduler_task = tokio::spawn(async move {
+        if let Some(SchedulerMsg::DaemonPublishCredential { reply, .. }) = inbox_rx.recv().await {
+            let _ = reply.send(Err("backend `mismatch` is managed by daemon `other`".into()));
+        }
+    });
+
+    let req = ws_request_with_token(addr, "tok-alpha");
+    let (mut ws, _) = connect_async(req).await.unwrap();
+    send_frame(
+        &mut ws,
+        Frame::Hello {
+            daemon_version: "test".into(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: sample_capabilities(),
+        },
+    )
+    .await;
+    let _ = recv_frame(&mut ws).await; // Welcome
+
+    send_frame(
+        &mut ws,
+        Frame::PublishCredential {
+            backend: "mismatch".into(),
+            payload: CredentialPayload::Codex {
+                contents: "{}".into(),
+            },
+        },
+    )
+    .await;
+
+    match recv_frame(&mut ws).await {
+        Frame::CredentialAck { backend, result } => {
+            assert_eq!(backend, "mismatch");
+            match result {
+                CredentialAckResult::Rejected { reason } => {
+                    assert!(reason.contains("managed by"), "got: {reason}");
+                }
+                CredentialAckResult::Accepted => panic!("expected Rejected"),
+            }
+        }
+        other => panic!("expected CredentialAck, got {other:?}"),
+    }
+
+    let _ = shutdown.send(());
+    scheduler_task.abort();
 }
 
 #[tokio::test]

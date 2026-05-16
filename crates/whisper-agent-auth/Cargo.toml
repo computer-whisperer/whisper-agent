@@ -9,6 +9,7 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["sync"] }
@@ -16,3 +17,13 @@ tokio = { workspace = true, features = ["sync"] }
 # wasm-only features that conflict in workspace resolution.
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64 = "0.22"
+
+[dev-dependencies]
+# CodexAuthSlot tests run async (prepare / update_from_contents) and
+# need `tokio::test` plus a tempdir for the on-disk-write paths.
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+tempfile = "3"
+# rustls 0.23 panics on the first TLS use unless a provider is set.
+# Tests that build a `reqwest::Client` install ring as the default
+# at test-fixture init time. Same dance the binaries do at startup.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

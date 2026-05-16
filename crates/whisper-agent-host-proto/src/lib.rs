@@ -39,12 +39,14 @@
 mod background;
 mod call;
 mod connection;
+mod credential;
 mod hook;
 mod session;
 
 pub use background::*;
 pub use call::*;
 pub use connection::*;
+pub use credential::*;
 pub use hook::*;
 pub use session::*;
 
@@ -197,6 +199,33 @@ pub enum Frame {
     BackgroundTaskList {
         session_id: SessionId,
         tasks: Vec<BackgroundTaskSummary>,
+    },
+
+    // ─── Credential publication ───────────────────────────────
+    /// **D→S**. Daemon publishes the current contents of a managed
+    /// credential file to the named scheduler-side backend.
+    ///
+    /// Emitted eagerly on connect (so the scheduler picks up any
+    /// drift after either side restarts) and again whenever the
+    /// daemon-side file changes — either because the daemon's own
+    /// refresh-token loop minted a new access token, or because an
+    /// external rewrite landed (e.g. the user re-ran `codex login`).
+    ///
+    /// Authorization is bilateral: the scheduler's backend config
+    /// names a `manager` daemon, the daemon's config names a
+    /// `backend`, and only matching pairs are accepted. Payload
+    /// schema is in [`CredentialPayload`].
+    PublishCredential {
+        backend: String,
+        payload: CredentialPayload,
+    },
+    /// **S→D**. Result of a [`Frame::PublishCredential`]. Exactly one
+    /// per publish; the daemon correlates by `backend` (publishes are
+    /// idempotent per-backend — the daemon does not pipeline multiple
+    /// outstanding publishes for the same backend).
+    CredentialAck {
+        backend: String,
+        result: CredentialAckResult,
     },
 
     // ─── Future extension point ──────────────────────────────
@@ -533,6 +562,35 @@ mod tests {
             session_id: sample_session_id(),
             hook_kind: HookKind::new("tool_started"),
             payload: serde_json::json!({"tool": "bash"}),
+        });
+    }
+
+    #[test]
+    fn publish_credential_round_trips() {
+        assert_round_trip(Frame::PublishCredential {
+            backend: "openai-sub".into(),
+            payload: CredentialPayload::Codex {
+                contents: r#"{"tokens":{"id_token":"x","access_token":"y","refresh_token":"z"}}"#
+                    .into(),
+            },
+        });
+    }
+
+    #[test]
+    fn credential_ack_round_trips_accepted() {
+        assert_round_trip(Frame::CredentialAck {
+            backend: "openai-sub".into(),
+            result: CredentialAckResult::Accepted,
+        });
+    }
+
+    #[test]
+    fn credential_ack_round_trips_rejected() {
+        assert_round_trip(Frame::CredentialAck {
+            backend: "openai-sub".into(),
+            result: CredentialAckResult::Rejected {
+                reason: "manager mismatch".into(),
+            },
         });
     }
 

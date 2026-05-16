@@ -131,7 +131,10 @@ pub struct AuthDaemon {
 /// MCP daemons can deserialize the same TOML shape without depending on
 /// the main crate. Re-exported here for back-compat with the many
 /// `crate::pod::config::Auth` import sites.
-pub use whisper_agent_auth::{Auth, ChatgptSubscriptionSource, CodexAuth, GoogleOauthSource};
+pub use whisper_agent_auth::{
+    Auth, ChatgptSubscriptionSource, CodexAuth, CodexAuthSlot, GoogleOauthSource,
+    default_codex_auth_path,
+};
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -227,6 +230,24 @@ impl BackendConfig {
             | BackendConfig::OpenAiResponses { auth, .. }
             | BackendConfig::Gemini { auth, .. } => Some(auth.mode_name()),
             BackendConfig::OpenAiChat { auth, .. } => auth.as_ref().map(Auth::mode_name),
+            BackendConfig::LlamaCpp { .. } => None,
+        }
+    }
+
+    /// Daemon name allowed to publish credential refreshes for this
+    /// backend, if any. Only the auth modes that support managed
+    /// rotation return `Some`. Used by the host-env link to authorize
+    /// inbound `Frame::PublishCredential` frames: the connected
+    /// daemon's name must equal this value, else the publish is
+    /// rejected without touching the backend.
+    pub fn credential_manager(&self) -> Option<&str> {
+        match self {
+            BackendConfig::Anthropic { auth, .. }
+            | BackendConfig::OpenAiResponses { auth, .. }
+            | BackendConfig::Gemini { auth, .. } => auth.credential_manager(),
+            BackendConfig::OpenAiChat { auth, .. } => {
+                auth.as_ref().and_then(Auth::credential_manager)
+            }
             BackendConfig::LlamaCpp { .. } => None,
         }
     }
@@ -394,14 +415,43 @@ fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn
                 .unwrap_or_else(|| OPENAI_API_BASE.to_string());
             Ok(Arc::new(OpenAiResponsesClient::with_api_key(url, key)))
         }
-        Auth::ChatgptSubscription { source, path } => {
+        Auth::ChatgptSubscription {
+            source,
+            path,
+            manager,
+        } => {
             let ChatgptSubscriptionSource::Codex = source;
-            let codex = CodexAuth::load(path.clone())
-                .context("load codex auth.json for openai_responses subscription auth")?;
             let url = base_url
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| CHATGPT_CODEX_BASE.to_string());
-            Ok(Arc::new(OpenAiResponsesClient::with_codex_auth(url, codex)))
+            let resolved_path = match path {
+                Some(p) => p.clone(),
+                None => default_codex_auth_path()?,
+            };
+            // `manager` flips the slot's startup behavior: with no
+            // manager the file is required at boot (legacy semantics
+            // — the operator put `codex login` output there manually);
+            // with a manager the daemon is the source of truth and a
+            // missing file is the expected pre-first-publication state.
+            let slot = if manager.is_some() {
+                match CodexAuth::load(Some(resolved_path.clone())) {
+                    Ok(codex) => Arc::new(CodexAuthSlot::loaded(codex)),
+                    Err(e) => {
+                        tracing::info!(
+                            path = %resolved_path.display(),
+                            error = %e,
+                            manager = manager.as_deref().unwrap_or(""),
+                            "codex auth file unavailable at startup — awaiting daemon publication"
+                        );
+                        Arc::new(CodexAuthSlot::empty(resolved_path))
+                    }
+                }
+            } else {
+                let codex = CodexAuth::load(Some(resolved_path))
+                    .context("load codex auth.json for openai_responses subscription auth")?;
+                Arc::new(CodexAuthSlot::loaded(codex))
+            };
+            Ok(Arc::new(OpenAiResponsesClient::with_codex_slot(url, slot)))
         }
         Auth::GoogleOauth { .. } => Err(anyhow!(
             "openai_responses: auth.mode `google_oauth` not supported"
@@ -559,6 +609,51 @@ auth = { mode = "api_key", value = "sk-test" }
         let cfg: Config = toml::from_str(text).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.auth.clients.is_empty());
+    }
+
+    #[test]
+    fn parses_chatgpt_subscription_manager_field() {
+        // Bilateral pairing: the backend's `manager` names the daemon
+        // that's allowed to push credential refreshes for it.
+        let text = r#"
+[backends.openai-sub]
+kind = "openai_responses"
+auth = { mode = "chatgpt_subscription", source = "codex", manager = "laptop-daemon" }
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let backend = cfg.backends.get("openai-sub").unwrap();
+        assert_eq!(backend.credential_manager(), Some("laptop-daemon"));
+    }
+
+    #[test]
+    fn chatgpt_subscription_without_manager_returns_none() {
+        // Legacy semantics: no manager means the local file is the
+        // sole source of truth; daemon publishes are not authorized
+        // for this backend.
+        let text = r#"
+[backends.openai-sub]
+kind = "openai_responses"
+auth = { mode = "chatgpt_subscription", source = "codex" }
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let backend = cfg.backends.get("openai-sub").unwrap();
+        assert_eq!(backend.credential_manager(), None);
+    }
+
+    #[test]
+    fn api_key_backends_never_report_a_credential_manager() {
+        // The `manager` knob is meaningful only for credential families
+        // that support managed rotation. API-key entries shouldn't even
+        // be eligible — surfacing `None` keeps the publish dispatch
+        // from accidentally matching anything.
+        let text = r#"
+[backends.anthropic]
+kind = "anthropic"
+auth = { mode = "api_key", value = "sk-test" }
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        let backend = cfg.backends.get("anthropic").unwrap();
+        assert_eq!(backend.credential_manager(), None);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use axum::{
 
 use crate::pod::config::{AuthClient, AuthDaemon};
 use crate::server::auth::AuthState;
-use crate::tools::host_env_link::{self, DaemonAuthState, LiveDaemonRegistry};
+use crate::tools::host_env_link::{self, DaemonAuthState, HostEnvLinkState, LiveDaemonRegistry};
 use futures::{SinkExt, StreamExt};
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
@@ -348,13 +348,17 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     // Daemons present `Authorization: Bearer <token>` on the WS
     // upgrade; loopback bypass is intentionally absent because the
     // daemon name is resolved from the token, so we always need it.
+    let host_env_link_state = Arc::new(HostEnvLinkState {
+        registry: live_daemon_registry.clone(),
+        scheduler_inbox: inbox_tx.clone(),
+    });
     let host_env_link_router = Router::new()
         .route("/v1/host_env_link", get(host_env_link::link_handler))
         .route_layer(middleware::from_fn_with_state(
             daemon_auth.clone(),
             host_env_link::auth::require_daemon_auth,
         ))
-        .with_state(live_daemon_registry.clone());
+        .with_state(host_env_link_state);
 
     let app = Router::new()
         .route("/ws", get(ws_handler))

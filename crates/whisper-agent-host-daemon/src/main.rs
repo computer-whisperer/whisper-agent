@@ -13,8 +13,14 @@ use clap::Parser;
 use rand::RngExt;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use whisper_agent_host_daemon::{ConnectError, catalog, connection};
+use whisper_agent_host_daemon::{ConnectError, catalog, config::DaemonConfig, connection};
 use whisper_agent_host_proto::{DaemonCapabilities, HostEnvSpecKind};
+
+/// Default location of the daemon's TOML config — matches the
+/// existing `host-daemon.env` location used by the AUR systemd unit.
+/// An absent default-path file is a soft no-op; an explicit
+/// `--config` pointing at a missing file errors out.
+const DEFAULT_CONFIG_PATH: &str = "/etc/whisper-agent/host-daemon.toml";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,6 +59,14 @@ struct Args {
     /// backoff with jitter, capped at this many seconds.
     #[arg(long, default_value_t = 60)]
     reconnect_max_secs: u64,
+
+    /// Daemon-side TOML config. Today's only knob is the list of
+    /// credential files to manage and publish (e.g. the user's
+    /// `~/.codex/auth.json`). Optional: if the default path doesn't
+    /// exist the daemon runs without publishing credentials; an
+    /// explicitly-named missing file errors out.
+    #[arg(long, env = "WHISPER_AGENT_HOST_DAEMON_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -110,18 +124,38 @@ async fn main() -> anyhow::Result<()> {
         supports_background_tasks: false,
     };
 
-    run_loop(args, token, capabilities).await
+    // Load the daemon TOML config. The default path is treated as
+    // soft-missing (an unconfigured daemon still works); an explicit
+    // `--config` against a missing file is fatal — the operator
+    // clearly meant something.
+    let (config_path, allow_missing) = match args.config.clone() {
+        Some(p) => (p, false),
+        None => (PathBuf::from(DEFAULT_CONFIG_PATH), true),
+    };
+    let daemon_config = DaemonConfig::load(&config_path, allow_missing)
+        .with_context(|| format!("load daemon config {}", config_path.display()))?;
+    if !daemon_config.publish_credential.is_empty() {
+        info!(
+            entries = daemon_config.publish_credential.len(),
+            path = %config_path.display(),
+            "credential publishers configured"
+        );
+    }
+
+    run_loop(args, token, capabilities, daemon_config).await
 }
 
 async fn run_loop(
     args: Args,
     token: String,
     capabilities: DaemonCapabilities,
+    daemon_config: DaemonConfig,
 ) -> anyhow::Result<()> {
     let mut backoff_secs = 1u64;
     info!(
         url = %args.server_url,
         tools = capabilities.tools.len(),
+        publishers = daemon_config.publish_credential.len(),
         "host-env daemon starting"
     );
     loop {
@@ -132,6 +166,7 @@ async fn run_loop(
             capabilities: capabilities.clone(),
             mcp_host_bin: args.mcp_host_bin.clone(),
             tls_connector: None,
+            publish_credentials: daemon_config.publish_credential.clone(),
         };
         match connection::run_connection(config).await {
             Ok(()) => {

@@ -16,7 +16,26 @@ path = "src/main.rs"
 whisper-agent-protocol = { workspace = true }
 whisper-agent-host-proto = { workspace = true }
 whisper-agent-worker-proto = { workspace = true }
-tokio = { workspace = true, features = ["process", "fs", "io-util", "io-std", "net", "sync"] }
+tokio = { workspace = true, features = ["process", "fs", "io-util", "io-std", "net", "sync", "time"] }
+# `notify` for watching the local OAuth credential file the daemon
+# is configured to publish. Same crate the imagegen daemon uses to
+# watch whisper-agent.toml; same parent-dir-then-filter-by-basename
+# pattern so editor `tmpfile + rename` saves don't kill the watch.
+notify = "8"
+# Read OAuth credentials and run refresh-token loops against the same
+# file format the central server uses. Pulls in `CodexAuth` + the
+# `from_contents`/`ensure_fresh` machinery so the daemon and the
+# scheduler agree on what a valid `auth.json` looks like.
+whisper-agent-auth = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+# Same chrono spec the auth crate uses — needed so the publisher can
+# bridge `CodexAuth::next_refresh_at` (chrono::DateTime) into a
+# tokio::time sleep duration.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# TOML config for the daemon itself (separate from the central
+# server's whisper-agent.toml). One `[[publish_credential]]` table
+# entry per credential file the daemon manages.
+toml = "1"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 # Direct rustls dep so `main` can call `crypto::ring::default_provider()
 # .install_default()` before any TLS work. rustls 0.23 panics on the
@@ -56,3 +75,6 @@ tempfile = "3"
 # both sides exercise the same wire types.
 tokio-tungstenite = "0.28"
 http = "1"
+# Used by the credential publisher tests to mint JWTs with a desired
+# `exp` claim. The auth crate consumes the same encoding.
+base64 = "0.22"

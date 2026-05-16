@@ -32,9 +32,8 @@ use async_stream::try_stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use whisper_agent_auth::{ClientAuth, CodexAuth};
+use whisper_agent_auth::{ClientAuth, CodexAuth, CodexAuthSlot, SlotUpdateError};
 use whisper_agent_protocol::{
     ContentBlock, Message, ProviderReplay, Role, ToolResultContent, TunableEnumVariant,
     TunableKind, TunableSpec, TunableValue, Usage,
@@ -80,7 +79,18 @@ impl OpenAiResponsesClient {
     /// `auth` plus a `chatgpt-account-id` header, against `base_url`
     /// (typically [`CHATGPT_CODEX_BASE`]).
     pub fn with_codex_auth(base_url: String, auth: CodexAuth) -> Self {
-        Self::new(base_url, ClientAuth::Codex(Arc::new(Mutex::new(auth))))
+        Self::new(
+            base_url,
+            ClientAuth::Codex(Arc::new(CodexAuthSlot::loaded(auth))),
+        )
+    }
+
+    /// Pre-built shared slot variant. Used by call sites that need
+    /// the slot to outlive the constructor (e.g. wiring the same
+    /// slot into a daemon-driven publication path *and* the provider
+    /// at startup).
+    pub fn with_codex_slot(base_url: String, slot: Arc<CodexAuthSlot>) -> Self {
+        Self::new(base_url, ClientAuth::Codex(slot))
     }
 
     fn new(base_url: String, auth: ClientAuth) -> Self {
@@ -367,29 +377,24 @@ impl ModelProvider for OpenAiResponsesClient {
 
     /// Only meaningful for `ClientAuth::Codex` — API-key clients have
     /// nothing to rotate via this path and return `NotSupported`.
-    /// For Codex: parse the pasted `auth.json` blob against the in-memory
-    /// path (so the new credential file lands exactly where the refresh
-    /// loop expects), lock the mutex briefly, and swap the inner state.
-    /// We write to disk *after* the swap so an error here doesn't leave
-    /// the on-disk file and in-memory state desynced.
+    /// Used by both the admin `UpdateCodexAuth` paste path and the
+    /// daemon-driven `PublishCredential` host-env-link path, so the
+    /// two channels can't diverge.
     fn update_codex_auth<'a>(
         &'a self,
         contents: &'a str,
     ) -> BoxFuture<'a, Result<(), UpdateAuthError>> {
         Box::pin(async move {
-            let m = match &self.auth {
+            let slot = match &self.auth {
                 ClientAuth::ApiKey(_) => return Err(UpdateAuthError::NotSupported),
-                ClientAuth::Codex(m) => m,
+                ClientAuth::Codex(s) => s,
             };
-            let mut guard = m.lock().await;
-            let path = guard.path().to_path_buf();
-            let fresh = CodexAuth::from_contents(path.clone(), contents)
-                .map_err(|e| UpdateAuthError::Invalid(format!("{e:#}")))?;
-            *guard = fresh;
-            guard
-                .persist()
-                .map_err(|e| UpdateAuthError::Io(format!("{e:#}")))?;
-            Ok(())
+            slot.update_from_contents(contents)
+                .await
+                .map_err(|e| match e {
+                    SlotUpdateError::Invalid(m) => UpdateAuthError::Invalid(m),
+                    SlotUpdateError::Io(m) => UpdateAuthError::Io(m),
+                })
         })
     }
 }

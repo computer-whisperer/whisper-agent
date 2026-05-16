@@ -38,6 +38,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// bulk data.
 const WORK_CHANNEL_BOUND: usize = 64;
 
+/// Bound on the outbound-frame channel used by the credential
+/// publisher tasks to push frames at the scheduler. One per active
+/// publisher per refresh is the steady state — token rotations are
+/// ~hourly, so the channel never approaches capacity in practice.
+const OUTBOUND_CHANNEL_BOUND: usize = 16;
+
 /// Configuration the binary hands to [`run_connection`]. Keeps the
 /// library entry point free of CLI-specific knobs.
 pub struct ConnectionConfig {
@@ -62,6 +68,11 @@ pub struct ConnectionConfig {
     /// (tokio-tungstenite's default for `wss://`). Tests pass `Some`
     /// with a self-signed-trust connector when dialing local TLS.
     pub tls_connector: Option<Connector>,
+    /// Credential files this daemon publishes to the scheduler. One
+    /// publisher task is spawned per entry after the handshake. Empty
+    /// list (the typical case) → no publishers, no behavior change
+    /// from a pre-publication-feature daemon.
+    pub publish_credentials: Vec<crate::config::PublishCredentialConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -117,7 +128,7 @@ pub async fn run_connection(config: ConnectionConfig) -> Result<(), ConnectError
     let runtime = Arc::new(Runtime {
         mcp_host_bin: config.mcp_host_bin.clone(),
     });
-    event_loop(socket, runtime).await
+    event_loop(socket, runtime, config.publish_credentials).await
 }
 
 struct Runtime {
@@ -185,9 +196,32 @@ async fn handshake(
     }
 }
 
-async fn event_loop(mut socket: WsStream, runtime: Arc<Runtime>) -> Result<(), ConnectError> {
+async fn event_loop(
+    mut socket: WsStream,
+    runtime: Arc<Runtime>,
+    publish_credentials: Vec<crate::config::PublishCredentialConfig>,
+) -> Result<(), ConnectError> {
     let (work_tx, mut work_rx) = mpsc::channel::<Work>(WORK_CHANNEL_BOUND);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_BOUND);
     let mut sessions = SessionRegistry::default();
+
+    // Spawn credential publishers (if any). Handles drop on event-
+    // loop exit, aborting their tasks at the next await point.
+    // Build a dedicated reqwest client so the publishers' refresh
+    // calls are independent of any HTTP client the worker layer
+    // might add later.
+    let _publishers = if publish_credentials.is_empty() {
+        crate::credentials::PublisherHandles::default()
+    } else {
+        crate::credentials::spawn_all(
+            &publish_credentials,
+            outbound_tx.clone(),
+            reqwest::Client::new(),
+        )
+    };
+    // Drop our own send end so `publishers` see the channel close
+    // when the event loop exits and the receiver drops below.
+    drop(outbound_tx);
 
     loop {
         tokio::select! {
@@ -233,6 +267,9 @@ async fn event_loop(mut socket: WsStream, runtime: Arc<Runtime>) -> Result<(), C
             },
             Some(work) = work_rx.recv() => {
                 handle_work(work, &mut sessions, &mut socket).await?;
+            }
+            Some(frame) = outbound_rx.recv() => {
+                send_frame(&mut socket, frame).await?;
             }
         }
     }
@@ -406,6 +443,28 @@ async fn handle_inbound(
             info!(?reason, %message, "scheduler sent goodbye");
             Ok(ControlFlow::Stop(reason))
         }
+        Frame::CredentialAck { backend, result } => {
+            use whisper_agent_host_proto::CredentialAckResult;
+            match result {
+                CredentialAckResult::Accepted => {
+                    info!(backend, "credential publish accepted by scheduler");
+                }
+                CredentialAckResult::Rejected { reason } => {
+                    // Surface loudly: a rejection means the bilateral
+                    // pairing is misconfigured (wrong backend name,
+                    // wrong manager on the scheduler) or the payload
+                    // doesn't parse. The publisher will republish on
+                    // its next change/refresh; if the misconfiguration
+                    // persists, the rejections will too.
+                    warn!(
+                        backend,
+                        reason,
+                        "credential publish rejected by scheduler — check backend/manager pairing"
+                    );
+                }
+            }
+            Ok(ControlFlow::Continue)
+        }
         // Frames the scheduler should never send to the daemon.
         Frame::Hello { .. }
         | Frame::Welcome { .. }
@@ -416,7 +475,8 @@ async fn handle_inbound(
         | Frame::ToolFinal { .. }
         | Frame::BackgroundTaskUpdate { .. }
         | Frame::BackgroundTaskList { .. }
-        | Frame::HookEvent { .. } => {
+        | Frame::HookEvent { .. }
+        | Frame::PublishCredential { .. } => {
             warn!(
                 kind = frame_kind(&frame),
                 "unexpected daemon-bound frame from scheduler — ignoring"
@@ -647,6 +707,8 @@ fn frame_kind(f: &Frame) -> &'static str {
         Frame::ListBackgroundTasks { .. } => "ListBackgroundTasks",
         Frame::BackgroundTaskList { .. } => "BackgroundTaskList",
         Frame::HookEvent { .. } => "HookEvent",
+        Frame::PublishCredential { .. } => "PublishCredential",
+        Frame::CredentialAck { .. } => "CredentialAck",
     }
 }
 

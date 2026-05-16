@@ -473,6 +473,21 @@ pub enum SchedulerMsg {
         code: Option<String>,
         error: Option<String>,
     },
+    /// Host-env daemon published a fresh credential blob for a
+    /// backend it manages. The connection task on the v2 host-env
+    /// link forwards `Frame::PublishCredential` here so the
+    /// scheduler can authorize (the backend's
+    /// `auth.manager` must equal `daemon_name`) and dispatch the
+    /// same `provider.update_codex_auth` path the admin paste
+    /// rotation uses. Reply is one-shot — the host-env connection
+    /// task uses it to send the matching `Frame::CredentialAck`
+    /// back to the daemon.
+    DaemonPublishCredential {
+        daemon_name: String,
+        backend: String,
+        contents: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Per-fire validation result surfaced back to whatever transport
@@ -1632,6 +1647,52 @@ impl Scheduler {
 
     /// Called from the inbox when the `/oauth/callback` route hands
     /// us a redirect. Looks up the pending flow by `state`; on miss,
+    /// Process a `Frame::PublishCredential` forwarded from the v2
+    /// host-env link's connection task. Validates the bilateral
+    /// pairing: the named backend must exist *and* its declared
+    /// `auth.manager` must equal the connected daemon's name.
+    /// On a match, delegates to the backend provider's
+    /// `update_codex_auth` (same path the admin paste rotation
+    /// uses), so persistence + in-memory swap go through one code
+    /// path with one set of invariants. The result is forwarded via
+    /// the one-shot `reply` so the connection task can ship the
+    /// matching `Frame::CredentialAck` back to the daemon.
+    fn apply_daemon_publish_credential(
+        &self,
+        daemon_name: String,
+        backend: String,
+        contents: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) {
+        let Some(entry) = self.backends.get(&backend) else {
+            let _ = reply.send(Err(format!("no such backend `{backend}`")));
+            return;
+        };
+        let manager = entry.source.credential_manager();
+        let Some(expected) = manager else {
+            let _ = reply.send(Err(format!(
+                "backend `{backend}` does not declare a credential manager — \
+                 daemon publishes are not authorized for this backend"
+            )));
+            return;
+        };
+        if expected != daemon_name {
+            let _ = reply.send(Err(format!(
+                "backend `{backend}` is managed by daemon `{expected}`, \
+                 not the connected daemon `{daemon_name}`"
+            )));
+            return;
+        }
+        let provider = entry.provider.clone();
+        tokio::spawn(async move {
+            let res = provider
+                .update_codex_auth(&contents)
+                .await
+                .map_err(|e| format!("{e}"));
+            let _ = reply.send(res);
+        });
+    }
+
     /// logs + drops (the callback page was already served). On hit,
     /// dispatches the token-exchange future. `error` is populated
     /// when the AS reported e.g. `access_denied`.
@@ -3018,6 +3079,14 @@ impl Scheduler {
             }
             SchedulerMsg::OauthCallback { state, code, error } => {
                 self.apply_oauth_callback(state, code, error, pending_io);
+            }
+            SchedulerMsg::DaemonPublishCredential {
+                daemon_name,
+                backend,
+                contents,
+                reply,
+            } => {
+                self.apply_daemon_publish_credential(daemon_name, backend, contents, reply);
             }
         }
     }
