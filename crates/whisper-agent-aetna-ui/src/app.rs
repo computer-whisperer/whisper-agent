@@ -7225,13 +7225,19 @@ const PICKER_HOST_ENVS_RUNAS_PREFIX: &str = "picker:host-envs:runas:";
 /// `default_runas` server-side.
 const PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX: &str = "picker:host-envs:runas-default:";
 /// Routed-key prefix for per-binding configurable controls. Full key
-/// shape is `picker:host-envs:option:<entry-name>:<option-key>` — the
+/// shape is `picker:host-envs:cfg:<entry-name>:<option-key>` — the
 /// suffix encodes both the picker entry and the daemon-advertised
 /// configurable so dispatch can locate the matching draft slot.
-const PICKER_HOST_ENVS_OPTION_PREFIX: &str = "picker:host-envs:option:";
+///
+/// Avoid `picker:host-envs:option:…` here: that namespace is reserved by
+/// `aetna_core::widgets::select::classify_event`, which would otherwise
+/// route every toggle inside the option control into
+/// `handle_host_envs_pick` and spawn phantom host-env entries named
+/// after the picked enum value.
+const PICKER_HOST_ENVS_OPTION_PREFIX: &str = "picker:host-envs:cfg:";
 /// Routed-key prefix for the "Default" reset button next to a per-binding
 /// configurable control. Suffix mirrors `PICKER_HOST_ENVS_OPTION_PREFIX`.
-const PICKER_HOST_ENVS_OPTION_DEFAULT_PREFIX: &str = "picker:host-envs:option-default:";
+const PICKER_HOST_ENVS_OPTION_DEFAULT_PREFIX: &str = "picker:host-envs:cfg-default:";
 const PICKER_MCP_HOSTS: &str = "picker:mcp-hosts";
 const PICKER_MCP_HOSTS_MODE: &str = "picker:mcp-hosts:mode";
 const PICKER_MCP_HOSTS_REMOVE_PREFIX: &str = "picker:mcp-hosts:remove:";
