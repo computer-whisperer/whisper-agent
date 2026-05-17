@@ -333,4 +333,58 @@ mod tests {
         // emoji collapses to a single underscore.
         assert_eq!(sanitize("emo-ji-🦀"), "emo-ji-_");
     }
+
+    /// End-to-end regression test mirroring the failure shape we hit
+    /// on `task-18b03cdfe997bd9b`: chatgpt.com/codex returned
+    /// `response.failed` with the useful detail nested under
+    /// `response.error`, and we logged only `failed: response.failed`.
+    /// The new pipeline must surface code/kind/response_id and produce
+    /// a forensic dump containing both the request and the response.
+    #[tokio::test]
+    async fn end_to_end_chatgpt_codex_response_failed_produces_useful_dump() {
+        use crate::providers::openai_responses::extract_completed_response_for_testing;
+        let stream = "event: response.failed\n\
+                      data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_abc123\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"type\":\"server_error\",\"message\":\"Sorry, something went wrong\"}}}\n\n";
+        let ctx = ForensicContext {
+            backend: "openai_responses".into(),
+            model: "gpt-5.5".into(),
+            request_body: r#"{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}]}"#.into(),
+            request_content_type: "application/json",
+        };
+        let err = extract_completed_response_for_testing(stream, Some(&ctx)).unwrap_err();
+
+        // Detail parsed correctly — code, kind, response_id, message all
+        // present on the resulting error.
+        let detail = err.provider_detail().cloned().expect("detail attached");
+        assert_eq!(detail.code.as_deref(), Some("server_error"));
+        assert_eq!(detail.response_id.as_deref(), Some("resp_abc123"));
+
+        // Dump-to-disk round-trips: an operator reading the file gets
+        // back everything they need to reproduce the failure against
+        // the provider — full request body, response excerpt, structured
+        // detail block.
+        let dir = tempfile::tempdir().unwrap();
+        let sink = ForensicSink::new(dir.path().to_path_buf());
+        sink.record_terminal_failure("task-18b03cdfe997bd9b", "openai-subscription", 469, &err)
+            .await;
+        let mut entries = tokio::fs::read_dir(dir.path()).await.unwrap();
+        let entry = entries.next_entry().await.unwrap().expect("dump exists");
+        let body = tokio::fs::read_to_string(entry.path()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["detail"]["code"], "server_error");
+        assert_eq!(v["error"]["detail"]["response_id"], "resp_abc123");
+        assert!(
+            v["request_body"]
+                .as_str()
+                .unwrap()
+                .contains(r#""model":"gpt-5.5""#),
+            "request body should preserve exact wire shape"
+        );
+        assert!(
+            v["response_excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("Sorry, something went wrong")
+        );
+    }
 }

@@ -879,6 +879,19 @@ fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
 /// having accumulated the items already). We merge both: completed-event
 /// metadata + accumulated items as the output.
 ///
+/// Cross-module test hook: surface the parser to `runtime::forensics`
+/// so it can drive an end-to-end test (response.failed body →
+/// ModelError → ForensicSink dump). The Ok variant is dropped because
+/// the test only cares about the error path; staying behind `cfg(test)`
+/// keeps the success type private.
+#[cfg(test)]
+pub fn extract_completed_response_for_testing(
+    body: &str,
+    forensic: Option<&ForensicContext>,
+) -> Result<(), ModelError> {
+    extract_completed_response(body, forensic).map(|_| ())
+}
+
 /// `response.failed` short-circuits to [`ModelError::Api`] so terminal
 /// server-side errors surface cleanly to the caller. When `forensic`
 /// is `Some`, the assembled body bytes ride along on the error for the
