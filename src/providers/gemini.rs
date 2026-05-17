@@ -1777,6 +1777,7 @@ mod tests {
             messages,
             cache_breakpoints: &[],
             tunables: &EMPTY_TUNABLES,
+            request_cache_key: None,
         }
     }
 

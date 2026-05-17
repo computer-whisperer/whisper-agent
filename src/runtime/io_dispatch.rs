@@ -602,6 +602,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             messages: &owned_req.messages,
             cache_breakpoints: &owned_req.cache_breakpoints,
             tunables: &owned_req.tunables,
+            request_cache_key: Some(owned_req.request_cache_key.as_str()),
         };
         let result = match stream_with_retry(
             provider.as_ref(),
@@ -1270,6 +1271,10 @@ struct OwnedModelRequest {
     messages: Vec<whisper_agent_protocol::Message>,
     cache_breakpoints: Vec<CacheBreakpoint>,
     tunables: BTreeMap<String, TunableValue>,
+    /// Per-thread routing-affinity key — surfaced to providers as
+    /// [`ModelRequest::request_cache_key`]. Sourced from `thread_id`
+    /// so every request for the same thread shares it.
+    request_cache_key: String,
 }
 
 fn build_model_request(
@@ -1309,6 +1314,7 @@ fn build_model_request(
     let max_tokens = task.config.max_tokens;
     let cache_breakpoints = default_cache_policy(&messages);
     let tunables = task.config.tunables.clone();
+    let request_cache_key = thread_id.to_string();
     (
         OwnedModelRequest {
             model: model.clone(),
@@ -1318,6 +1324,7 @@ fn build_model_request(
             messages,
             cache_breakpoints,
             tunables,
+            request_cache_key,
         },
         model,
         backend_name,

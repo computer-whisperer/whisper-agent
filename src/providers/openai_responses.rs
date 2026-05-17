@@ -155,6 +155,7 @@ impl OpenAiResponsesClient {
             // always stream and reassemble so both routes share one code path.
             stream: true,
             service_tier: pick_service_tier(req.tunables),
+            prompt_cache_key: req.request_cache_key,
         };
         // req.max_tokens is ignored: the ChatGPT-subscription route rejects
         // `max_output_tokens` outright, and Codex's own client doesn't send it
@@ -1568,6 +1569,14 @@ struct RspRequest<'a> {
     /// advertised in `/models`.
     #[serde(skip_serializing_if = "Option::is_none")]
     service_tier: Option<&'a str>,
+    /// Stable per-thread routing-affinity hint. Combined with the prefix
+    /// hash on the server side so successive requests for the same
+    /// thread land on the same cache shard. Without it the load
+    /// balancer routes by prefix-hash alone and adjacent same-prefix
+    /// requests inside one tool loop can be shuffled across cache-cold
+    /// nodes, blowing the prompt cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 /// Wire value for [`RspRequest::include`]. Constant because we always want the
@@ -2474,6 +2483,7 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             store: false,
             stream: true,
             service_tier: None,
+            prompt_cache_key: None,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("service_tier").is_none(), "absent when None: {v}");
@@ -2484,6 +2494,36 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["service_tier"], serde_json::json!("priority"));
+    }
+
+    #[test]
+    fn request_body_prompt_cache_key_serializes_only_when_present() {
+        // Mirrors the service_tier story: absent on the wire when None
+        // so non-routing callers stay byte-stable against pre-field
+        // request bodies. Present as a plain string when set.
+        let body = RspRequest {
+            model: "gpt-5",
+            instructions: None,
+            input: Vec::new(),
+            tools: None,
+            include: REQUEST_INCLUDES,
+            store: false,
+            stream: true,
+            service_tier: None,
+            prompt_cache_key: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("prompt_cache_key").is_none(), "absent when None: {v}");
+
+        let body = RspRequest {
+            prompt_cache_key: Some("task-18b03f4cbd87ae97"),
+            ..body
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v["prompt_cache_key"],
+            serde_json::json!("task-18b03f4cbd87ae97")
+        );
     }
 
     #[test]
@@ -2544,6 +2584,7 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             store: false,
             stream: true,
             service_tier: None,
+            prompt_cache_key: None,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(

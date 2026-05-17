@@ -51,6 +51,13 @@ pub struct ModelRequest<'a> {
     /// advertises nothing, or because the user accepted every
     /// advertised default and the UI sent nothing back).
     pub tunables: &'a BTreeMap<String, TunableValue>,
+    /// Stable per-thread routing key. Forwarded as OpenAI's
+    /// `prompt_cache_key` body field so successive requests for the
+    /// same thread land on the same cache shard — without it the
+    /// load balancer routes by prefix-hash alone and can shuffle
+    /// adjacent same-prefix calls across cache-cold nodes. Providers
+    /// without a routing-key concept ignore this field.
+    pub request_cache_key: Option<&'a str>,
 }
 
 /// Logical positions at which a cache checkpoint can be attached. Translated into
