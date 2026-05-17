@@ -605,6 +605,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             request_cache_key: Some(owned_req.request_cache_key.as_str()),
             session_id: Some(owned_req.session_id.as_str()),
             installation_id: Some(owned_req.installation_id.as_str()),
+            turn_routing_token: Some(&owned_req.turn_routing_token),
         };
         let result = match stream_with_retry(
             provider.as_ref(),
@@ -1286,6 +1287,12 @@ struct OwnedModelRequest {
     /// Surfaced to providers as [`ModelRequest::installation_id`].
     /// Cloned from the scheduler's load-or-create startup value.
     installation_id: String,
+    /// Shared per-turn sticky-routing slot — surfaced to providers as
+    /// [`ModelRequest::turn_routing_token`]. Cloned-Arc from the
+    /// `Thread`'s slot, so subsequent calls within the same tool loop
+    /// observe the same `OnceLock` and the OpenAI Codex adapter can
+    /// capture+replay the `x-codex-turn-state` header.
+    turn_routing_token: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 fn build_model_request(
@@ -1328,6 +1335,7 @@ fn build_model_request(
     let request_cache_key = thread_id.to_string();
     let session_id = scheduler.session_id().to_string();
     let installation_id = scheduler.installation_id().to_string();
+    let turn_routing_token = std::sync::Arc::clone(&task.turn_routing_token);
     (
         OwnedModelRequest {
             model: model.clone(),
@@ -1340,6 +1348,7 @@ fn build_model_request(
             request_cache_key,
             session_id,
             installation_id,
+            turn_routing_token,
         },
         model,
         backend_name,

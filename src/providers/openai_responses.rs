@@ -78,6 +78,15 @@ const CODEX_CLIENT_VERSION: &str = "99.0.0";
 /// official client are the same as for [`CODEX_CLIENT_VERSION`].
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
+/// Sticky-routing token header. The chatgpt.com codex backend issues a
+/// value on the first /responses response of a "turn" via this response
+/// header; the client must echo it back on every subsequent /responses
+/// request within the same turn so the load balancer keeps routing them
+/// to the same cache shard. Without this echo, adjacent same-prefix
+/// calls inside a tool loop can be shuffled across cache-cold nodes
+/// and the prompt cache misses.
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+
 pub struct OpenAiResponsesClient {
     http: reqwest::Client,
     base_url: String,
@@ -217,6 +226,16 @@ impl OpenAiResponsesClient {
                 builder = builder.header("x-codex-installation-id", install);
             }
             builder = builder.header("originator", CODEX_ORIGINATOR);
+            // Replay the sticky-routing token if a prior call this turn
+            // captured one. The first call of a turn finds the slot
+            // empty and goes without the header; the server's response
+            // populates the slot for follow-up calls (see the matching
+            // `OnceLock::set` in `do_create_message_streaming`).
+            if let Some(slot) = req.turn_routing_token
+                && let Some(token) = slot.get()
+            {
+                builder = builder.header(X_CODEX_TURN_STATE_HEADER, token.as_str());
+            }
         }
         let send = builder.send();
         let resp = tokio::select! {
@@ -282,6 +301,22 @@ impl OpenAiResponsesClient {
                 crate::providers::codex_usage::parse_codex_headers(resp.headers())
             {
                 yield ModelEvent::ProviderUsage { snapshot };
+            }
+            // Capture the sticky-routing token. The first /responses
+            // call of a turn finds the slot empty and goes without
+            // the request header; the server's response carries the
+            // token here. `OnceLock::set` is no-op after the first
+            // success, so subsequent calls within the turn don't
+            // overwrite — the contract is "echo back the value
+            // captured at turn start." Codex-route only (api.openai.com
+            // doesn't issue this header).
+            if let Some(slot) = req.turn_routing_token
+                && let Some(header_value) = resp
+                    .headers()
+                    .get(X_CODEX_TURN_STATE_HEADER)
+                    .and_then(|v| v.to_str().ok())
+            {
+                let _ = slot.set(header_value.to_string());
             }
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();

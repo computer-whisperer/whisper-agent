@@ -71,6 +71,16 @@ pub struct ModelRequest<'a> {
     /// across server restarts. Ignored by routes that don't recognize
     /// codex-namespaced headers.
     pub installation_id: Option<&'a str>,
+    /// Per-turn sticky-routing slot. Lifecycle: minted fresh when a
+    /// new user message kicks off the next turn; shared across every
+    /// model call that follows within that turn (the tool loop). The
+    /// OpenAI Codex adapter reads `OnceLock::get()` to decide whether
+    /// to send the `x-codex-turn-state` request header on this call,
+    /// and `OnceLock::set()`s the value captured from the response
+    /// header so subsequent calls within the turn replay it. Empty
+    /// (no value) is the normal first-call-of-turn state. Providers
+    /// without a sticky-routing notion ignore this field.
+    pub turn_routing_token: Option<&'a std::sync::Arc<std::sync::OnceLock<String>>>,
 }
 
 /// Logical positions at which a cache checkpoint can be attached. Translated into

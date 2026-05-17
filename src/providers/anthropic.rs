@@ -1215,6 +1215,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1243,6 +1244,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1272,6 +1274,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1306,6 +1309,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1333,6 +1337,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1365,6 +1370,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();

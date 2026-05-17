@@ -1780,6 +1780,7 @@ mod tests {
             request_cache_key: None,
             session_id: None,
             installation_id: None,
+            turn_routing_token: None,
         }
     }
 

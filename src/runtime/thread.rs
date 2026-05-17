@@ -181,6 +181,19 @@ pub struct Thread {
     #[serde(default)]
     pub draft: String,
     pub internal: ThreadInternalState,
+    /// Shared per-turn sticky-routing slot, lifecycle-scoped to one
+    /// user-message cycle (the tool loop kicked off by a single user
+    /// input). Reset to an empty `OnceLock` inside
+    /// [`Self::submit_user_message`]. The OpenAI Codex adapter reads
+    /// the value (if any) and forwards it as the
+    /// `x-codex-turn-state` request header; when the server's first
+    /// response of the turn carries that header back it stores it
+    /// here, and every later call within the turn replays it so the
+    /// chatgpt.com backend keeps routing them to the same cache
+    /// shard. Transient — recovering across restarts requires a
+    /// fresh turn anyway.
+    #[serde(default, skip)]
+    pub turn_routing_token: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -354,6 +367,7 @@ impl Thread {
             dispatch_depth: 0,
             draft: String::new(),
             internal: ThreadInternalState::Idle,
+            turn_routing_token: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -466,6 +480,7 @@ impl Thread {
             // carry over.
             draft: String::new(),
             internal: ThreadInternalState::Idle,
+            turn_routing_token: std::sync::Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -564,6 +579,12 @@ impl Thread {
         };
         self.conversation.push(msg);
         self.turns_in_cycle = 0;
+        // Fresh per-turn sticky-routing slot. A new user message marks
+        // the boundary between turns in codex's vocabulary — replaying
+        // a prior turn's `x-codex-turn-state` into the next turn would
+        // violate the client/server contract per the codex CLI's own
+        // comment (see codex-rs/core/src/client.rs:227).
+        self.turn_routing_token = std::sync::Arc::new(std::sync::OnceLock::new());
         self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
         } else {
@@ -1876,6 +1897,51 @@ mod tests {
             }
             other => panic!("expected Blocks, got {other:?}"),
         }
+    }
+
+    fn empty_thread() -> Thread {
+        Thread::new(
+            "t".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        )
+    }
+
+    #[test]
+    fn submit_user_message_resets_turn_routing_token() {
+        // The codex contract is: each "turn" (one user input + the
+        // assistant's tool-loop reply) gets a fresh sticky-routing
+        // slot. Replaying a prior turn's token into the next turn
+        // violates client/server expectations and can cause routing
+        // bugs (see codex-rs/core/src/client.rs:227). The boundary
+        // signal is `submit_user_message` — that's where we mint a
+        // fresh `OnceLock` regardless of whether the previous slot
+        // was populated.
+        let mut task = empty_thread();
+        // Simulate the prior turn having captured a token.
+        task.turn_routing_token
+            .set("prior-turn-token".to_string())
+            .expect("slot starts empty");
+        assert_eq!(
+            task.turn_routing_token.get().map(String::as_str),
+            Some("prior-turn-token")
+        );
+        let prior_arc = std::sync::Arc::clone(&task.turn_routing_token);
+
+        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
+
+        // New slot, not the same Arc, and empty.
+        assert!(
+            !std::sync::Arc::ptr_eq(&prior_arc, &task.turn_routing_token),
+            "submit_user_message should swap in a fresh Arc, not mutate the existing one"
+        );
+        assert!(
+            task.turn_routing_token.get().is_none(),
+            "new turn must start with an empty routing slot"
+        );
     }
 
     #[test]
