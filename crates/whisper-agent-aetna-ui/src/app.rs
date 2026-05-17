@@ -4237,11 +4237,18 @@ impl ChatApp {
                     }) = view.items.iter_mut().rev().find(|it| {
                         matches!(it, DisplayItem::ToolCall { tool_use_id: id, .. } if id == &tool_use_id)
                     }) {
-                        // The integrated result is authoritative; drop
-                        // the streaming buffer once End lands.
-                        streaming_output.clear();
+                        // `ThreadToolCallEnd.result_preview` is intentionally
+                        // small for collapsed headers. If the tool streamed
+                        // text content while it ran, keep that accumulated
+                        // full output as the expanded result body instead of
+                        // replacing it with the clipped preview at completion.
+                        let full_or_preview = if streaming_output.trim().is_empty() {
+                            result_preview
+                        } else {
+                            std::mem::take(streaming_output)
+                        };
                         *result = Some(FusedToolResult {
-                            text: result_preview,
+                            text: full_or_preview,
                             is_error,
                         });
                     } else {
@@ -22172,16 +22179,44 @@ fn selectable_caption(key: impl Into<String>, value: impl Into<String>) -> El {
 }
 
 fn selectable_code_block(key: impl Into<String>, value: &str) -> El {
-    let body = text(value.to_string())
+    // Temporary UI-side guardrail for aetna's soft-wrap height bug:
+    // very long monospace lines can visually wrap while the surrounding
+    // box keeps the pre-wrap height, making the text bleed out of the
+    // args/result surface. Insert hard line breaks before layout so the
+    // normal explicit-newline path measures the same lines it paints.
+    let display = hard_wrap_code_lines(value, 100);
+    let body = text(display.clone())
         .key(key.into())
         .selectable()
-        .selection_source(SelectionSource::identity(value.to_string()))
+        .selection_source(SelectionSource::identity(display))
         .mono()
         .font_size(tokens::TEXT_SM.size)
-        .nowrap_text()
-        .width(Size::Hug)
+        .wrap_text()
+        .width(Size::Fill(1.0))
         .height(Size::Hug);
     code_block_chrome(body)
+}
+
+fn hard_wrap_code_lines(value: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    for (line_idx, line) in value.split('\n').enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        let mut col = 0usize;
+        for ch in line.chars() {
+            if col >= max_cols {
+                out.push('\n');
+                col = 0;
+            }
+            out.push(ch);
+            col += if ch == '\t' { 4 } else { 1 };
+        }
+    }
+    out
 }
 
 fn prefix_selectable_keys(mut el: El, prefix: &str) -> El {
@@ -22473,10 +22508,10 @@ fn first_text(blocks: &[ContentBlock]) -> Option<String> {
 fn tool_result_text_summary(content: &whisper_agent_protocol::ToolResultContent) -> String {
     use whisper_agent_protocol::ToolResultContent;
     match content {
-        ToolResultContent::Text(text) => preview(text, 200),
+        ToolResultContent::Text(text) => text.clone(),
         ToolResultContent::Blocks(blocks) => {
             let text = blocks.iter().find_map(|b| match b {
-                ContentBlock::Text { text } => Some(preview(text, 200)),
+                ContentBlock::Text { text } => Some(text.clone()),
                 _ => None,
             });
             let image_count = blocks
@@ -22504,14 +22539,4 @@ fn tool_result_image_items(
             state: decode_image_source(source),
         })
         .collect()
-}
-
-fn preview(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
-        s.to_string()
-    } else {
-        let head: String = chars.iter().take(max_chars).collect();
-        format!("{head}…")
-    }
 }
