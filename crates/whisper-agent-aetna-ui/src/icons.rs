@@ -91,6 +91,12 @@ pub static ICON_REFRESH_CW: LazyLock<SvgIcon> = LazyLock::new(|| {
     SvgIcon::parse_current_color(LUCIDE_REFRESH_CW).expect("lucide refresh-cw svg parses")
 });
 
+/// Outward diagonal arrows — opens a section's body in the focused
+/// text-lightbox modal. Lucide's `maximize-2` shape.
+pub static ICON_MAXIMIZE_2: LazyLock<SvgIcon> = LazyLock::new(|| {
+    SvgIcon::parse_current_color(LUCIDE_MAXIMIZE_2).expect("lucide maximize-2 svg parses")
+});
+
 const LUCIDE_ZAP: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>"##;
 
 const LUCIDE_PLAY: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>"##;
@@ -118,3 +124,5 @@ const LUCIDE_DATABASE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBo
 const LUCIDE_GAUGE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>"##;
 
 const LUCIDE_REFRESH_CW: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>"##;
+
+const LUCIDE_MAXIMIZE_2: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" x2="14" y1="3" y2="10"/><line x1="3" x2="10" y1="21" y2="14"/></svg>"##;

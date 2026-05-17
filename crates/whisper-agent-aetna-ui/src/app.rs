@@ -597,6 +597,26 @@ struct LightboxState {
     status: Option<String>,
 }
 
+/// State backing the focused text-lightbox modal. Opened by clicking
+/// the "expand" affordance next to a tool-call args / output / result
+/// section so the user can see the full body without scrolling the
+/// chat. Text is cloned out of the originating row at open time —
+/// further streaming updates the row but not the modal snapshot,
+/// matching how the image lightbox behaves.
+#[derive(Clone)]
+struct TextLightboxState {
+    /// Human-readable title shown in the dialog header — typically
+    /// `"<tool_name> · <kind>"` (e.g. `"bash · output"`).
+    title: String,
+    text: String,
+    /// `true` ⇒ the originating section was a tool error, painted
+    /// destructively in the header so users distinguish failed calls.
+    is_error: bool,
+    /// Transient status line under the body — populated by Copy /
+    /// (future) Download actions, cleared on the next open.
+    status: Option<String>,
+}
+
 /// Generic text-editor modal over one pod file. Opened by clicking
 /// a non-specialized file path in the file tree (pod.toml / behavior
 /// configs / behavior prompts / `.json` paths route to their own
@@ -1492,6 +1512,14 @@ pub struct ChatApp {
     /// `aetna_core::Image` is shared with the inline row so we don't
     /// re-decode the bytes when the modal opens.
     lightbox: Option<LightboxState>,
+
+    // ----- modal: text lightbox -----
+    /// Snapshot of one tool-call text section (args / output / result)
+    /// shown in a focused modal so users can read the full body without
+    /// scrolling the chat. `Some` while the modal is open. Text is
+    /// captured at open time — live streaming updates the row, not the
+    /// modal snapshot, matching how the image lightbox behaves.
+    text_lightbox: Option<TextLightboxState>,
 
     // ----- thread inspector -----
     /// Thread id whose inspector panel is currently expanded. `Some`
@@ -2867,6 +2895,7 @@ impl ChatApp {
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             sidebar_drag: ResizeDrag::default(),
             lightbox: None,
+            text_lightbox: None,
             inspector_open: None,
             buckets_modal: None,
             settings_modal: None,
@@ -4761,6 +4790,29 @@ impl App for ChatApp {
             self.lightbox = None;
             return;
         }
+        // Text-lightbox expand affordance → open the focused modal.
+        // Suffix is `{idx}:{kind}` where `kind` is `args`/`output`/
+        // `result`; `open_text_lightbox` walks back to the matching
+        // DisplayItem to lift the right body.
+        if let Some(key) = event.route()
+            && let Some(suffix) = key.strip_prefix(CHAT_TEXT_LIGHTBOX_PREFIX)
+            && matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some((idx_str, kind)) = suffix.split_once(':')
+            && let Ok(idx) = idx_str.parse::<usize>()
+        {
+            self.open_text_lightbox(idx, kind);
+            return;
+        }
+        if event.is_click_or_activate(TEXT_LIGHTBOX_MODAL_COPY_KEY) {
+            self.copy_text_lightbox();
+            return;
+        }
+        if event.is_click_or_activate(TEXT_LIGHTBOX_MODAL_DISMISS_KEY)
+            || event.is_click_or_activate(TEXT_LIGHTBOX_MODAL_CLOSE_KEY)
+        {
+            self.text_lightbox = None;
+            return;
+        }
         // JSON viewer dismiss / close — same shape as the lightbox.
         // Clearing the slot is the close; the per-node accordion
         // open set is dropped alongside so a re-open lands with the
@@ -6148,6 +6200,22 @@ const LIGHTBOX_MODAL_DISMISS_KEY: &str = "lightbox:dismiss";
 const LIGHTBOX_MODAL_CLOSE_KEY: &str = "lightbox:close";
 const LIGHTBOX_MODAL_COPY_KEY: &str = "lightbox:copy";
 const LIGHTBOX_MODAL_DOWNLOAD_KEY: &str = "lightbox:download";
+
+/// Routed key for the per-section "expand" icon next to a tool-call
+/// args / output / result block. Suffix is `{idx}:{kind}` where `kind`
+/// is one of `args`, `output`, `result` — the click handler walks back
+/// to the matching `DisplayItem::ToolCall` to lift the right body.
+const CHAT_TEXT_LIGHTBOX_PREFIX: &str = "chat:text-lightbox:";
+
+fn chat_text_lightbox_key(idx: usize, kind: &str) -> String {
+    format!("{CHAT_TEXT_LIGHTBOX_PREFIX}{idx}:{kind}")
+}
+
+/// Routed-key shapes for the text lightbox modal. Same scrim /
+/// close / copy contract as the image lightbox.
+const TEXT_LIGHTBOX_MODAL_DISMISS_KEY: &str = "text-lightbox:dismiss";
+const TEXT_LIGHTBOX_MODAL_CLOSE_KEY: &str = "text-lightbox:close";
+const TEXT_LIGHTBOX_MODAL_COPY_KEY: &str = "text-lightbox:copy";
 
 /// Routed-key shapes for the JSON tree viewer modal. The accordion
 /// group key is shared across every collapsible node — the per-node
@@ -11540,6 +11608,9 @@ impl ChatApp {
         // clicking an image in the chat log is a deliberate "show me
         // this big," and a stray modal underneath shouldn't clip it.
         if let Some(modal_el) = self.render_lightbox_modal() {
+            out.push(Some(modal_el));
+        }
+        if let Some(modal_el) = self.render_text_lightbox_modal() {
             out.push(Some(modal_el));
         }
         out
@@ -17359,6 +17430,127 @@ impl ChatApp {
         }
     }
 
+    /// Lift the matching body out of the active thread's
+    /// `view.items[idx]` (must be a `DisplayItem::ToolCall`) into
+    /// `self.text_lightbox`. `kind` is the routing tag
+    /// (`args` / `output` / `result`); unrecognized tags or
+    /// missing bodies are a no-op.
+    fn open_text_lightbox(&mut self, idx: usize, kind: &str) {
+        let Some(thread_id) = self.selected.as_deref() else {
+            return;
+        };
+        let Some(view) = self.views.get(thread_id) else {
+            return;
+        };
+        let Some(item) = view.items.get(idx) else {
+            return;
+        };
+        let DisplayItem::ToolCall {
+            name,
+            args_pretty,
+            streaming_output,
+            result,
+            ..
+        } = item
+        else {
+            return;
+        };
+        let (body, is_error) = match kind {
+            "args" => (args_pretty.clone().unwrap_or_default(), false),
+            "output" => (streaming_output.clone(), false),
+            "result" => match result {
+                Some(r) => (r.text.clone(), r.is_error),
+                None => return,
+            },
+            _ => return,
+        };
+        if body.is_empty() {
+            return;
+        }
+        self.text_lightbox = Some(TextLightboxState {
+            title: format!("{name} · {kind}"),
+            text: body,
+            is_error,
+            status: None,
+        });
+    }
+
+    fn set_text_lightbox_status(&mut self, status: impl Into<String>) {
+        if let Some(lb) = self.text_lightbox.as_mut() {
+            lb.status = Some(status.into());
+        }
+    }
+
+    fn copy_text_lightbox(&mut self) {
+        let Some(lb) = self.text_lightbox.as_ref() else {
+            return;
+        };
+        match copy_text_to_clipboard(&lb.text) {
+            Ok(()) => self.set_text_lightbox_status("copy requested"),
+            Err(err) => self.set_text_lightbox_status(format!("copy failed: {err}")),
+        }
+    }
+
+    /// Focused text-lightbox modal — opened from any tool-call
+    /// section's expand affordance. Same `overlay + scrim +
+    /// dialog_content` frame as the image lightbox; the body is a
+    /// scrollable monospace block sized to a comfortable portion of a
+    /// 1080-tall viewport so even 30 KiB bash dumps fit without
+    /// growing the chat scroll.
+    fn render_text_lightbox_modal(&self) -> Option<El> {
+        let lb = self.text_lightbox.as_ref()?;
+        const TEXT_LIGHTBOX_W: f32 = 960.0;
+        const TEXT_LIGHTBOX_BODY_H: f32 = 640.0;
+
+        let title_color = if lb.is_error {
+            tokens::DESTRUCTIVE
+        } else {
+            tokens::FOREGROUND
+        };
+        let header = row([
+            text(lb.title.clone()).bold().color(title_color),
+            spacer(),
+            text(format!("{} chars", lb.text.chars().count()))
+                .caption()
+                .muted(),
+        ])
+        .align(Align::Center)
+        .width(Size::Fill(1.0));
+
+        let display = hard_wrap_code_lines(&lb.text, 120);
+        let body = scroll([text(display.clone())
+            .key("text-lightbox:body")
+            .selectable()
+            .selection_source(SelectionSource::identity(display))
+            .mono()
+            .font_size(tokens::TEXT_SM.size)
+            .wrap_text()
+            .width(Size::Fill(1.0))
+            .height(Size::Hug)])
+        .key("text-lightbox:scroll")
+        .width(Size::Fill(1.0))
+        .height(Size::Fixed(TEXT_LIGHTBOX_BODY_H));
+
+        let mut body_children = vec![header, body];
+        if let Some(status) = &lb.status {
+            body_children.push(text(status.clone()).caption().muted());
+        }
+        let dialog_body = column(body_children)
+            .gap(tokens::SPACE_2)
+            .width(Size::Fill(1.0));
+
+        let copy = button("Copy").key(TEXT_LIGHTBOX_MODAL_COPY_KEY);
+        let close = button("Close").key(TEXT_LIGHTBOX_MODAL_CLOSE_KEY);
+        let children: Vec<El> = vec![dialog_body, dialog_footer([copy, close])];
+
+        Some(overlay([
+            scrim(TEXT_LIGHTBOX_MODAL_DISMISS_KEY),
+            dialog_content(children)
+                .width(Size::Fixed(TEXT_LIGHTBOX_W))
+                .block_pointer(),
+        ]))
+    }
+
     /// Fullscreen image-lightbox modal. The default `dialog(...)`
     /// helper hard-codes `width = Fixed(420)` on its modal panel,
     /// which would clip a wide screenshot to a narrow column — so we
@@ -22481,6 +22673,36 @@ fn copy_image_to_clipboard(bytes: &[u8], mime: ImageMime) -> Result<(), String> 
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|err| err.to_string())?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let text = text.to_string();
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(err) = write_text_to_browser_clipboard(text).await {
+            log::warn!("clipboard text write failed: {err}");
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn write_text_to_browser_clipboard(text: String) -> Result<(), String> {
+    let window = web_sys::window().ok_or_else(|| "window unavailable".to_string())?;
+    let clipboard = window.navigator().clipboard();
+    let promise = clipboard.write_text(&text);
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(js_error_to_string)?;
+    Ok(())
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn write_image_to_browser_clipboard(bytes: Vec<u8>, mime: ImageMime) -> Result<(), String> {
     use wasm_bindgen::JsCast;
@@ -22634,6 +22856,22 @@ fn tool_call_header(name: &str, summary: Option<&str>, result: Option<&FusedTool
     out
 }
 
+/// Section label for one body in a tool-call accordion, paired with
+/// a small "expand" icon that opens the focused text-lightbox modal.
+/// `kind` is the routing tag (`args` / `output` / `result`) — must
+/// match what `open_text_lightbox` recognizes; `label` is the
+/// human-readable text shown beside the icon (e.g. `"error"` for an
+/// errored result).
+fn tool_section_label(idx: usize, kind: &str, label: &str) -> El {
+    let expand = icon_button(crate::icons::ICON_MAXIMIZE_2.clone())
+        .key(chat_text_lightbox_key(idx, kind))
+        .icon_size(tokens::ICON_XS)
+        .ghost();
+    row([text(label.to_string()).caption().muted(), expand])
+        .gap(tokens::SPACE_1)
+        .align(Align::Center)
+}
+
 /// Expanded-body content for a tool-call accordion. When a `diff`
 /// is present (`edit_file` / `write_file` paths the renderer
 /// recognizes), the body shows a unified-diff view rooted at the
@@ -22669,11 +22907,11 @@ fn tool_call_body(
     } else if let Some(args) = args_pretty
         && !args.trim().is_empty()
     {
-        blocks.push(text("args").caption().muted());
+        blocks.push(tool_section_label(idx, "args", "args"));
         blocks.push(selectable_code_block(chat_text_key(idx, "args"), args));
     }
     if !streaming_output.trim().is_empty() {
-        blocks.push(text("output").caption().muted());
+        blocks.push(tool_section_label(idx, "output", "output"));
         blocks.push(selectable_code_block(
             chat_text_key(idx, "streaming-output"),
             streaming_output,
@@ -22681,7 +22919,7 @@ fn tool_call_body(
     }
     if let Some(r) = result {
         let label = if r.is_error { "error" } else { "result" };
-        blocks.push(text(label).caption().muted());
+        blocks.push(tool_section_label(idx, "result", label));
         blocks.push(selectable_code_block(chat_text_key(idx, "result"), &r.text));
     }
     if blocks.is_empty() {
