@@ -23,6 +23,8 @@ crates/whisper-agent-aetna-ui/out/
 /audit.jsonl
 /conversation.json
 /tasks/
+/installation_id
+/forensics/
 
 # Dev-script sandbox: mcp-host workspace + audit log + task JSON (see scripts/dev.sh)
 /sandbox/
