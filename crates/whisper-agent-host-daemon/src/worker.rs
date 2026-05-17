@@ -284,28 +284,27 @@ fn worker_env_overrides(
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
-    if let Some(ConfigurableValue::Enum(mode)) = options.get("user_env") {
-        if matches!(mode.as_str(), "runas_basic" | "runas_desktop")
-            && let Some(id) = runas_id
-        {
-            out.insert("HOME".into(), id.home.clone());
-            out.insert("USER".into(), id.name.clone());
-            out.insert("LOGNAME".into(), id.name.clone());
-            out.insert("XDG_CONFIG_HOME".into(), format!("{}/.config", id.home));
-            out.insert("XDG_DATA_HOME".into(), format!("{}/.local/share", id.home));
-            out.insert("XDG_CACHE_HOME".into(), format!("{}/.cache", id.home));
+    if let Some(ConfigurableValue::Enum(mode)) = options.get("user_env")
+        && matches!(mode.as_str(), "runas_basic" | "runas_desktop")
+        && let Some(id) = runas_id
+    {
+        out.insert("HOME".into(), id.home.clone());
+        out.insert("USER".into(), id.name.clone());
+        out.insert("LOGNAME".into(), id.name.clone());
+        out.insert("XDG_CONFIG_HOME".into(), format!("{}/.config", id.home));
+        out.insert("XDG_DATA_HOME".into(), format!("{}/.local/share", id.home));
+        out.insert("XDG_CACHE_HOME".into(), format!("{}/.cache", id.home));
 
-            if mode == "runas_desktop" {
-                let runtime_dir = format!("/run/user/{}", id.uid);
-                if std::path::Path::new(&runtime_dir).exists() {
-                    out.insert("XDG_RUNTIME_DIR".into(), runtime_dir.clone());
-                    let bus = format!("{runtime_dir}/bus");
-                    if std::path::Path::new(&bus).exists() {
-                        out.insert(
-                            "DBUS_SESSION_BUS_ADDRESS".into(),
-                            format!("unix:path={bus}"),
-                        );
-                    }
+        if mode == "runas_desktop" {
+            let runtime_dir = format!("/run/user/{}", id.uid);
+            if std::path::Path::new(&runtime_dir).exists() {
+                out.insert("XDG_RUNTIME_DIR".into(), runtime_dir.clone());
+                let bus = format!("{runtime_dir}/bus");
+                if std::path::Path::new(&bus).exists() {
+                    out.insert(
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("unix:path={bus}"),
+                    );
                 }
             }
         }
@@ -337,6 +336,7 @@ fn resolve_bin_dir(mcp_host_bin: &str) -> Result<String, WorkerError> {
     Ok(parent.to_string_lossy().into_owned())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_landlock(
     allowed_paths: &[PathAccess],
     network: &NetworkPolicy,

@@ -63,14 +63,14 @@ use whisper_agent_protocol::{
     BehaviorSummary, BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase,
     BucketCreateInput, BucketLoadOutcome, BucketLoadPhase, BucketSourceInput, BucketSummary,
     CatchUp, ClientToServer, ContentBlock, CoreTools, Disposition, EmbeddingProviderInfo, FsEntry,
-    HostEnvBindingRequest, HostEnvDaemonSummary, ImageMime, ImageSource, InitialListing,
-    KnowledgeAutoquerySource, ModelSummary, NamedHostEnv, Overlap, PodAllow, PodConfig, PodLimits,
-    PodSummary, QuantizationInput, ResourceSnapshot, RetentionPolicy, Role, ServerToClient,
-    SharedMcpAuthInput, SharedMcpAuthPublic, SharedMcpHostInfo, SharedMcpPrefixInput,
-    SlotStateLabel, SystemPromptChoice, ThreadBindingsRequest, ThreadConfigOverride,
-    ThreadDefaultCaps, ThreadDefaults, ThreadSummary, ToolSurface, TrackedCadenceInput,
-    TrackedDriverInput, TriggerSpec, TunableKind, TunableSpec, TunableValue,
-    permission::SudoDecision,
+    HostEnvBindingRequest, HostEnvConfigurableSummary, HostEnvDaemonSummary, ImageMime,
+    ImageSource, InitialListing, KnowledgeAutoquerySource, ModelSummary, NamedHostEnv, Overlap,
+    PodAllow, PodConfig, PodLimits, PodSummary, QuantizationInput, ResourceSnapshot,
+    RetentionPolicy, Role, ServerToClient, SharedMcpAuthInput, SharedMcpAuthPublic,
+    SharedMcpHostInfo, SharedMcpPrefixInput, SlotStateLabel, SystemPromptChoice,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadDefaultCaps, ThreadDefaults, ThreadSummary,
+    ToolSurface, TrackedCadenceInput, TrackedDriverInput, TriggerSpec, TunableKind, TunableSpec,
+    TunableValue, permission::SudoDecision,
 };
 
 /// Inbound event variants the host shell pushes into the [`Inbound`]
@@ -5688,6 +5688,16 @@ impl App for ChatApp {
                 }
                 return;
             }
+            if let Some(suffix) = key.strip_prefix(PICKER_HOST_ENVS_OPTION_DEFAULT_PREFIX)
+                && let Some((entry_name, option_key)) = suffix.split_once(':')
+                && let Some(entry) = self
+                    .picker_host_envs
+                    .iter_mut()
+                    .find(|e| e.name == entry_name)
+            {
+                entry.options_draft.remove(option_key);
+                return;
+            }
             if let Some(name) = key.strip_prefix(PICKER_MCP_HOSTS_REMOVE_PREFIX) {
                 self.picker_mcp_hosts.retain(|n| n != name);
                 if self.picker_mcp_hosts.is_empty() {
@@ -5997,6 +6007,11 @@ struct PickerHostEnv {
     name: String,
     workspace_root_draft: String,
     runas_draft: String,
+    /// Per-binding option overrides keyed by the configurables advertised
+    /// by the backing daemon. Empty entries are skipped on the wire so the
+    /// daemon falls back to its advertised defaults (or to the pod-config
+    /// `NamedHostEnv.options` defaults the scheduler folds in).
+    options_draft: BTreeMap<String, whisper_agent_protocol::ConfigurableValue>,
 }
 
 /// Explicit inheritance mode for binding lists. The underlying wire
@@ -6435,6 +6450,14 @@ const HOST_ENV_EDITOR_RUNAS_ADD_KEY: &str = "pod-editor:host-env:runas:add";
 const HOST_ENV_EDITOR_RUNAS_PREFIX: &str = "pod-editor:host-env:runas:";
 const HOST_ENV_EDITOR_RUNAS_DELETE_PREFIX: &str = "pod-editor:host-env:runas:delete:";
 const HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY: &str = "pod-editor:host-env:runas:default";
+/// Per-knob default editor for `NamedHostEnv.options`. Full key shape is
+/// `pod-editor:host-env:option:<option-key>` — the suffix identifies the
+/// configurable advertised by the entry's daemon.
+const HOST_ENV_EDITOR_OPTION_PREFIX: &str = "pod-editor:host-env:option:";
+/// "Default" reset button next to a per-knob default editor. Clearing the
+/// draft removes the key from `NamedHostEnv.options` so the daemon's
+/// advertised default takes effect at provisioning time.
+const HOST_ENV_EDITOR_OPTION_DEFAULT_PREFIX: &str = "pod-editor:host-env:option-default:";
 /// Defaults-tab field keys.
 const POD_EDITOR_DEFAULTS_BACKEND_KEY: &str = "pod-editor:defaults:backend";
 const POD_EDITOR_DEFAULTS_MODEL_KEY: &str = "pod-editor:defaults:model";
@@ -7201,6 +7224,14 @@ const PICKER_HOST_ENVS_RUNAS_PREFIX: &str = "picker:host-envs:runas:";
 /// runas input. Clearing the draft falls back to the entry's
 /// `default_runas` server-side.
 const PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX: &str = "picker:host-envs:runas-default:";
+/// Routed-key prefix for per-binding configurable controls. Full key
+/// shape is `picker:host-envs:option:<entry-name>:<option-key>` — the
+/// suffix encodes both the picker entry and the daemon-advertised
+/// configurable so dispatch can locate the matching draft slot.
+const PICKER_HOST_ENVS_OPTION_PREFIX: &str = "picker:host-envs:option:";
+/// Routed-key prefix for the "Default" reset button next to a per-binding
+/// configurable control. Suffix mirrors `PICKER_HOST_ENVS_OPTION_PREFIX`.
+const PICKER_HOST_ENVS_OPTION_DEFAULT_PREFIX: &str = "picker:host-envs:option-default:";
 const PICKER_MCP_HOSTS: &str = "picker:mcp-hosts";
 const PICKER_MCP_HOSTS_MODE: &str = "picker:mcp-hosts:mode";
 const PICKER_MCP_HOSTS_REMOVE_PREFIX: &str = "picker:mcp-hosts:remove:";
@@ -7539,7 +7570,7 @@ impl ChatApp {
                             name: entry.name.clone(),
                             workspace_root,
                             runas,
-                            options: Default::default(),
+                            options: entry.options_draft.clone(),
                         }
                     })
                     .collect(),
@@ -8177,6 +8208,91 @@ impl ChatApp {
             return true;
         }
 
+        if self.handle_picker_host_env_option_event(event) {
+            return true;
+        }
+
+        false
+    }
+
+    /// Route a UI event into per-binding `picker_host_envs[i].options_draft`
+    /// for any configurable advertised by the matching daemon. Mirrors
+    /// [`Self::handle_new_thread_tunable_event`] but indexes by
+    /// `(entry_name, option_key)` since each entry has its own daemon
+    /// catalog. Specs are cloned per entry up front to avoid borrowing
+    /// `self` immutably and mutably at the same time.
+    fn handle_picker_host_env_option_event(&mut self, event: &UiEvent) -> bool {
+        // Pair (entry_name, [spec]) snapshots — cloned up front so the
+        // hot loop can mutate the matching draft without re-borrowing.
+        let snapshots: Vec<(String, Vec<HostEnvConfigurableSummary>)> = self
+            .picker_host_envs
+            .iter()
+            .map(|entry| {
+                let cfgs = self
+                    .picker_host_env_daemon(&entry.name)
+                    .map(|d| d.session_configurables.clone())
+                    .unwrap_or_default();
+                (entry.name.clone(), cfgs)
+            })
+            .collect();
+        for (entry_name, cfgs) in &snapshots {
+            for cfg in cfgs {
+                let opt_key = format!(
+                    "{PICKER_HOST_ENVS_OPTION_PREFIX}{entry_name}:{}",
+                    cfg.spec.key
+                );
+                match &cfg.spec.kind {
+                    TunableKind::Bool { default } => {
+                        if event.is_click_or_activate(&opt_key) {
+                            let Some(entry) = self
+                                .picker_host_envs
+                                .iter_mut()
+                                .find(|e| e.name == *entry_name)
+                            else {
+                                return true;
+                            };
+                            let prev = entry
+                                .options_draft
+                                .get(&cfg.spec.key)
+                                .and_then(|v| match v {
+                                    TunableValue::Bool(b) => Some(*b),
+                                    _ => None,
+                                })
+                                .unwrap_or(*default);
+                            entry
+                                .options_draft
+                                .insert(cfg.spec.key.clone(), TunableValue::Bool(!prev));
+                            return true;
+                        }
+                    }
+                    TunableKind::Enum { variants, .. } => {
+                        let allowed: Vec<String> =
+                            variants.iter().map(|v| v.value.clone()).collect();
+                        let mut pick: Option<String> = None;
+                        if toggle::apply_event_single(&mut pick, event, &opt_key, |raw| {
+                            if allowed.iter().any(|v| v == raw) {
+                                Some(Some(raw.to_string()))
+                            } else {
+                                None
+                            }
+                        }) {
+                            if let Some(picked) = pick
+                                && let Some(entry) = self
+                                    .picker_host_envs
+                                    .iter_mut()
+                                    .find(|e| e.name == *entry_name)
+                            {
+                                entry
+                                    .options_draft
+                                    .insert(cfg.spec.key.clone(), TunableValue::Enum(picked));
+                            }
+                            return true;
+                        }
+                    }
+                    TunableKind::String { .. } | TunableKind::Int { .. } => {}
+                }
+            }
+        }
         false
     }
 
@@ -8326,6 +8442,7 @@ impl ChatApp {
                         name: value,
                         workspace_root_draft: String::new(),
                         runas_draft: String::new(),
+                        options_draft: BTreeMap::new(),
                     });
                 }
                 self.picker_host_envs_open = false;
@@ -10717,8 +10834,8 @@ impl ChatApp {
                     .collect();
                 toggle_group(key.clone(), &current, options)
             }
-            TunableKind::String { default } => text(format!("{}", default)).muted().small(),
-            TunableKind::Int { default, .. } => text(format!("{}", default)).muted().small(),
+            TunableKind::String { default } => text(default.clone()).muted().small(),
+            TunableKind::Int { default, .. } => text(default.to_string()).muted().small(),
         };
         let mut item = vec![form_label(label), form_control(control)];
         if let Some(desc) = spec.description.as_deref() {
@@ -10757,6 +10874,19 @@ impl ChatApp {
         self.pod_configs.get(pod_id).map(|c| &c.allow)
     }
 
+    /// Look up the daemon advertising the named pod host-env entry, so
+    /// the picker can render daemon-specific session-configurable
+    /// controls. `None` while the pod config or daemon list haven't
+    /// landed yet, or when the entry's provider name is missing from
+    /// the live daemon catalog.
+    fn picker_host_env_daemon(&self, entry_name: &str) -> Option<&HostEnvDaemonSummary> {
+        let allow = self.picker_pod_allow()?;
+        let pod_entry = allow.host_env.iter().find(|n| n.name == entry_name)?;
+        self.host_env_daemons
+            .iter()
+            .find(|d| d.name == pod_entry.provider)
+    }
+
     /// Render the Host envs row — chip list of picked entries + an
     /// "Add" trigger that opens [`host_envs_menu`]. Each chip is a
     /// body button (toggles inline workspace_root editing) paired with
@@ -10786,7 +10916,9 @@ impl ChatApp {
                 host_env_chip(
                     &entry.name,
                     expanded,
-                    !entry.workspace_root_draft.is_empty() || !entry.runas_draft.is_empty(),
+                    !entry.workspace_root_draft.is_empty()
+                        || !entry.runas_draft.is_empty()
+                        || !entry.options_draft.is_empty(),
                 )
             })
             .collect();
@@ -10910,7 +11042,124 @@ impl ChatApp {
         if let Some(r) = runas_section {
             children.push(r);
         }
+        if let Some(options_section) = self.host_envs_options_editor(name, entry, pod_entry) {
+            children.push(options_section);
+        }
         Some(column(children).gap(tokens::SPACE_3))
+    }
+
+    /// Per-binding options editor — one row per configurable advertised
+    /// by the backing daemon (`HostEnvDaemonSummary.session_configurables`).
+    /// Returns `None` when the daemon catalog hasn't loaded yet or the
+    /// daemon advertises nothing. Bool/Enum kinds render interactive
+    /// controls; String/Int kinds render the default as muted text until
+    /// a daemon actually advertises one and we wire a widget for it.
+    fn host_envs_options_editor(
+        &self,
+        name: &str,
+        entry: &PickerHostEnv,
+        pod_entry: Option<&NamedHostEnv>,
+    ) -> Option<El> {
+        let daemon = self.picker_host_env_daemon(name)?;
+        if daemon.session_configurables.is_empty() {
+            return None;
+        }
+        let mut rows: Vec<El> = vec![text(format!("Session options for {name}")).muted().small()];
+        for cfg in &daemon.session_configurables {
+            let opt_key = format!("{PICKER_HOST_ENVS_OPTION_PREFIX}{name}:{}", cfg.spec.key);
+            let reset_key = format!(
+                "{PICKER_HOST_ENVS_OPTION_DEFAULT_PREFIX}{name}:{}",
+                cfg.spec.key
+            );
+            let label = cfg
+                .spec
+                .label
+                .clone()
+                .unwrap_or_else(|| cfg.spec.key.clone());
+
+            // Effective default surfaced to the user: pod-config override
+            // wins over the daemon-advertised default. The picker draft
+            // wins over both when set.
+            let pod_default = pod_entry.and_then(|n| n.options.get(&cfg.spec.key));
+            let daemon_default = configurable_kind_default(&cfg.spec.kind);
+            let resolved_default: Option<TunableValue> =
+                pod_default.cloned().or_else(|| daemon_default.clone());
+            let current = entry
+                .options_draft
+                .get(&cfg.spec.key)
+                .cloned()
+                .or_else(|| resolved_default.clone());
+
+            let control: El = match &cfg.spec.kind {
+                TunableKind::Bool { .. } => {
+                    let bool_value = matches!(current, Some(TunableValue::Bool(true)));
+                    row([
+                        checkbox(bool_value).key(&opt_key),
+                        text(label.clone()).muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                }
+                TunableKind::Enum { variants, .. } => {
+                    let current_value = match &current {
+                        Some(TunableValue::Enum(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let options: Vec<(String, String)> = variants
+                        .iter()
+                        .map(|v| {
+                            let lab = v.label.clone().unwrap_or_else(|| v.value.clone());
+                            (v.value.clone(), lab)
+                        })
+                        .collect();
+                    toggle_group(opt_key.clone(), &current_value, options)
+                }
+                TunableKind::String { .. } | TunableKind::Int { .. } => {
+                    let display = match &current {
+                        Some(TunableValue::String(s)) => s.clone(),
+                        Some(TunableValue::Int(n)) => n.to_string(),
+                        Some(TunableValue::Bool(b)) => b.to_string(),
+                        Some(TunableValue::Enum(s)) => s.clone(),
+                        None => "(no default)".to_string(),
+                    };
+                    text(display).muted().small()
+                }
+            };
+
+            let mut reset = button("Default").key(reset_key).ghost();
+            if !entry.options_draft.contains_key(&cfg.spec.key) {
+                reset = reset.disabled();
+            }
+
+            let hint_text = match (&pod_default, &daemon_default) {
+                (Some(pd), _) => format!(
+                    "pod default: {} (daemon advertises {})",
+                    configurable_value_display(pd),
+                    configurable_kind_short(&cfg.spec.kind),
+                ),
+                (None, Some(dd)) => format!(
+                    "daemon default: {} ({})",
+                    configurable_value_display(dd),
+                    configurable_kind_short(&cfg.spec.kind),
+                ),
+                (None, None) => configurable_kind_short(&cfg.spec.kind),
+            };
+
+            let mut row_children: Vec<El> = vec![
+                row([control, reset])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center),
+                text(hint_text).muted().small(),
+            ];
+            if let Some(desc) = cfg.spec.description.as_deref() {
+                row_children.insert(0, text(format!("{label} — {desc}")).muted().small());
+            } else {
+                row_children.insert(0, text(label.clone()).muted().small());
+            }
+
+            rows.push(column(row_children).gap(tokens::SPACE_1));
+        }
+        Some(column(rows).gap(tokens::SPACE_2))
     }
 
     /// Render the MCP hosts row — same shape as
@@ -14608,6 +14857,14 @@ impl ChatApp {
             return true;
         }
 
+        // Per-knob options handling needs to peek at `self.host_env_daemons`
+        // alongside the mutable editor borrow; doing it before the
+        // `sub` borrow below keeps the borrow checker happy without
+        // cloning the whole editor state.
+        if self.handle_host_env_entry_option_event(event) {
+            return true;
+        }
+
         let Some(sub) = self
             .pod_editor
             .as_mut()
@@ -15021,6 +15278,109 @@ impl ChatApp {
                     text_input::apply_event(host, selection, &host_key, event);
                     return true;
                 }
+            }
+        }
+        false
+    }
+
+    /// Route a UI event into the host-env editor's per-knob
+    /// `NamedHostEnv.options` map. Mirrors
+    /// [`Self::handle_picker_host_env_option_event`] but writes into the
+    /// pod-config editor instead of the new-thread picker draft.
+    /// Configurable specs are cloned up front so the hot loop can mutate
+    /// the editor without holding an immutable borrow on
+    /// `self.host_env_daemons`.
+    fn handle_host_env_entry_option_event(&mut self, event: &UiEvent) -> bool {
+        // Reset button — purely click-driven, no daemon lookup needed.
+        if matches!(event.kind, UiEventKind::Click | UiEventKind::Activate)
+            && let Some(route) = event.route()
+            && let Some(option_key) = route.strip_prefix(HOST_ENV_EDITOR_OPTION_DEFAULT_PREFIX)
+            && let Some(sub) = self
+                .pod_editor
+                .as_mut()
+                .and_then(|editor| editor.host_env_editor.as_mut())
+        {
+            sub.entry.options.remove(option_key);
+            sub.error = None;
+            return true;
+        }
+
+        // Snapshot the cfgs for the editor's current provider so the
+        // value-set loop below doesn't need a live `&self` borrow.
+        let cfgs: Vec<HostEnvConfigurableSummary> = {
+            let Some(sub) = self
+                .pod_editor
+                .as_ref()
+                .and_then(|editor| editor.host_env_editor.as_ref())
+            else {
+                return false;
+            };
+            let provider = sub.entry.provider.trim();
+            if provider.is_empty() {
+                return false;
+            }
+            self.host_env_daemons
+                .iter()
+                .find(|d| d.name == provider)
+                .map(|d| d.session_configurables.clone())
+                .unwrap_or_default()
+        };
+        if cfgs.is_empty() {
+            return false;
+        }
+        for cfg in &cfgs {
+            let opt_key = format!("{HOST_ENV_EDITOR_OPTION_PREFIX}{}", cfg.spec.key);
+            match &cfg.spec.kind {
+                TunableKind::Bool { default } => {
+                    if event.is_click_or_activate(&opt_key) {
+                        let Some(sub) = self
+                            .pod_editor
+                            .as_mut()
+                            .and_then(|editor| editor.host_env_editor.as_mut())
+                        else {
+                            return true;
+                        };
+                        let prev = sub
+                            .entry
+                            .options
+                            .get(&cfg.spec.key)
+                            .and_then(|v| match v {
+                                TunableValue::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .unwrap_or(*default);
+                        sub.entry
+                            .options
+                            .insert(cfg.spec.key.clone(), TunableValue::Bool(!prev));
+                        sub.error = None;
+                        return true;
+                    }
+                }
+                TunableKind::Enum { variants, .. } => {
+                    let allowed: Vec<String> = variants.iter().map(|v| v.value.clone()).collect();
+                    let mut pick: Option<String> = None;
+                    if toggle::apply_event_single(&mut pick, event, &opt_key, |raw| {
+                        if allowed.iter().any(|v| v == raw) {
+                            Some(Some(raw.to_string()))
+                        } else {
+                            None
+                        }
+                    }) {
+                        if let Some(picked) = pick
+                            && let Some(sub) = self
+                                .pod_editor
+                                .as_mut()
+                                .and_then(|editor| editor.host_env_editor.as_mut())
+                        {
+                            sub.entry
+                                .options
+                                .insert(cfg.spec.key.clone(), TunableValue::Enum(picked));
+                            sub.error = None;
+                        }
+                        return true;
+                    }
+                }
+                TunableKind::String { .. } | TunableKind::Int { .. } => {}
             }
         }
         false
@@ -16060,6 +16420,9 @@ impl ChatApp {
         };
         let runas_body = self.render_host_env_runas_body(editor);
         let mut body_children = vec![top, spec_body, runas_body];
+        if let Some(options_body) = self.render_host_env_options_body(editor) {
+            body_children.push(options_body);
+        }
         if let Some(err) = editor.error.as_deref() {
             body_children.push(
                 alert([
@@ -16141,6 +16504,105 @@ impl ChatApp {
                 ),
             ]),
         ])
+    }
+
+    /// Per-knob defaults editor for `NamedHostEnv.options`. Sourced from
+    /// the daemon's advertised `session_configurables` (looked up via
+    /// `entry.provider`). Bool/Enum kinds render interactive controls;
+    /// String/Int kinds render the daemon default as muted text until a
+    /// daemon actually advertises one and we wire a widget for it.
+    /// Returns `None` when the entry has no provider yet, the matching
+    /// daemon hasn't connected, or it advertises no configurables — the
+    /// modal stays uncluttered in those cases.
+    fn render_host_env_options_body(&self, editor: &HostEnvEntryEditorState) -> Option<El> {
+        let provider = editor.entry.provider.trim();
+        if provider.is_empty() {
+            return None;
+        }
+        let daemon = self.host_env_daemons.iter().find(|d| d.name == provider)?;
+        if daemon.session_configurables.is_empty() {
+            return None;
+        }
+        let mut rows: Vec<El> = Vec::new();
+        for cfg in &daemon.session_configurables {
+            let opt_key = format!("{HOST_ENV_EDITOR_OPTION_PREFIX}{}", cfg.spec.key);
+            let reset_key = format!("{HOST_ENV_EDITOR_OPTION_DEFAULT_PREFIX}{}", cfg.spec.key);
+            let label = cfg
+                .spec
+                .label
+                .clone()
+                .unwrap_or_else(|| cfg.spec.key.clone());
+
+            let daemon_default = configurable_kind_default(&cfg.spec.kind);
+            let pod_value = editor.entry.options.get(&cfg.spec.key).cloned();
+            let current = pod_value.clone().or_else(|| daemon_default.clone());
+
+            let control: El = match &cfg.spec.kind {
+                TunableKind::Bool { .. } => {
+                    let bool_value = matches!(current, Some(TunableValue::Bool(true)));
+                    row([
+                        checkbox(bool_value).key(&opt_key),
+                        text(label.clone()).muted().small(),
+                    ])
+                    .gap(tokens::SPACE_2)
+                    .align(Align::Center)
+                }
+                TunableKind::Enum { variants, .. } => {
+                    let current_value = match &current {
+                        Some(TunableValue::Enum(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let options: Vec<(String, String)> = variants
+                        .iter()
+                        .map(|v| {
+                            let lab = v.label.clone().unwrap_or_else(|| v.value.clone());
+                            (v.value.clone(), lab)
+                        })
+                        .collect();
+                    toggle_group(opt_key.clone(), &current_value, options)
+                }
+                TunableKind::String { .. } | TunableKind::Int { .. } => {
+                    let display = match &current {
+                        Some(TunableValue::String(s)) => s.clone(),
+                        Some(TunableValue::Int(n)) => n.to_string(),
+                        Some(TunableValue::Bool(b)) => b.to_string(),
+                        Some(TunableValue::Enum(s)) => s.clone(),
+                        None => "(no default)".to_string(),
+                    };
+                    text(display).muted().small()
+                }
+            };
+
+            let mut reset = button("Default").key(reset_key).ghost();
+            if pod_value.is_none() {
+                reset = reset.disabled();
+            }
+
+            let hint = match &daemon_default {
+                Some(d) => format!(
+                    "daemon default: {} ({})",
+                    configurable_value_display(d),
+                    configurable_kind_short(&cfg.spec.kind),
+                ),
+                None => configurable_kind_short(&cfg.spec.kind),
+            };
+
+            let mut item = vec![
+                form_label(label),
+                form_control(
+                    row([control, reset])
+                        .gap(tokens::SPACE_2)
+                        .align(Align::Center),
+                ),
+            ];
+            if let Some(desc) = cfg.spec.description.as_deref() {
+                item.push(form_description(format!("{desc} — {hint}")));
+            } else {
+                item.push(form_description(hint));
+            }
+            rows.push(form_item(item));
+        }
+        Some(form(rows))
     }
 
     fn render_host_env_landlock_body(
@@ -18336,6 +18798,11 @@ impl ChatApp {
                 }
             };
             card_children.push(text(tools).caption().muted().ellipsis());
+            if !daemon.session_configurables.is_empty() {
+                card_children.push(render_session_configurables_summary(
+                    &daemon.session_configurables,
+                ));
+            }
         } else {
             card_children.push(
                 paragraph(
@@ -21855,6 +22322,93 @@ fn format_build_elapsed(started_at_rfc3339: &str) -> String {
         format!("{s}s")
     };
     format!("{body} elapsed")
+}
+
+fn render_session_configurables_summary(items: &[HostEnvConfigurableSummary]) -> El {
+    let mut rows: Vec<El> = vec![
+        text(format!("session options ({}):", items.len()))
+            .caption()
+            .muted(),
+    ];
+    for item in items {
+        let label = item
+            .spec
+            .label
+            .clone()
+            .unwrap_or_else(|| item.spec.key.clone());
+        let summary = format!(
+            "  {} ({}) — {} • {}",
+            item.spec.key,
+            label,
+            configurable_kind_short(&item.spec.kind),
+            session_configurable_lifecycle_short(&item.lifecycle),
+        );
+        rows.push(text(summary).caption().muted().ellipsis());
+    }
+    column(rows).gap(tokens::SPACE_1).width(Size::Fill(1.0))
+}
+
+/// Render a `ConfigurableValue` as a short human-readable string for hints
+/// and badges. Mirrors the wire types defined in
+/// `whisper_agent_protocol::ConfigurableValue`.
+fn configurable_value_display(value: &TunableValue) -> String {
+    match value {
+        TunableValue::Bool(b) => b.to_string(),
+        TunableValue::Enum(s) => s.clone(),
+        TunableValue::String(s) => format!("{s:?}"),
+        TunableValue::Int(n) => n.to_string(),
+    }
+}
+
+/// Extract the daemon-advertised default for a `ConfigurableKind` as a
+/// matching `ConfigurableValue`, so the picker can seed control state
+/// and surface a "what the daemon would use" hint. Returns `None` only
+/// for shapes that have no meaningful default (none today — every kind
+/// carries one on the wire).
+fn configurable_kind_default(kind: &TunableKind) -> Option<TunableValue> {
+    Some(match kind {
+        TunableKind::Bool { default } => TunableValue::Bool(*default),
+        TunableKind::Enum { default, .. } => TunableValue::Enum(default.clone()),
+        TunableKind::String { default } => TunableValue::String(default.clone()),
+        TunableKind::Int { default, .. } => TunableValue::Int(*default),
+    })
+}
+
+fn configurable_kind_short(kind: &TunableKind) -> String {
+    match kind {
+        TunableKind::Bool { default } => format!("bool (default: {default})"),
+        TunableKind::Enum { variants, default } => {
+            let names: Vec<&str> = variants.iter().map(|v| v.value.as_str()).collect();
+            format!("enum [{}] (default: {default})", names.join(" | "))
+        }
+        TunableKind::String { default } => {
+            if default.is_empty() {
+                "string".to_string()
+            } else {
+                format!("string (default: {default:?})")
+            }
+        }
+        TunableKind::Int { default, min, max } => {
+            let range = match (min, max) {
+                (Some(lo), Some(hi)) => format!(" [{lo}..={hi}]"),
+                (Some(lo), None) => format!(" [>={lo}]"),
+                (None, Some(hi)) => format!(" [<={hi}]"),
+                (None, None) => String::new(),
+            };
+            format!("int{range} (default: {default})")
+        }
+    }
+}
+
+/// Map the wire-string lifecycle from `HostEnvConfigurableSummary` to a short
+/// human-readable badge. Unknown values pass through verbatim so a future
+/// daemon variant still renders something useful.
+fn session_configurable_lifecycle_short(lifecycle: &str) -> &str {
+    match lifecycle {
+        "spawn_only" => "spawn-only",
+        "live_update" => "live-update",
+        other => other,
+    }
 }
 
 fn format_ms_ago(ms: u64) -> String {

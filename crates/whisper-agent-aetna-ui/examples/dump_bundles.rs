@@ -1870,6 +1870,36 @@ fn mock_host_env_daemons() -> Vec<whisper_agent_protocol::HostEnvDaemonSummary> 
             ],
             max_concurrent_sessions: Some(4),
             supports_background_tasks: true,
+            session_configurables: vec![whisper_agent_protocol::HostEnvConfigurableSummary {
+                spec: whisper_agent_protocol::ConfigurableSpec {
+                    key: "user_env".into(),
+                    label: Some("User environment".into()),
+                    description: Some(
+                        "Populate HOME/USER/XDG variables from the selected runas user.".into(),
+                    ),
+                    kind: whisper_agent_protocol::ConfigurableKind::Enum {
+                        default: "none".into(),
+                        variants: vec![
+                            whisper_agent_protocol::ConfigurableEnumVariant {
+                                value: "none".into(),
+                                label: Some("Minimal daemon environment".into()),
+                                description: None,
+                            },
+                            whisper_agent_protocol::ConfigurableEnumVariant {
+                                value: "runas_basic".into(),
+                                label: Some("Basic runas environment".into()),
+                                description: None,
+                            },
+                            whisper_agent_protocol::ConfigurableEnumVariant {
+                                value: "runas_desktop".into(),
+                                label: Some("Desktop runas environment".into()),
+                                description: None,
+                            },
+                        ],
+                    },
+                },
+                lifecycle: "spawn_only".into(),
+            }],
             last_active_ms_ago: Some(3_200),
         },
         whisper_agent_protocol::HostEnvDaemonSummary {
@@ -1882,6 +1912,7 @@ fn mock_host_env_daemons() -> Vec<whisper_agent_protocol::HostEnvDaemonSummary> 
             tools: Vec::new(),
             max_concurrent_sessions: None,
             supports_background_tasks: false,
+            session_configurables: Vec::new(),
             last_active_ms_ago: None,
         },
     ]
@@ -2417,6 +2448,7 @@ mcp_hosts = ["filesystem", "git"]
                     },
                     allow_runas: Vec::new(),
                     default_runas: None,
+                    options: Default::default(),
                 },
                 NamedHostEnv {
                     name: "browser".into(),
@@ -2440,6 +2472,7 @@ mcp_hosts = ["filesystem", "git"]
                     },
                     allow_runas: Vec::new(),
                     default_runas: None,
+                    options: Default::default(),
                 },
             ],
             knowledge_buckets: vec!["wiki".into()],
@@ -2704,6 +2737,7 @@ fn mock_inspector_snapshot() -> ThreadSnapshot {
                 "/home/user/workspace/whisper-agent",
             )),
             runas: None,
+            options: Default::default(),
         }],
         mcp_hosts: vec!["filesystem".into(), "memory".into()],
         ..ThreadBindings::default()
