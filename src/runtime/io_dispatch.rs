@@ -590,6 +590,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
     };
     let stream_tx = scheduler.stream_sender();
     let usage_tx = scheduler.usage_sender();
+    let forensic_sink = scheduler.forensic_sink();
     let cancel = scheduler.cancel_token_or_default(&thread_id);
     Box::pin(async move {
         debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching streaming model call");
@@ -614,7 +615,31 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
         .await
         {
             Ok(resp) => IoResult::ModelCall(Ok(resp)),
-            Err(e) => IoResult::ModelCall(Err(e.to_string())),
+            Err(e) => {
+                // Structured trace + (optional) disk dump on terminal
+                // failure. The structured fields land in `kubectl logs`
+                // immediately; the disk dump preserves the request +
+                // response bytes for offline replay if the operator
+                // wants to reproduce the failure against the provider.
+                let detail = e.provider_detail().cloned().unwrap_or_default();
+                tracing::warn!(
+                    %thread_id,
+                    op_id,
+                    backend = %backend_name,
+                    model = %model_name,
+                    error.code = detail.code.as_deref().unwrap_or(""),
+                    error.kind = detail.kind.as_deref().unwrap_or(""),
+                    error.response_id = detail.response_id.as_deref().unwrap_or(""),
+                    error.message = detail.message.as_deref().unwrap_or(""),
+                    forensic_captured = e.forensic().is_some(),
+                    error = %e,
+                    "model call failed terminally"
+                );
+                forensic_sink
+                    .record_terminal_failure(&thread_id, &backend_name, op_id, &e)
+                    .await;
+                IoResult::ModelCall(Err(e.to_string()))
+            }
         };
         SchedulerCompletion::Io(IoCompletion {
             thread_id,
@@ -702,10 +727,15 @@ async fn stream_with_retry(
                 if e.is_transient() && attempt < MAX_FIRST_EVENT_RETRIES =>
             {
                 let wait = transient_backoff(attempt);
+                let detail = e.provider_detail().cloned().unwrap_or_default();
                 tracing::warn!(
                     %thread_id,
+                    backend = %backend_name,
                     attempt = attempt + 1,
                     wait_ms = wait.as_millis() as u64,
+                    error.code = detail.code.as_deref().unwrap_or(""),
+                    error.kind = detail.kind.as_deref().unwrap_or(""),
+                    error.response_id = detail.response_id.as_deref().unwrap_or(""),
                     error = %e,
                     "transient model-call error on first event; retrying after backoff"
                 );

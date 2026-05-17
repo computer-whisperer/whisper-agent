@@ -121,6 +121,16 @@ struct ServeArgs {
     #[arg(long, default_value = "audit.jsonl")]
     audit_log: PathBuf,
 
+    /// Directory for forensic dumps written when a model-call retry
+    /// budget is exhausted. Each terminal failure produces one JSON
+    /// file containing the request body, the captured response
+    /// excerpt, the parsed provider error detail, and the surrounding
+    /// metadata (backend, model, thread id, timestamp). Pass an empty
+    /// string to disable disk dumps; in-flight failures still get
+    /// structured tracing.
+    #[arg(long, default_value = "forensics")]
+    forensics_dir: PathBuf,
+
     /// Pods root directory. Each pod is a subdirectory containing a
     /// `pod.toml` and a `threads/` folder of per-thread JSON. Pass an
     /// empty string to disable persistence.
@@ -567,6 +577,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         default_host_env,
         default_shared_host_names,
         audit_log_path: args.audit_log,
+        forensics_dir: args.forensics_dir,
         host_id: "default".into(),
         pods_root,
         buckets_root,

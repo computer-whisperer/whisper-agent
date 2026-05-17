@@ -61,6 +61,7 @@ use crate::providers::embedding::EmbeddingProvider;
 use crate::providers::model::ModelProvider;
 use crate::providers::rerank::RerankProvider;
 use crate::runtime::audit::AuditLog;
+use crate::runtime::forensics::ForensicSink;
 use crate::runtime::io_dispatch::{
     self, IoCompletion, KnowledgeAutoqueryCompletion, SchedulerCompletion, SchedulerFuture,
 };
@@ -795,6 +796,12 @@ pub struct Scheduler {
     /// Owns the connection registry, subscription map, audit log, and the
     /// `ThreadEvent → ServerToClient` translation layer.
     router: ThreadEventRouter,
+    /// Disk dump writer for terminal model-call failures (Layer 3 of
+    /// the forensic-logging design). Cheap to clone; io_dispatch's
+    /// `model_call` clones it per dispatch so the dump-to-disk happens
+    /// off the scheduler hot path. Disabled when started with
+    /// `--forensics-dir ""`.
+    forensic_sink: ForensicSink,
 
     /// The registry is the single source of truth for MCP sessions,
     /// tool descriptors, and host-env handles.
@@ -906,6 +913,7 @@ impl Scheduler {
         rerank_providers: HashMap<String, RerankProviderEntry>,
         bucket_registry: BucketRegistry,
         audit: AuditLog,
+        forensic_sink: ForensicSink,
         shared_mcp_catalog: crate::tools::shared_mcp_catalog::CatalogStore,
         shared_mcp_overlays: Vec<SharedHostOverlay>,
         v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
@@ -1014,6 +1022,7 @@ impl Scheduler {
                 tasks: HashMap::new(),
                 cancel_tokens: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
+                forensic_sink,
                 resources,
                 next_op_id: 1,
                 dirty: HashSet::new(),
@@ -1042,6 +1051,14 @@ impl Scheduler {
     /// router.
     pub(crate) fn stream_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
         self.stream_tx.clone()
+    }
+
+    /// Clone of the forensic disk-dump sink. io_dispatch's `model_call`
+    /// grabs one of these per dispatch so the dump-to-disk on terminal
+    /// failure happens on the dispatch future, not the scheduler hot
+    /// path.
+    pub(crate) fn forensic_sink(&self) -> ForensicSink {
+        self.forensic_sink.clone()
     }
 
     /// Clone of the backend-usage sender. Dispatched I/O futures grab

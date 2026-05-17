@@ -121,6 +121,11 @@ pub struct ServerConfig {
     /// Typically every host configured via `shared_mcp_hosts`.
     pub default_shared_host_names: Vec<String>,
     pub audit_log_path: PathBuf,
+    /// Directory for forensic dumps written when a model-call retry
+    /// budget is exhausted (see [`crate::runtime::forensics`]). Empty
+    /// path disables on-disk capture; the structured tracing in
+    /// io_dispatch still fires.
+    pub forensics_dir: PathBuf,
     pub host_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
@@ -187,6 +192,16 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         .with_context(|| format!("open audit log {}", config.audit_log_path.display()))?;
     info!(audit_log = %audit.path().display(), "audit log open");
 
+    // Forensic dumps land here on terminal model-call failures.
+    // `--forensics-dir ""` opts out; structured tracing still fires.
+    let forensic_sink = if config.forensics_dir.as_os_str().is_empty() {
+        info!("forensic dump-to-disk disabled (--forensics-dir was empty)");
+        crate::runtime::forensics::ForensicSink::disabled()
+    } else {
+        info!(forensics_dir = %config.forensics_dir.display(), "forensic dump-to-disk enabled");
+        crate::runtime::forensics::ForensicSink::new(config.forensics_dir.clone())
+    };
+
     // Synthesize the default pod from the server-level config. The actual
     // on-disk pod.toml is materialized below (only when persistence is
     // enabled); the in-memory entry is what the scheduler routes
@@ -243,6 +258,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.rerank_providers,
         bucket_registry,
         audit,
+        forensic_sink,
         config.shared_mcp_catalog,
         config.shared_mcp_overlays,
         live_daemon_registry.clone(),

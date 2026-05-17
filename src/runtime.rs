@@ -9,6 +9,7 @@
 //! log that records every step's decision.
 
 pub mod audit;
+pub mod forensics;
 pub mod io_dispatch;
 pub mod memory_snapshot;
 pub mod scheduler;
