@@ -21,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{ContentBlock, Message, ProviderReplay, ToolResultContent, Usage};
 
 use crate::providers::model::{
-    BoxFuture, BoxStream, CacheBreakpoint, ModelError, ModelEvent, ModelInfo, ModelProvider,
-    ModelRequest, ModelResponse, ToolSpec,
+    BoxFuture, BoxStream, CacheBreakpoint, ForensicBuf, ForensicContext, ModelError, ModelEvent,
+    ModelInfo, ModelProvider, ModelRequest, ModelResponse, ProviderErrorDetail, ToolSpec,
 };
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -63,6 +63,14 @@ impl AnthropicClient {
         cancel: &CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
         let body = build_request_body(req);
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: req.model.to_string(),
+            request_body: body_str.clone(),
+            request_content_type: "application/json",
+        };
         let send = self
             .http
             .post(API_URL)
@@ -70,7 +78,7 @@ impl AnthropicClient {
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("anthropic-beta", EXTENDED_CACHE_BETA)
             .header("content-type", "application/json")
-            .json(&body)
+            .body(body_str)
             .send();
         let resp = tokio::select! {
             r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -82,7 +90,7 @@ impl AnthropicClient {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::api(status.as_u16(), body));
+            return Err(http_error_to_model_error(status.as_u16(), body, forensic));
         }
         let parsed: MessageResponse = tokio::select! {
             r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -109,7 +117,16 @@ impl AnthropicClient {
         body.stream = true;
         let http = self.http.clone();
         let api_key = self.api_key.clone();
+        let model = req.model.to_string();
         Box::pin(try_stream! {
+            let body_str = serde_json::to_string(&body)
+                .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+            let forensic = ForensicContext {
+                backend: PROVIDER_TAG.to_string(),
+                model,
+                request_body: body_str.clone(),
+                request_content_type: "application/json",
+            };
             let send = http
                 .post(API_URL)
                 .header("x-api-key", &api_key)
@@ -117,7 +134,7 @@ impl AnthropicClient {
                 .header("anthropic-beta", EXTENDED_CACHE_BETA)
                 .header("content-type", "application/json")
                 .header("accept", "text/event-stream")
-                .json(&body)
+                .body(body_str)
                 .send();
             let resp: reqwest::Response = tokio::select! {
                 r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
@@ -126,11 +143,12 @@ impl AnthropicClient {
             let status = resp.status();
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
-                Err(ModelError::api(status.as_u16(), err_body))?;
+                Err(http_error_to_model_error(status.as_u16(), err_body, forensic))?;
                 return;
             }
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
+            let mut forensic_buf = ForensicBuf::default();
             let mut state = StreamState::default();
             loop {
                 // Dropping `bytes` when the cancel branch wins aborts
@@ -145,6 +163,7 @@ impl AnthropicClient {
                     _ = cancel.cancelled() => Err(ModelError::Cancelled),
                 };
                 let Some(chunk) = next? else { break };
+                forensic_buf.push(&chunk);
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -156,7 +175,7 @@ impl AnthropicClient {
                         // the stream — the server may add new event types.
                         Err(_) => continue,
                     };
-                    for out in state.consume(ev)? {
+                    for out in state.consume(ev, &forensic, &forensic_buf)? {
                         yield out;
                     }
                     if state.done {
@@ -742,7 +761,12 @@ impl StreamState {
     /// Fold one SSE event into the running state, returning any [`ModelEvent`]s
     /// that should be emitted to the consumer. Most events either yield zero
     /// or one event; `message_stop` yields the terminal `Completed`.
-    fn consume(&mut self, event: AnthropicStreamEvent) -> Result<Vec<ModelEvent>, ModelError> {
+    fn consume(
+        &mut self,
+        event: AnthropicStreamEvent,
+        forensic: &ForensicContext,
+        forensic_buf: &ForensicBuf,
+    ) -> Result<Vec<ModelEvent>, ModelError> {
         let mut out = Vec::new();
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
@@ -923,7 +947,22 @@ impl StreamState {
             }
             AnthropicStreamEvent::Ping | AnthropicStreamEvent::Other => {}
             AnthropicStreamEvent::Error { error } => {
-                Err(ModelError::api(500, error.message))?;
+                let detail = ProviderErrorDetail {
+                    code: error.kind.clone().filter(|s| !s.is_empty()),
+                    kind: None,
+                    response_id: None,
+                    message: Some(error.message.clone()).filter(|s| !s.is_empty()),
+                };
+                let artifact = forensic.clone().into_artifact_with_response(ForensicBuf {
+                    bytes: forensic_buf.bytes.clone(),
+                    truncated: forensic_buf.truncated,
+                });
+                Err(ModelError::Api {
+                    status: 500,
+                    body: error.message,
+                    detail: Some(Box::new(detail)),
+                    forensic: Some(std::sync::Arc::new(artifact)),
+                })?;
             }
         }
         Ok(out)
@@ -994,10 +1033,45 @@ struct MessageDeltaUsage {
     output_tokens: Option<u32>,
 }
 
+/// Parse an HTTP non-2xx response body into a `ModelError::Api`,
+/// mining the standard Anthropic `{"type":"error","error":{"type":...,
+/// "message":...}}` envelope into [`ProviderErrorDetail`] when present
+/// and always attaching the forensic capture. Falls back to all-None
+/// detail when the body isn't JSON or doesn't match the envelope.
+fn http_error_to_model_error(status: u16, body: String, forensic: ForensicContext) -> ModelError {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: AnthropicStreamError,
+    }
+    let detail = serde_json::from_str::<Envelope>(&body)
+        .ok()
+        .map(|env| ProviderErrorDetail {
+            code: env.error.kind.filter(|s| !s.is_empty()),
+            kind: None,
+            response_id: None,
+            message: Some(env.error.message).filter(|s| !s.is_empty()),
+        });
+    let artifact = forensic.into_http_error_artifact(body.as_bytes().to_vec());
+    ModelError::Api {
+        status,
+        body,
+        detail: detail.map(Box::new),
+        forensic: Some(std::sync::Arc::new(artifact)),
+    }
+}
+
 #[derive(Deserialize, Debug)]
 struct AnthropicStreamError {
     #[serde(default)]
     message: String,
+    /// Provider-shaped category: `overloaded_error`,
+    /// `invalid_request_error`, `rate_limit_error`,
+    /// `api_error`, etc. Drives the `code` field of
+    /// [`ProviderErrorDetail`] for Anthropic — the wire calls this
+    /// `type` so we rename, and we expose it as `code` because it's
+    /// the only fine-grained classifier Anthropic ships.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -1435,9 +1509,16 @@ mod tests {
     fn feed_events(events: &[&str]) -> (Vec<ModelEvent>, StreamState) {
         let mut state = StreamState::default();
         let mut out = Vec::new();
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "test".into(),
+            request_body: String::new(),
+            request_content_type: "application/json",
+        };
+        let buf = ForensicBuf::default();
         for ev_json in events {
             let ev: AnthropicStreamEvent = serde_json::from_str(ev_json).unwrap();
-            out.extend(state.consume(ev).unwrap());
+            out.extend(state.consume(ev, &forensic, &buf).unwrap());
         }
         (out, state)
     }
@@ -1631,5 +1712,54 @@ mod tests {
             },
             _ => panic!("expected Completed"),
         }
+    }
+
+    #[test]
+    fn stream_error_event_carries_kind_and_forensic() {
+        // Anthropic mid-stream `error` event with `type=overloaded_error` —
+        // the most common 529-equivalent. Verify `type` lands as
+        // ProviderErrorDetail.code so io_dispatch can grep for overloads.
+        let mut state = StreamState::default();
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "claude-sonnet-4-6".into(),
+            request_body: r#"{"messages":[]}"#.into(),
+            request_content_type: "application/json",
+        };
+        let mut buf = ForensicBuf::default();
+        buf.push(b"event: message_start\ndata: {...}\n\n");
+        let ev: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        )
+        .unwrap();
+        let err = state.consume(ev, &forensic, &buf).unwrap_err();
+        let detail = err.provider_detail().cloned().expect("detail attached");
+        assert_eq!(detail.code.as_deref(), Some("overloaded_error"));
+        assert_eq!(detail.message.as_deref(), Some("Overloaded"));
+        let artifact = err.forensic().expect("artifact attached");
+        assert_eq!(artifact.request_body, r#"{"messages":[]}"#);
+        assert!(
+            std::str::from_utf8(&artifact.response_excerpt)
+                .unwrap()
+                .contains("message_start")
+        );
+    }
+
+    #[test]
+    fn http_error_envelope_extracts_error_type_as_code() {
+        // Standard Anthropic HTTP 4xx body shape.
+        let body =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#;
+        let ctx = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "claude-sonnet-4-6".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err = http_error_to_model_error(400, body.to_string(), ctx);
+        let detail = err.provider_detail().cloned().expect("detail extracted");
+        assert_eq!(detail.code.as_deref(), Some("invalid_request_error"));
+        assert_eq!(detail.message.as_deref(), Some("bad input"));
+        assert!(err.forensic().is_some());
     }
 }
