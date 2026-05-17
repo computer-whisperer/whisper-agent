@@ -6924,7 +6924,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "ahash",
  "anyhow",
@@ -6977,7 +6977,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-aetna-ui"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "aetna-core",
  "aetna-markdown",
@@ -7008,7 +7008,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-auth"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7025,7 +7025,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-desktop-aetna"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "aetna-core",
  "aetna-winit-wgpu",
@@ -7046,7 +7046,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-host-daemon"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "axum",
@@ -7080,7 +7080,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-host-proto"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "ciborium",
  "serde",
@@ -7090,7 +7090,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-fetch"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "axum",
@@ -7110,7 +7110,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-host"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -7135,7 +7135,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-imagegen"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7158,7 +7158,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-proto"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "serde",
  "serde_json",
@@ -7166,7 +7166,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-mcp-search"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "anyhow",
  "axum",
@@ -7185,7 +7185,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-protocol"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -7196,7 +7196,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-agent-worker-proto"
-version = "0.3.21"
+version = "0.3.22"
 dependencies = [
  "ciborium",
  "serde",
