@@ -62,7 +62,15 @@ NoNewPrivileges=yes
 # `allowed_paths` — is what actually scopes the child's reach. Having
 # systemd blanket-deny /home at the daemon level would prevent the
 # very resolution the child needs to perform.
-ProtectSystem=strict
+#
+# ProtectSystem=full (not strict): /usr, /boot, /efi, /etc stay
+# read-only — but /tmp, /home, /var, and the rest of the tree stay
+# writable so pod host_env bindings like `/tmp:rw` or
+# `/home/<user>/workspace:rw` can actually be written through after
+# landlock scopes them per-worker. `strict` would mount the entire
+# hierarchy read-only and any such binding would EROFS at the mount
+# layer before landlock ever sees the call.
+ProtectSystem=full
 ReadWritePaths=/var/lib/whisper-agent
 
 # Kernel surface: nothing the daemon needs.
