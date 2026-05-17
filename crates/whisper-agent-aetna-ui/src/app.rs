@@ -3162,6 +3162,18 @@ impl ChatApp {
                     .insert(snapshot.pod_id.clone(), snapshot.config.clone());
                 self.pending_pod_config_gets.remove(&snapshot.pod_id);
 
+                // Prefetch models for the snapshot's default backend
+                // so the new-thread model dropdown is populated before
+                // the user opens it. The model picker is live against
+                // `effective_backend()`, which falls through to the
+                // pod default when no override is picked — without
+                // this, the dropdown would race the `ListModels`
+                // round-trip and render empty on first open.
+                let default_backend = snapshot.config.thread_defaults.backend.clone();
+                if !default_backend.is_empty() {
+                    self.ensure_models_requested(&default_backend);
+                }
+
                 if let Some(editor) = self.pod_editor.as_mut()
                     && editor.pending_get.as_ref() == correlation_id.as_ref()
                     && editor.pod_id == snapshot.pod_id
@@ -5072,9 +5084,12 @@ impl App for ChatApp {
         // "+ New thread" entry point: clear the selection so the
         // new-thread pane renders. The active sidebar pod tab is the
         // source of truth for which pod the next `CreateThread` lands
-        // in — no separate seed needed.
+        // in — no separate seed needed. Prime the pod config so the
+        // Backend / Model triggers can show the pod's actual defaults
+        // on first paint (rather than a transient "loading…" label).
         if event.is_click_or_activate(SIDEBAR_NEW_THREAD_KEY) {
             self.selected = None;
+            self.ensure_pod_config_for_picker();
             return;
         }
 
@@ -8211,6 +8226,12 @@ impl ChatApp {
             SelectAction::Toggle => {
                 self.close_other_pickers(PICKER_BACKEND);
                 self.picker_backend_open = !self.picker_backend_open;
+                // The "Inherit pod default ({name})" menu row depends
+                // on the pod config being cached. Fetch it if we
+                // haven't already so the label resolves on first open.
+                if self.picker_backend_open {
+                    self.ensure_pod_config_for_picker();
+                }
             }
             SelectAction::Dismiss => self.picker_backend_open = false,
             SelectAction::Pick(value) => {
@@ -8242,6 +8263,16 @@ impl ChatApp {
             SelectAction::Toggle => {
                 self.close_other_pickers(PICKER_MODEL);
                 self.picker_model_open = !self.picker_model_open;
+                // The model menu is live against the effective backend
+                // — picker override or pod default — so make sure both
+                // the pod config (for the default) and the backend's
+                // models are loaded before the popover paints.
+                if self.picker_model_open {
+                    self.ensure_pod_config_for_picker();
+                    if let Some(backend) = self.effective_backend().map(str::to_owned) {
+                        self.ensure_models_requested(&backend);
+                    }
+                }
             }
             SelectAction::Dismiss => self.picker_model_open = false,
             SelectAction::Pick(value) => {
@@ -9888,12 +9919,23 @@ impl ChatApp {
         let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
         let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
 
+        // Show the pod's actual configured defaults in the inherit
+        // label so the user can see what value they'd get without
+        // overriding; falls back to the generic placeholder when the
+        // pod config hasn't loaded yet.
+        let pod_defaults = self.picker_pod_config().map(|c| &c.thread_defaults);
+        let max_tokens_label = pod_defaults
+            .map(|d| format!("Inherits pod default: {}", d.max_tokens))
+            .unwrap_or_else(|| "(inherit pod default)".to_string());
+        let max_turns_label = pod_defaults
+            .map(|d| format!("Inherits pod default: {}", d.max_turns))
+            .unwrap_or_else(|| "(inherit pod default)".to_string());
         let max_tokens_row = self.render_optional_numeric_row(
             self.new_thread_max_tokens.is_some(),
             NEW_THREAD_MAX_TOKENS_OVERRIDE_KEY,
             NEW_THREAD_MAX_TOKENS_KEY,
             &self.new_thread_max_tokens_buf,
-            "(inherit pod default)",
+            &max_tokens_label,
             NumericInputOpts::default()
                 .min(1.0)
                 .max(200_000.0)
@@ -9904,7 +9946,7 @@ impl ChatApp {
             NEW_THREAD_MAX_TURNS_OVERRIDE_KEY,
             NEW_THREAD_MAX_TURNS_KEY,
             &self.new_thread_max_turns_buf,
-            "(inherit pod default)",
+            &max_turns_label,
             NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
         );
 
@@ -10975,16 +11017,59 @@ impl ChatApp {
             .collect()
     }
 
-    fn backend_label(&self) -> String {
+    /// Pod's configured default backend for new threads, or `None`
+    /// when the picker-targeted pod's config hasn't been fetched yet.
+    /// Sourced from [`PodConfig::thread_defaults`], which the server
+    /// uses when a `CreateThread` doesn't override the binding.
+    fn pod_default_backend(&self) -> Option<&str> {
+        self.picker_pod_config()
+            .map(|c| c.thread_defaults.backend.as_str())
+    }
+
+    /// Pod's configured default model id for new threads, or `None`
+    /// when the pod config hasn't loaded. The trigger labels show this
+    /// directly rather than the placeholder "inherit pod default" so
+    /// the user can see what they're getting without opening the menu.
+    fn pod_default_model(&self) -> Option<&str> {
+        self.picker_pod_config()
+            .map(|c| c.thread_defaults.model.as_str())
+    }
+
+    /// Backend the next `CreateThread` would actually run against: the
+    /// user's picker override if set, otherwise the active pod's
+    /// `thread_defaults.backend`. Lets the model picker stay live even
+    /// when the user hasn't explicitly picked a backend.
+    fn effective_backend(&self) -> Option<&str> {
         self.picker_backend
-            .clone()
-            .unwrap_or_else(|| "inherit pod default".to_string())
+            .as_deref()
+            .or_else(|| self.pod_default_backend())
+    }
+
+    fn backend_label(&self) -> String {
+        if let Some(b) = self.picker_backend.as_deref() {
+            return b.to_string();
+        }
+        match self.pod_default_backend() {
+            Some(b) => b.to_string(),
+            None => "loading pod default…".to_string(),
+        }
     }
 
     fn backend_hint(&self) -> String {
-        match self.backends.len() {
-            0 => "loading backends…".to_string(),
-            n => format!("{n} backend{} configured", if n == 1 { "" } else { "s" }),
+        if self.backends.is_empty() {
+            return "loading backends…".to_string();
+        }
+        let Some(pod_default) = self.pod_default_backend() else {
+            return format!(
+                "{} backend{} configured",
+                self.backends.len(),
+                if self.backends.len() == 1 { "" } else { "s" },
+            );
+        };
+        match self.picker_backend.as_deref() {
+            None => "using pod default".to_string(),
+            Some(b) if b == pod_default => "matches pod default".to_string(),
+            Some(_) => format!("overrides pod default ({pod_default})"),
         }
     }
 
@@ -10992,17 +11077,20 @@ impl ChatApp {
         if let Some(m) = self.picker_model.as_deref() {
             return m.to_string();
         }
-        // Mirror `build_creation_request` so the trigger reflects
-        // exactly what the server would resolve if the user hit
-        // Start now — no surprises after submit.
-        if let Some(b) = self.picker_backend.as_ref() {
+        // When the user picked a backend (and thus an override), mirror
+        // `build_creation_request`'s fallback chain so the trigger
+        // reflects what the server would actually resolve. When the
+        // user didn't pick a backend, use the pod's own configured
+        // `thread_defaults.model` — that's the authoritative value the
+        // server falls back to when no model override is sent.
+        if let Some(b) = self.picker_backend.as_deref() {
             if let Some(default) = self
                 .backends
                 .iter()
-                .find(|bs| &bs.name == b)
+                .find(|bs| bs.name == b)
                 .and_then(|bs| bs.default_model.clone())
             {
-                return format!("{default}  (backend default)");
+                return default;
             }
             if let Some(first) = self
                 .models_by_backend
@@ -11010,23 +11098,38 @@ impl ChatApp {
                 .and_then(|list| list.first())
                 .map(|m| m.id.clone())
             {
-                return format!("{first}  (first available)");
+                return first;
             }
+            return "loading models…".to_string();
         }
-        "auto (backend default)".to_string()
+        match self.pod_default_model() {
+            Some(m) => m.to_string(),
+            None => "loading pod default…".to_string(),
+        }
     }
 
     fn model_hint(&self) -> String {
-        let Some(b) = self.picker_backend.as_ref() else {
-            return "pick a backend first to load its models".to_string();
+        let Some(b) = self.effective_backend() else {
+            return "loading pod default…".to_string();
         };
+        let inheriting = self.picker_model.is_none() && self.picker_backend.is_none();
         match self.models_by_backend.get(b) {
+            None if inheriting => "using pod default".to_string(),
             None => "loading models…".to_string(),
-            Some(list) => format!(
-                "{} model{} available",
-                list.len(),
-                if list.len() == 1 { "" } else { "s" }
-            ),
+            Some(list) => {
+                let count = format!(
+                    "{} model{} available",
+                    list.len(),
+                    if list.len() == 1 { "" } else { "s" }
+                );
+                if inheriting {
+                    format!("using pod default · {count}")
+                } else if self.picker_model.is_none() {
+                    format!("using {b} default · {count}")
+                } else {
+                    count
+                }
+            }
         }
     }
 
@@ -20318,10 +20421,11 @@ impl ChatApp {
     }
 
     fn backend_menu(&self) -> El {
-        let mut options: Vec<(String, String)> = vec![(
-            PICKER_INHERIT.to_string(),
-            "Inherit pod default".to_string(),
-        )];
+        let inherit_label = match self.pod_default_backend() {
+            Some(default) => format!("Inherit pod default ({default})"),
+            None => "Inherit pod default".to_string(),
+        };
+        let mut options: Vec<(String, String)> = vec![(PICKER_INHERIT.to_string(), inherit_label)];
         for b in &self.backends {
             // `kind` (e.g. "anthropic" / "openai_chat") is useful
             // context — surface it after the alias so the option
@@ -20332,11 +20436,33 @@ impl ChatApp {
     }
 
     fn model_menu(&self) -> El {
-        let mut options: Vec<(String, String)> = vec![(
-            PICKER_INHERIT.to_string(),
-            "Auto (backend default)".to_string(),
-        )];
-        if let Some(b) = self.picker_backend.as_ref()
+        // The "Auto" sentinel resolves against the *effective* backend
+        // — picker override if set, else pod default — so we annotate
+        // it with whichever default the server would actually pick.
+        let auto_default = self.effective_backend().and_then(|b| {
+            if self.picker_backend.is_none() {
+                // No backend override → server uses pod's configured
+                // model directly.
+                self.pod_default_model().map(str::to_owned)
+            } else {
+                self.backends
+                    .iter()
+                    .find(|bs| bs.name == b)
+                    .and_then(|bs| bs.default_model.clone())
+                    .or_else(|| {
+                        self.models_by_backend
+                            .get(b)
+                            .and_then(|list| list.first())
+                            .map(|m| m.id.clone())
+                    })
+            }
+        });
+        let auto_label = match auto_default {
+            Some(id) => format!("Auto (default: {id})"),
+            None => "Auto (backend default)".to_string(),
+        };
+        let mut options: Vec<(String, String)> = vec![(PICKER_INHERIT.to_string(), auto_label)];
+        if let Some(b) = self.effective_backend()
             && let Some(list) = self.models_by_backend.get(b)
         {
             for m in list {
