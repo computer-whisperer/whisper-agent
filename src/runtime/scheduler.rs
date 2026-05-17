@@ -1241,11 +1241,12 @@ impl Scheduler {
                 name,
                 workspace_root,
                 runas,
+                options,
             } = binding
             else {
                 continue;
             };
-            if workspace_root.is_none() && runas.is_none() {
+            if workspace_root.is_none() && runas.is_none() && options.is_empty() {
                 continue;
             }
             self.v2_contexts.set(
@@ -1254,6 +1255,7 @@ impl Scheduler {
                 whisper_agent_host_proto::ThreadContext {
                     workspace_root: workspace_root.clone(),
                     runas: runas.clone(),
+                    options: options.clone(),
                     ..whisper_agent_host_proto::ThreadContext::default()
                 },
             );
@@ -2914,10 +2916,20 @@ impl Scheduler {
                                     rebound_to = %name,
                                     "migrating Inline host_env binding to Named reference",
                                 );
+                                let options = self
+                                    .pods
+                                    .get(&task.pod_id)
+                                    .map(|pod| {
+                                        crate::runtime::scheduler::bindings::default_options_for(
+                                            pod, &name,
+                                        )
+                                    })
+                                    .unwrap_or_default();
                                 migrated.push(HostEnvBinding::Named {
                                     name,
                                     workspace_root,
                                     runas,
+                                    options,
                                 });
                                 bindings_dirty = true;
                             }
@@ -2934,6 +2946,7 @@ impl Scheduler {
                         name,
                         workspace_root,
                         runas,
+                        options,
                     } => {
                         // Persisted thread.json files predating the
                         // workspace_root or runas fields deserialize with
@@ -2961,10 +2974,19 @@ impl Scheduler {
                         if runas_was_none && filled_runas.is_some() {
                             bindings_dirty = true;
                         }
+                        let mut filled_options = self
+                            .pods
+                            .get(&task.pod_id)
+                            .map(|pod| {
+                                crate::runtime::scheduler::bindings::default_options_for(pod, &name)
+                            })
+                            .unwrap_or_default();
+                        filled_options.extend(options);
                         migrated.push(HostEnvBinding::Named {
                             name,
                             workspace_root: filled_ws,
                             runas: filled_runas,
+                            options: filled_options,
                         });
                     }
                 }
@@ -3006,6 +3028,9 @@ impl Scheduler {
                                 pod, name,
                             ),
                         runas: crate::runtime::scheduler::bindings::default_runas_for(pod, name),
+                        options: crate::runtime::scheduler::bindings::default_options_for(
+                            pod, name,
+                        ),
                     })
                     .collect();
                 warn!(
@@ -3580,6 +3605,7 @@ impl Scheduler {
                         name,
                         workspace_root,
                         runas: _,
+                        ..
                     } => Some(crate::runtime::memory_snapshot::HostEnvInfo {
                         name: name.as_str(),
                         workspace_root: workspace_root.as_deref(),

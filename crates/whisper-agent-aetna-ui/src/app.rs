@@ -1997,6 +1997,7 @@ impl HostEnvEntryEditorState {
                 },
                 allow_runas: Vec::new(),
                 default_runas: None,
+                options: Default::default(),
             },
             error: None,
             limits_cpus_buf: String::new(),
@@ -3978,6 +3979,7 @@ impl ChatApp {
                             name,
                             workspace_root,
                             runas: _,
+                            ..
                         } => match workspace_root {
                             Some(p) => format!("{name} (cwd: {})", p.display()),
                             None => name.clone(),
@@ -7537,6 +7539,7 @@ impl ChatApp {
                             name: entry.name.clone(),
                             workspace_root,
                             runas,
+                            options: Default::default(),
                         }
                     })
                     .collect(),
@@ -7658,6 +7661,8 @@ impl ChatApp {
         match &spec.kind {
             TunableKind::Bool { default } => TunableValue::Bool(*default),
             TunableKind::Enum { default, .. } => TunableValue::Enum(default.clone()),
+            TunableKind::String { default } => TunableValue::String(default.clone()),
+            TunableKind::Int { default, .. } => TunableValue::Int(*default),
         }
     }
 
@@ -8223,6 +8228,7 @@ impl ChatApp {
                         return true;
                     }
                 }
+                TunableKind::String { .. } | TunableKind::Int { .. } => {}
             }
         }
         false
@@ -10711,6 +10717,8 @@ impl ChatApp {
                     .collect();
                 toggle_group(key.clone(), &current, options)
             }
+            TunableKind::String { default } => text(format!("{}", default)).muted().small(),
+            TunableKind::Int { default, .. } => text(format!("{}", default)).muted().small(),
         };
         let mut item = vec![form_label(label), form_control(control)];
         if let Some(desc) = spec.description.as_deref() {

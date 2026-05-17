@@ -41,6 +41,7 @@ pub fn build_default_pod_config(
                 spec,
                 allow_runas: Vec::new(),
                 default_runas: None,
+                options: Default::default(),
             }],
             vec![HOST_ENV_NAME.to_string()],
         ),

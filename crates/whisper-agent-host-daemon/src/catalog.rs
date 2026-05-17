@@ -15,6 +15,7 @@
 //! not on the hot path; if the worker can't be spawned, daemon
 //! startup fails loudly — which is what we want.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use tracing::{debug, info};
@@ -68,6 +69,8 @@ pub async fn probe_tool_catalog(
         Some(Path::new(probe_workspace)),
         None,
         None,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
     )
     .await?;
     info!(count = worker.tools.len(), "probed worker tool catalog");

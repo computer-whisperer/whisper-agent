@@ -542,12 +542,16 @@ fn spawn_open_session(
         let workspace_root_override = context.workspace_root.clone();
         let runas_override = context.runas.clone();
         let bash_timeout_secs = context.bash_timeout_secs;
+        let env = context.env.clone();
+        let options = context.options.clone();
         let result = worker::spawn(
             &spec,
             &runtime.mcp_host_bin,
             workspace_root_override.as_deref(),
             runas_override.as_deref(),
             bash_timeout_secs,
+            &env,
+            &options,
         )
         .await
         .map(|w| Session {

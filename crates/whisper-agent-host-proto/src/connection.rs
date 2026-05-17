@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::call::ToolDescriptor;
+use whisper_agent_protocol::ConfigurableSpec;
 
 /// Daemon-advertised capabilities, sent in [`crate::Frame::Hello`].
 ///
@@ -36,6 +37,33 @@ pub struct DaemonCapabilities {
     /// `true`, the scheduler hides background-mode tools from threads
     /// bound to this daemon.
     pub supports_background_tasks: bool,
+
+    /// Provider-specific session options this daemon understands. The
+    /// scheduler and UI treat these as generic configurable controls;
+    /// selected values ride [`crate::ThreadContext::options`] at
+    /// `OpenSession` time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_configurables: Vec<SessionConfigurableSpec>,
+}
+
+/// Lifecycle for a daemon-advertised session configurable.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConfigurableLifecycle {
+    /// The option is consumed while spawning/provisioning the worker;
+    /// changing it on a live session requires reprovisioning.
+    SpawnOnly,
+    /// The option can be applied to subsequent tool calls via
+    /// [`crate::Frame::UpdateSession`].
+    LiveUpdate,
+}
+
+/// One daemon-advertised per-session configurable.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SessionConfigurableSpec {
+    #[serde(flatten)]
+    pub spec: ConfigurableSpec,
+    pub lifecycle: SessionConfigurableLifecycle,
 }
 
 /// The discriminator on [`crate::HostEnvSpec`]. Daemons advertise the
@@ -104,6 +132,7 @@ mod tests {
             spec_kinds: vec![HostEnvSpecKind::Landlock],
             max_concurrent_sessions: None,
             supports_background_tasks: false,
+            session_configurables: Vec::new(),
         });
     }
 
@@ -119,6 +148,7 @@ mod tests {
             spec_kinds: vec![HostEnvSpecKind::Landlock, HostEnvSpecKind::Container],
             max_concurrent_sessions: Some(16),
             supports_background_tasks: true,
+            session_configurables: Vec::new(),
         });
     }
 

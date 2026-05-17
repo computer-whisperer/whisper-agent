@@ -305,6 +305,7 @@ impl BehaviorBindingsOverride {
                         name: name.clone(),
                         workspace_root: None,
                         runas: None,
+                        options: Default::default(),
                     })
                     .collect()
             }),

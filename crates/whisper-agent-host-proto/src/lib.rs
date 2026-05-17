@@ -315,6 +315,7 @@ mod tests {
                 spec_kinds: vec![HostEnvSpecKind::Landlock],
                 max_concurrent_sessions: Some(8),
                 supports_background_tasks: true,
+                session_configurables: Vec::new(),
             },
         });
     }

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use whisper_agent_protocol::ConfigurableValue;
 
 /// Session identifier. Scheduler-assigned (typically a UUID rendered
 /// as a string) — daemons never invent one. The scheduler is the
@@ -94,6 +95,13 @@ pub struct ThreadContext {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 
+    /// Provider-specific session options advertised by the daemon via
+    /// `DaemonCapabilities.session_configurables`. The daemon interprets
+    /// only keys it advertised; the scheduler stores and forwards the map
+    /// generically so new provider knobs do not need new protocol fields.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, ConfigurableValue>,
+
     /// Drop to this user before exec in bash. `None` ⇒ daemon's uid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runas: Option<String>,
@@ -155,6 +163,16 @@ impl ThreadContext {
                 delta.env_unset.insert(k.clone());
             }
         }
+        for (k, v) in &new.options {
+            if self.options.get(k) != Some(v) {
+                delta.option_set.insert(k.clone(), v.clone());
+            }
+        }
+        for k in self.options.keys() {
+            if !new.options.contains_key(k) {
+                delta.option_unset.insert(k.clone());
+            }
+        }
         if self.runas != new.runas {
             delta.runas = Some(new.runas.clone());
         }
@@ -185,6 +203,12 @@ impl ThreadContext {
         for (k, v) in &delta.env_set {
             self.env.insert(k.clone(), v.clone());
         }
+        for k in &delta.option_unset {
+            self.options.remove(k);
+        }
+        for (k, v) in &delta.option_set {
+            self.options.insert(k.clone(), v.clone());
+        }
         if let Some(r) = &delta.runas {
             self.runas = r.clone();
         }
@@ -205,6 +229,8 @@ impl ThreadContext {
         delta.workspace_root.is_none()
             && delta.env_set.is_empty()
             && delta.env_unset.is_empty()
+            && delta.option_set.is_empty()
+            && delta.option_unset.is_empty()
             && delta.runas.is_none()
             && delta.tool_denylist.is_none()
             && delta.bash_timeout_secs.is_none()
@@ -240,6 +266,14 @@ pub struct ThreadContextDelta {
     /// Environment names to remove.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub env_unset: BTreeSet<String>,
+
+    /// Provider option additions / overrides. Merged on top of existing
+    /// `options`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub option_set: BTreeMap<String, ConfigurableValue>,
+    /// Provider option names to remove.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub option_unset: BTreeSet<String>,
 
     #[serde(
         default,
@@ -315,6 +349,10 @@ mod tests {
                 ("PATH".into(), "/usr/bin".into()),
                 ("HOME".into(), "/home/me".into()),
             ]),
+            options: BTreeMap::from([(
+                "user_env".into(),
+                ConfigurableValue::Enum("runas_basic".into()),
+            )]),
             runas: Some("worker".into()),
             tool_denylist: BTreeSet::from(["view_pdf".into(), "view_image".into()]),
             bash_timeout_secs: Some(120),
@@ -472,6 +510,7 @@ mod tests {
             bash_timeout_secs: Some(120),
             workspace_root: Some(PathBuf::from("/work")),
             output_byte_cap: Some(1024),
+            ..ThreadContext::default()
         };
         let delta = a.diff_to(&b);
         let mut applied = a.clone();

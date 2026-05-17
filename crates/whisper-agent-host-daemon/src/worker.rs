@@ -22,7 +22,7 @@
 //! "first inheritable extra FD" — the launcher contract is what
 //! makes it 3, both sides hard-code that.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +35,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{info, warn};
+use whisper_agent_protocol::ConfigurableValue;
 use whisper_agent_protocol::sandbox::{AccessMode, HostEnvSpec, NetworkPolicy, PathAccess};
 use whisper_agent_worker_proto::{
     CallId, CallToolResult, ContentBlock, PROTOCOL_VERSION as WORKER_PROTOCOL_VERSION,
@@ -220,6 +221,8 @@ pub async fn spawn(
     workspace_root_override: Option<&Path>,
     runas: Option<&str>,
     bash_timeout_secs: Option<u32>,
+    env: &BTreeMap<String, String>,
+    options: &BTreeMap<String, ConfigurableValue>,
 ) -> Result<Worker, WorkerError> {
     match spec {
         HostEnvSpec::Landlock {
@@ -233,6 +236,8 @@ pub async fn spawn(
                 workspace_root_override,
                 runas,
                 bash_timeout_secs,
+                env,
+                options,
             )
             .await
         }
@@ -272,6 +277,45 @@ pub(crate) fn resolve_workspace_root(
     }
 }
 
+fn worker_env_overrides(
+    runas_id: Option<&crate::runas::UserIdentity>,
+    env: &BTreeMap<String, String>,
+    options: &BTreeMap<String, ConfigurableValue>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+
+    if let Some(ConfigurableValue::Enum(mode)) = options.get("user_env") {
+        if matches!(mode.as_str(), "runas_basic" | "runas_desktop")
+            && let Some(id) = runas_id
+        {
+            out.insert("HOME".into(), id.home.clone());
+            out.insert("USER".into(), id.name.clone());
+            out.insert("LOGNAME".into(), id.name.clone());
+            out.insert("XDG_CONFIG_HOME".into(), format!("{}/.config", id.home));
+            out.insert("XDG_DATA_HOME".into(), format!("{}/.local/share", id.home));
+            out.insert("XDG_CACHE_HOME".into(), format!("{}/.cache", id.home));
+
+            if mode == "runas_desktop" {
+                let runtime_dir = format!("/run/user/{}", id.uid);
+                if std::path::Path::new(&runtime_dir).exists() {
+                    out.insert("XDG_RUNTIME_DIR".into(), runtime_dir.clone());
+                    let bus = format!("{runtime_dir}/bus");
+                    if std::path::Path::new(&bus).exists() {
+                        out.insert(
+                            "DBUS_SESSION_BUS_ADDRESS".into(),
+                            format!("unix:path={bus}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Explicit context env always wins over synthesized provider defaults.
+    out.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    out
+}
+
 /// Resolve `mcp_host_bin` to an absolute path and return its parent.
 /// The parent directory needs read+execute access in the landlock
 /// ruleset so the binary can be loaded after exec.
@@ -300,6 +344,8 @@ async fn spawn_landlock(
     workspace_root_override: Option<&Path>,
     runas: Option<&str>,
     bash_timeout_secs: Option<u32>,
+    env: &BTreeMap<String, String>,
+    options: &BTreeMap<String, ConfigurableValue>,
 ) -> Result<Worker, WorkerError> {
     let workspace_root_path = resolve_workspace_root(allowed_paths, workspace_root_override)?;
     let workspace_root = workspace_root_path.to_string_lossy().into_owned();
@@ -323,21 +369,19 @@ async fn spawn_landlock(
     // `setgroups()` requires CAP_SETGID even when the resulting group
     // list matches the current one. An unprivileged per-user daemon
     // selecting its own user would otherwise fail to spawn.
-    let runas_id = match runas {
-        Some(name) => {
-            let id = crate::runas::lookup(name)
-                .map_err(|e| WorkerError::PreExec(format!("resolving runas `{name}`: {e}")))?;
-            // SAFETY: `geteuid` is async-signal-safe and has no
-            // observable side effects.
-            let current_uid = unsafe { libc::geteuid() };
-            if id.uid == current_uid {
-                None
-            } else {
-                Some(id)
-            }
-        }
+    let env_runas_id = match runas {
+        Some(name) => Some(
+            crate::runas::lookup(name)
+                .map_err(|e| WorkerError::PreExec(format!("resolving runas `{name}`: {e}")))?,
+        ),
         None => None,
     };
+    // SAFETY: `geteuid` is async-signal-safe and has no observable side effects.
+    let current_uid = unsafe { libc::geteuid() };
+    let runas_id = env_runas_id
+        .as_ref()
+        .filter(|id| id.uid != current_uid)
+        .cloned();
 
     info!(
         %workspace_root,
@@ -346,6 +390,8 @@ async fn spawn_landlock(
         runas = ?runas,
         "spawning landlock-sandboxed worker"
     );
+
+    let worker_env = worker_env_overrides(env_runas_id.as_ref(), env, options);
 
     let allowed_paths_owned: Vec<PathAccess> = allowed_paths.to_vec();
     let network_owned = network.clone();
@@ -369,6 +415,7 @@ async fn spawn_landlock(
     // pipe.
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
+    cmd.envs(worker_env);
     cmd.kill_on_drop(true);
 
     // SAFETY: `pre_exec` runs in the forked child between fork and
@@ -967,6 +1014,8 @@ mod tests {
             Some(Path::new("/tmp")),
             Some("definitely_not_a_real_user_zzz_9217"),
             None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .await;
         // Worker isn't Debug, so we can't use unwrap_err; map manually.

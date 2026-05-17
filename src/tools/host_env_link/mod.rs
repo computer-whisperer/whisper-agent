@@ -35,7 +35,7 @@ use whisper_agent_host_proto::{
     CallId, CallToolResult, ContentBlock, DaemonCapabilities, GoodbyeReason, HostEnvSpec,
     HostEnvSpecKind, ProvisionPhase, SessionId, ThreadContext,
 };
-use whisper_agent_protocol::HostEnvDaemonSummary;
+use whisper_agent_protocol::{HostEnvConfigurableSummary, HostEnvDaemonSummary};
 
 pub use auth::{AdmittedDaemon, DaemonAuthState};
 pub use endpoint::link_handler;
@@ -207,6 +207,16 @@ impl LiveDaemonRegistry {
                             supports_background_tasks: handle
                                 .capabilities
                                 .supports_background_tasks,
+                            session_configurables: handle
+                                .capabilities
+                                .session_configurables
+                                .iter()
+                                .map(|c| HostEnvConfigurableSummary {
+                                    spec: c.spec.clone(),
+                                    lifecycle: session_configurable_lifecycle_label(c.lifecycle)
+                                        .into(),
+                                })
+                                .collect(),
                             last_active_ms_ago: Some(
                                 (now_ms - handle.last_active_at_ms.load(Ordering::Acquire)).max(0)
                                     as u64,
@@ -223,6 +233,7 @@ impl LiveDaemonRegistry {
                         tools: Vec::new(),
                         max_concurrent_sessions: None,
                         supports_background_tasks: false,
+                        session_configurables: Vec::new(),
                         last_active_ms_ago: None,
                     },
                 }
@@ -368,6 +379,15 @@ pub(super) fn unix_millis_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn session_configurable_lifecycle_label(
+    lifecycle: whisper_agent_host_proto::SessionConfigurableLifecycle,
+) -> &'static str {
+    match lifecycle {
+        whisper_agent_host_proto::SessionConfigurableLifecycle::SpawnOnly => "spawn_only",
+        whisper_agent_host_proto::SessionConfigurableLifecycle::LiveUpdate => "live_update",
+    }
 }
 
 fn host_env_spec_kind_label(kind: &HostEnvSpecKind) -> String {

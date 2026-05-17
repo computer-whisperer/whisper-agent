@@ -14,7 +14,10 @@ use rand::RngExt;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use whisper_agent_host_daemon::{ConnectError, catalog, config::DaemonConfig, connection};
-use whisper_agent_host_proto::{DaemonCapabilities, HostEnvSpecKind};
+use whisper_agent_host_proto::{
+    DaemonCapabilities, HostEnvSpecKind, SessionConfigurableLifecycle, SessionConfigurableSpec,
+};
+use whisper_agent_protocol::{ConfigurableEnumVariant, ConfigurableKind, ConfigurableSpec};
 
 /// Default location of the daemon's TOML config — matches the
 /// existing `host-daemon.env` location used by the AUR systemd unit.
@@ -122,6 +125,38 @@ async fn main() -> anyhow::Result<()> {
         spec_kinds: vec![HostEnvSpecKind::Landlock],
         max_concurrent_sessions: None,
         supports_background_tasks: false,
+        session_configurables: vec![SessionConfigurableSpec {
+            spec: ConfigurableSpec {
+                key: "user_env".into(),
+                label: Some("User environment".into()),
+                description: Some(
+                    "Populate HOME/USER/XDG variables from the selected runas user; \
+                     desktop mode also exposes XDG_RUNTIME_DIR and DBus when present."
+                        .into(),
+                ),
+                kind: ConfigurableKind::Enum {
+                    default: "none".into(),
+                    variants: vec![
+                        ConfigurableEnumVariant {
+                            value: "none".into(),
+                            label: Some("Minimal daemon environment".into()),
+                            description: Some("Inherit only the daemon service environment.".into()),
+                        },
+                        ConfigurableEnumVariant {
+                            value: "runas_basic".into(),
+                            label: Some("Basic runas environment".into()),
+                            description: Some("Set HOME, USER, LOGNAME, and XDG config/data/cache paths from runas.".into()),
+                        },
+                        ConfigurableEnumVariant {
+                            value: "runas_desktop".into(),
+                            label: Some("Desktop runas environment".into()),
+                            description: Some("Basic runas env plus XDG_RUNTIME_DIR and DBus session bus when available.".into()),
+                        },
+                    ],
+                },
+            },
+            lifecycle: SessionConfigurableLifecycle::SpawnOnly,
+        }],
     };
 
     // Load the daemon TOML config. The default path is treated as

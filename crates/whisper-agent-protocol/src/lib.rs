@@ -80,20 +80,20 @@ impl Usage {
     }
 }
 
-/// Schema for one backend-specific knob a model exposes. Backends advertise
-/// these via `ModelInfo.tunables` (per-model), and the UI renders matching
-/// controls in the thread-creation flow. Values land back on
-/// [`ThreadConfig::tunables`] keyed by [`TunableSpec::key`] and ride every
-/// model call as part of [`crate::ModelRequest`]; each provider only
-/// interprets keys it advertised, ignoring the rest.
+/// Schema for one provider-advertised configurable knob. Backends use
+/// this as model [`TunableSpec`]s; host-env daemons use it for per-session
+/// options. Values are stored in a generic [`ConfigurableValue`] map keyed by
+/// [`ConfigurableSpec::key`]. Each provider/daemon only interprets keys it
+/// advertised, ignoring the rest so the wire stays stable as new knobs land.
 ///
 /// `kind` carries both the value shape and the default — separating "what
 /// this control is" from "what value to seed it with." Adding new shapes
-/// (Int, Float, String) later just extends the [`TunableKind`] enum.
+/// later extends [`ConfigurableKind`] without changing callers that only pass
+/// values through.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct TunableSpec {
-    /// Stable identifier used as the key in [`ThreadConfig::tunables`].
-    /// Backends must keep this stable across versions — UIs may persist
+pub struct ConfigurableSpec {
+    /// Stable identifier used as the key in the matching value map.
+    /// Providers must keep this stable across versions — UIs may persist
     /// user choices by key.
     pub key: String,
     /// Short human label. UIs fall back to `key` when missing.
@@ -102,36 +102,44 @@ pub struct TunableSpec {
     /// Longer help text (tooltip / inline hint). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub kind: TunableKind,
+    pub kind: ConfigurableKind,
 }
 
-/// Shape + default for one tunable. v1 covers boolean toggles
-/// (`thinking on/off`, `fast mode`) and string-enums (reasoning effort
-/// `low | medium | high`); numeric / free-text kinds can land later.
+/// Shape + default for one configurable. v1 covers boolean toggles and
+/// string-enums; free-text and numeric variants are available for host-env
+/// provider options that need them.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TunableKind {
+pub enum ConfigurableKind {
     Bool {
         default: bool,
     },
     Enum {
-        variants: Vec<TunableEnumVariant>,
+        variants: Vec<ConfigurableEnumVariant>,
         /// Must match one of `variants[i].value`. UIs should validate
         /// this; out-of-range defaults at the wire boundary fall back
         /// to the first variant on the rendering side.
         default: String,
     },
+    String {
+        #[serde(default)]
+        default: String,
+    },
+    Int {
+        default: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
 }
 
-/// One option in a [`TunableKind::Enum`] choice list. `value` is the
-/// wire payload sent back as [`TunableValue::Enum`]; `label` is the
-/// human-readable text the UI renders; `description` is optional
-/// longer help text (tooltip / inline hint), populated when the
-/// backend has per-variant detail worth surfacing — the codex
-/// service-tier path uses this for the per-tier descriptions returned
-/// by the `/models` endpoint.
+/// One option in a [`ConfigurableKind::Enum`] choice list. `value` is the
+/// wire payload sent back as [`ConfigurableValue::Enum`]; `label` is the
+/// human-readable text the UI renders; `description` is optional longer help
+/// text (tooltip / inline hint).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TunableEnumVariant {
+pub struct ConfigurableEnumVariant {
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -139,17 +147,25 @@ pub struct TunableEnumVariant {
     pub description: Option<String>,
 }
 
-/// Persisted value for a single tunable. Untagged so JSON / CBOR round-
-/// trip the value compactly (`true` / `"high"` rather than wrapping in
-/// a discriminator object). The two variants are disjoint in CBOR /
-/// JSON type space (bool vs string), so untagged deserialization is
-/// unambiguous.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// Persisted value for a single configurable. Untagged so JSON / CBOR round-
+/// trip compactly (`true` / `"high"` / `42` rather than wrapping in a
+/// discriminator object). The variants are disjoint in CBOR / JSON type space.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
-pub enum TunableValue {
+pub enum ConfigurableValue {
     Bool(bool),
     Enum(String),
+    String(String),
+    Int(i64),
 }
+
+/// Back-compat aliases for model-execution knobs. The generic configurable
+/// schema is shared with host-env providers; existing backend/UI code can keep
+/// using the narrower Tunable names.
+pub type TunableSpec = ConfigurableSpec;
+pub type TunableKind = ConfigurableKind;
+pub type TunableEnumVariant = ConfigurableEnumVariant;
+pub type TunableValue = ConfigurableValue;
 
 /// Diagnostic log of per-LLM-call metadata. Grows by one [`TurnEntry`]
 /// on every assistant turn (i.e. every `integrate_model_response` in
@@ -550,6 +566,10 @@ pub enum HostEnvBinding {
         /// scheduler never lets an out-of-list value land here.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runas: Option<String>,
+        /// Provider-specific session options selected for this binding.
+        /// Values correspond to keys advertised by the backing daemon.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        options: BTreeMap<String, ConfigurableValue>,
     },
     /// Reserved: ad-hoc/subagent path — not constructable from any
     /// current wire request type.
@@ -575,6 +595,11 @@ pub struct HostEnvBindingRequest {
     /// are not in the entry's `allow_runas` list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runas: Option<String>,
+    /// Provider-specific session options to overlay on the named entry's
+    /// defaults. Unknown keys are accepted here and interpreted by the
+    /// daemon that provisions the binding.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, ConfigurableValue>,
 }
 
 impl<'de> Deserialize<'de> for HostEnvBindingRequest {
@@ -592,6 +617,8 @@ impl<'de> Deserialize<'de> for HostEnvBindingRequest {
                 workspace_root: Option<std::path::PathBuf>,
                 #[serde(default)]
                 runas: Option<String>,
+                #[serde(default)]
+                options: BTreeMap<String, ConfigurableValue>,
             },
         }
         Ok(match Shape::deserialize(d)? {
@@ -599,15 +626,18 @@ impl<'de> Deserialize<'de> for HostEnvBindingRequest {
                 name,
                 workspace_root: None,
                 runas: None,
+                options: BTreeMap::new(),
             },
             Shape::Full {
                 name,
                 workspace_root,
                 runas,
+                options,
             } => HostEnvBindingRequest {
                 name,
                 workspace_root,
                 runas,
+                options,
             },
         })
     }
@@ -1102,8 +1132,20 @@ pub struct HostEnvDaemonSummary {
     pub max_concurrent_sessions: Option<u32>,
     #[serde(default)]
     pub supports_background_tasks: bool,
+    /// Provider-specific per-session options the daemon advertises.
+    /// `lifecycle` is a string (`"spawn_only"`, `"live_update"`, …) so the
+    /// client protocol does not depend on the host-daemon wire crate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_configurables: Vec<HostEnvConfigurableSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_ms_ago: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct HostEnvConfigurableSummary {
+    #[serde(flatten)]
+    pub spec: ConfigurableSpec,
+    pub lifecycle: String,
 }
 
 /// Full per-task snapshot. Sent in response to a `SubscribeToThread` so the client can
@@ -3180,6 +3222,7 @@ mod tests {
             name: "default".into(),
             workspace_root: Some(std::path::PathBuf::from("/work/x")),
             runas: None,
+            options: BTreeMap::new(),
         };
         let s = serde_json::to_string(&with).unwrap();
         assert!(s.contains("workspace_root"));
@@ -3191,6 +3234,7 @@ mod tests {
             name: "default".into(),
             workspace_root: None,
             runas: None,
+            options: BTreeMap::new(),
         };
         let s = serde_json::to_string(&without).unwrap();
         assert!(
@@ -3212,10 +3256,12 @@ mod tests {
                 name,
                 workspace_root,
                 runas,
+                options,
             } => {
                 assert_eq!(name, "default");
                 assert!(workspace_root.is_none());
                 assert!(runas.is_none());
+                assert!(options.is_empty());
             }
             _ => panic!("expected Named"),
         }
@@ -3228,6 +3274,7 @@ mod tests {
             name: "default".into(),
             workspace_root: None,
             runas: Some("worker".into()),
+            options: BTreeMap::new(),
         };
         let s = serde_json::to_string(&with).unwrap();
         assert!(s.contains("runas"));
@@ -3239,6 +3286,7 @@ mod tests {
             name: "default".into(),
             workspace_root: None,
             runas: None,
+            options: BTreeMap::new(),
         };
         let s = serde_json::to_string(&without).unwrap();
         assert!(

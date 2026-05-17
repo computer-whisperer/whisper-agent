@@ -331,6 +331,7 @@ mod tests {
                         },
                         allow_runas: Vec::new(),
                         default_runas: None,
+                        options: Default::default(),
                     },
                     NamedHostEnv {
                         name: "landlock-ro".into(),
@@ -341,6 +342,7 @@ mod tests {
                         },
                         allow_runas: Vec::new(),
                         default_runas: None,
+                        options: Default::default(),
                     },
                 ],
                 knowledge_buckets: Vec::new(),
@@ -438,6 +440,7 @@ max_turns = 50
             },
             allow_runas: Vec::new(),
             default_runas: None,
+            options: Default::default(),
         });
         let err = validate(&cfg).unwrap_err();
         assert!(matches!(err, PodConfigError::DuplicateSandboxName(_)));

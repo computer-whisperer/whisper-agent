@@ -5,11 +5,12 @@
 //! scope as well. Pure — no scheduler state — so the cap-enforcement
 //! rules live in one readable place.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use whisper_agent_protocol::sandbox::AccessMode;
 use whisper_agent_protocol::{
-    HostEnvBinding, HostEnvBindingRequest, HostEnvSpec, ThreadBindingsRequest,
+    ConfigurableValue, HostEnvBinding, HostEnvBindingRequest, HostEnvSpec, ThreadBindingsRequest,
 };
 
 use crate::permission::Scope;
@@ -65,6 +66,18 @@ pub(super) fn default_runas_for(pod: &Pod, name: &str) -> Option<String> {
         .iter()
         .find(|nh| nh.name == name)
         .and_then(|nh| nh.default_runas.clone())
+}
+
+/// Pod-level provider-option defaults for a binding. Request values overlay
+/// this map at thread creation time.
+pub(super) fn default_options_for(pod: &Pod, name: &str) -> BTreeMap<String, ConfigurableValue> {
+    pod.config
+        .allow
+        .host_env
+        .iter()
+        .find(|nh| nh.name == name)
+        .map(|nh| nh.options.clone())
+        .unwrap_or_default()
 }
 
 /// True iff `candidate` is listed in the named entry's `allow_runas`.
@@ -152,6 +165,7 @@ pub(super) fn resolve_bindings_choice(
                 name: name.clone(),
                 workspace_root: None,
                 runas: None,
+                options: BTreeMap::new(),
             })
             .collect()
     });
@@ -162,6 +176,7 @@ pub(super) fn resolve_bindings_choice(
                 name,
                 workspace_root,
                 runas,
+                options: request_options,
             } = req;
             if !allow.host_env.iter().any(|nh| nh.name == name) {
                 return Err(format!(
@@ -227,10 +242,13 @@ pub(super) fn resolve_bindings_choice(
                 }
                 None => default_runas_for(pod, &name),
             };
+            let mut options = default_options_for(pod, &name);
+            options.extend(request_options);
             Ok(HostEnvBinding::Named {
                 name,
                 workspace_root,
                 runas,
+                options,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -325,6 +343,7 @@ mod tests {
                         },
                         allow_runas: Vec::new(),
                         default_runas: None,
+                        options: Default::default(),
                     },
                     NamedHostEnv {
                         name: "narrow".into(),
@@ -335,6 +354,7 @@ mod tests {
                         },
                         allow_runas: Vec::new(),
                         default_runas: None,
+                        options: Default::default(),
                     },
                 ],
                 knowledge_buckets: Vec::new(),
@@ -429,6 +449,7 @@ mod tests {
                 name: "wide".into(),
                 workspace_root: None,
                 runas: None,
+                options: Default::default(),
             }]),
             mcp_hosts: None,
         };
@@ -459,6 +480,7 @@ mod tests {
                 name: "narrow".into(),
                 workspace_root: None,
                 runas: None,
+                options: Default::default(),
             }]),
             mcp_hosts: Some(vec!["search".into()]),
         };
@@ -494,11 +516,13 @@ mod tests {
                         name: "wide".into(),
                         workspace_root: None,
                         runas: None,
+                        options: Default::default(),
                     },
                     HostEnvBindingRequest {
                         name: "narrow".into(),
                         workspace_root: None,
                         runas: None,
+                        options: Default::default(),
                     },
                 ]),
                 mcp_hosts: None,
@@ -581,6 +605,7 @@ mod tests {
                 name: "wide".into(),
                 workspace_root: None,
                 runas: Some("nobody".into()),
+                options: Default::default(),
             }]),
             mcp_hosts: None,
         };
@@ -602,6 +627,7 @@ mod tests {
                 name: "wide".into(),
                 workspace_root: None,
                 runas: Some("root".into()),
+                options: Default::default(),
             }]),
             mcp_hosts: None,
         };
@@ -624,6 +650,7 @@ mod tests {
                 name: "narrow".into(),
                 workspace_root: None,
                 runas: Some("worker".into()),
+                options: Default::default(),
             }]),
             mcp_hosts: None,
         };

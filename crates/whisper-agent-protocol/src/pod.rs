@@ -140,6 +140,11 @@ pub struct NamedHostEnv {
     /// `allow_runas`; pod-config validation rejects mismatches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_runas: Option<String>,
+    /// Provider-specific session option defaults, keyed by the daemon's
+    /// advertised configurable schema. The scheduler stores and forwards
+    /// these generically; each daemon interprets only keys it advertised.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub options: std::collections::BTreeMap<String, crate::ConfigurableValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
