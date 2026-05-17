@@ -123,10 +123,7 @@ impl OpenAiChatClient {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
         let parsed: OaResponse = tokio::select! {
             r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -232,7 +229,7 @@ impl OpenAiChatClient {
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                Err(ModelError::Api { status: status.as_u16(), body })?;
+                Err(ModelError::api(status.as_u16(), body))?;
                 return;
             }
 
@@ -287,10 +284,7 @@ impl OpenAiChatClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
         let parsed: OaListModelsResponse = resp
             .json()

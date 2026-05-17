@@ -188,10 +188,7 @@ impl OpenAiResponsesClient {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
         Ok(resp)
     }
@@ -312,10 +309,7 @@ impl OpenAiResponsesClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
 
         if codex_mode {
@@ -422,10 +416,7 @@ impl ModelProvider for OpenAiResponsesClient {
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(ModelError::Api {
-                    status: status.as_u16(),
-                    body,
-                });
+                return Err(ModelError::api(status.as_u16(), body));
             }
             let body = resp
                 .text()
@@ -903,10 +894,7 @@ fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
                     .as_ref()
                     .and_then(|r| r.status.clone())
                     .unwrap_or_else(|| "failed".to_string());
-                return Err(ModelError::Api {
-                    status: 500,
-                    body: format!("{status}: {detail}"),
-                });
+                return Err(ModelError::api(500, format!("{status}: {detail}")));
             }
             SseEvent::Other => {}
         }
@@ -1224,10 +1212,7 @@ impl RspStreamState {
                     .as_ref()
                     .and_then(|r| r.status.clone())
                     .unwrap_or_else(|| "failed".to_string());
-                return Err(ModelError::Api {
-                    status: 500,
-                    body: format!("{status}: {detail}"),
-                });
+                return Err(ModelError::api(500, format!("{status}: {detail}")));
             }
             RspStreamEvent::Other => {}
         }
@@ -2062,7 +2047,7 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
 "#;
         let err = extract_completed_response(stream).unwrap_err();
         match err {
-            ModelError::Api { status, body } => {
+            ModelError::Api { status, body, .. } => {
                 assert_eq!(status, 500);
                 assert!(body.contains("rate limited"), "body was: {body}");
             }

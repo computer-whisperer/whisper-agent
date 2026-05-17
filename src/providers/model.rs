@@ -134,12 +134,112 @@ pub struct ModelInfo {
     pub tunables: Vec<TunableSpec>,
 }
 
+/// Structured fields parsed out of a provider's native error envelope.
+/// Populated by each adapter at the point of failure so io_dispatch can
+/// log them as tracing fields and the forensic dump can record them
+/// verbatim. All fields are optional because each provider populates a
+/// different subset:
+///
+/// - OpenAI Responses (`response.failed`, HTTP non-2xx): `code`
+///   (`response.error.code` or top-level `error.code`), `kind`
+///   (`error.type`), `response_id` (`response.id`), `message`.
+/// - OpenAI Chat: `code`, `kind` (= `error.type`), `message`.
+/// - Anthropic: `code` (= `error.type`, e.g. `"overloaded_error"`),
+///   `message`.
+/// - Gemini: `code` (= `error.status`, e.g. `"RESOURCE_EXHAUSTED"`),
+///   `kind` (HTTP-status numeric mapping), `message`.
+///
+/// All-None means the body wasn't parseable in any provider-recognised
+/// shape; the raw body still lives in [`ModelError::Api::body`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProviderErrorDetail {
+    /// Provider-specific machine-readable code — the most useful field
+    /// for grepping and for deciding retry-vs-give-up. Examples:
+    /// `context_length_exceeded`, `overloaded_error`,
+    /// `RESOURCE_EXHAUSTED`, `server_error`.
+    pub code: Option<String>,
+    /// Coarser categorisation when the provider exposes one separately
+    /// from `code`. OpenAI's `error.type` lives here
+    /// (`invalid_request_error`, `server_error`, …); Anthropic uses its
+    /// `error.type` as `code` so this stays None there.
+    pub kind: Option<String>,
+    /// Provider-side response identifier so an operator can
+    /// cross-reference the failure with the provider's own logs
+    /// (OpenAI request id, Responses `response.id`, etc.). None when
+    /// the wire shape doesn't carry one.
+    pub response_id: Option<String>,
+    /// Human-readable detail, verbatim from the provider when present.
+    /// Often the same as [`ModelError::Api::body`] when no nested
+    /// envelope exists, but distinct when the message is dug out of a
+    /// nested `error.message` field.
+    pub message: Option<String>,
+}
+
+/// Captured request + response bytes from a single model call, for
+/// post-mortem forensic dump when something goes wrong. Wrapped in an
+/// `Arc` on [`ModelError::Api::forensic`] so cloning the error stays
+/// cheap. Adapters populate this at the point of failure; io_dispatch
+/// decides whether to flush it to disk.
+///
+/// `response_excerpt` is capped (the adapter holds a rolling window of
+/// the last `FORENSIC_RESPONSE_CAP_BYTES` bytes) to bound memory on
+/// long-running streams. `response_truncated` records whether the cap
+/// was hit so a reader of the dump knows the bytes aren't the full
+/// stream.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForensicArtifact {
+    /// Backend name as registered with the scheduler — used to label
+    /// the dump and to slice the forensic directory by backend.
+    pub backend: String,
+    /// Model id as actually sent on the wire.
+    pub model: String,
+    /// HTTP request body the adapter POSTed. Almost always JSON; the
+    /// content type is recorded separately for the rare exception.
+    pub request_body: String,
+    /// Content type of `request_body`.
+    pub request_content_type: &'static str,
+    /// Response bytes captured up to the point of failure. For
+    /// streaming responses this is the rolling tail of the SSE stream;
+    /// for HTTP non-2xx responses this is the full body (or capped if
+    /// huge). UTF-8 in practice — kept as `Vec<u8>` to avoid losing
+    /// bytes when a stream truncates mid-codepoint.
+    pub response_excerpt: Vec<u8>,
+    /// True when `response_excerpt` was capped by the rolling window
+    /// and earlier bytes were dropped. Always false for non-streaming
+    /// HTTP error captures.
+    pub response_truncated: bool,
+}
+
+/// Soft cap on `ForensicArtifact::response_excerpt`. Big enough to
+/// retain the full final SSE event in nearly every realistic failure;
+/// small enough that an occasional dump doesn't balloon a multi-MB
+/// JSON file. Exposed so adapters and tests share one constant.
+pub const FORENSIC_RESPONSE_CAP_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("transport error: {0}")]
     Transport(String),
     #[error("api error {status}: {body}")]
-    Api { status: u16, body: String },
+    Api {
+        status: u16,
+        body: String,
+        /// Structured fields extracted from the provider's error
+        /// envelope, when the adapter recognised the shape. `None`
+        /// when nothing was parseable. Drives the structured tracing
+        /// fields in io_dispatch and the `detail` block in the
+        /// forensic dump. Boxed to keep the `ModelError` enum small
+        /// enough for the `Result<_, ModelError>` clippy size lint
+        /// (the detail struct is ~100 B on its own).
+        #[allow(dead_code)]
+        detail: Option<Box<ProviderErrorDetail>>,
+        /// Captured request + response bytes for forensic dump. `None`
+        /// when the failure happened before a request was built (auth
+        /// refresh failed pre-send, etc.) or when the adapter declined
+        /// to capture for a specific class of error.
+        #[allow(dead_code)]
+        forensic: Option<std::sync::Arc<ForensicArtifact>>,
+    },
     /// Server signalled a short-term capacity / quota exhaustion (typically HTTP
     /// 429). Carries the server-suggested wait before retrying along with the
     /// raw body so the caller can show a useful message. The dispatch layer may
@@ -156,6 +256,20 @@ pub enum ModelError {
 }
 
 impl ModelError {
+    /// Construct an `Api` error with no structured detail and no
+    /// forensic capture — the cheapest call-site form for tests and
+    /// for adapters that haven't been wired through the forensic
+    /// machinery yet. Production adapters should populate `detail` and
+    /// `forensic` directly via the struct form.
+    pub fn api(status: u16, body: impl Into<String>) -> Self {
+        ModelError::Api {
+            status,
+            body: body.into(),
+            detail: None,
+            forensic: None,
+        }
+    }
+
     /// True when this error is a transient infrastructure fault worth
     /// retrying transparently — network glitches, request timeouts,
     /// and 5xx server errors (including Anthropic's 529 Overloaded).
@@ -169,6 +283,27 @@ impl ModelError {
             ModelError::Transport(_) => true,
             ModelError::Api { status, .. } => matches!(*status, 408 | 500..=599),
             ModelError::RateLimited { .. } | ModelError::Cancelled => false,
+        }
+    }
+
+    /// Borrow the structured detail from an `Api` error, if any. Used
+    /// by io_dispatch to attach tracing fields without reaching into
+    /// the variant directly at every log site.
+    pub fn provider_detail(&self) -> Option<&ProviderErrorDetail> {
+        match self {
+            ModelError::Api {
+                detail: Some(d), ..
+            } => Some(d.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Borrow the forensic artifact from an `Api` error, if captured.
+    /// Used by io_dispatch's terminal-failure path to flush a dump.
+    pub fn forensic(&self) -> Option<&ForensicArtifact> {
+        match self {
+            ModelError::Api { forensic, .. } => forensic.as_deref(),
+            _ => None,
         }
     }
 }
@@ -269,6 +404,25 @@ pub enum ModelEvent {
     /// that expose this data (today: OpenAI Responses on the Codex
     /// route); silent for all others.
     ProviderUsage { snapshot: BackendUsage },
+    /// Non-fatal degradation signal from the provider — the call
+    /// succeeded (a `Completed` will still arrive) but the model's
+    /// output was constrained or partially withheld for a reason the
+    /// caller cares about. Examples: Gemini `finishReason = SAFETY`
+    /// or `RECITATION`, OpenAI Chat `finish_reason = content_filter`,
+    /// OpenAI Responses `status = incomplete` with a non-token reason.
+    /// io_dispatch logs these as structured warnings; the UI may
+    /// surface them as a row badge in future. Ephemeral: not persisted
+    /// into the thread state.
+    ProviderWarning {
+        /// Provider-shaped machine code so log queries can slice by
+        /// category — `"SAFETY"`, `"RECITATION"`, `"content_filter"`,
+        /// `"incomplete:context_length"`. Free-form per provider.
+        code: String,
+        /// Human-readable detail, verbatim when the provider supplies
+        /// one. Empty string when there's nothing more to say beyond
+        /// `code`.
+        message: String,
+    },
     /// Terminal event. `content` is the assistant-turn content block list the
     /// scheduler should persist. Deltas emitted before this are strictly for
     /// broadcast; the canonical state comes from here.
@@ -633,71 +787,17 @@ mod tests {
     fn is_transient_classification() {
         assert!(ModelError::Transport("read timeout".into()).is_transient());
         // 5xx server errors — retry.
-        assert!(
-            ModelError::Api {
-                status: 500,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            ModelError::Api {
-                status: 502,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            ModelError::Api {
-                status: 503,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            ModelError::Api {
-                status: 529,
-                body: String::new()
-            }
-            .is_transient()
-        );
+        assert!(ModelError::api(500, "").is_transient());
+        assert!(ModelError::api(502, "").is_transient());
+        assert!(ModelError::api(503, "").is_transient());
+        assert!(ModelError::api(529, "").is_transient());
         // 408 Request Timeout — retry.
-        assert!(
-            ModelError::Api {
-                status: 408,
-                body: String::new()
-            }
-            .is_transient()
-        );
+        assert!(ModelError::api(408, "").is_transient());
         // Client-side 4xx — don't retry (auth, bad request, context exhausted).
-        assert!(
-            !ModelError::Api {
-                status: 400,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            !ModelError::Api {
-                status: 401,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            !ModelError::Api {
-                status: 403,
-                body: String::new()
-            }
-            .is_transient()
-        );
-        assert!(
-            !ModelError::Api {
-                status: 404,
-                body: String::new()
-            }
-            .is_transient()
-        );
+        assert!(!ModelError::api(400, "").is_transient());
+        assert!(!ModelError::api(401, "").is_transient());
+        assert!(!ModelError::api(403, "").is_transient());
+        assert!(!ModelError::api(404, "").is_transient());
         // 429 is carried by RateLimited, not Api — but even if it showed up as Api,
         // rate-limit retry is driven by the dedicated variant's retry_after path.
         assert!(

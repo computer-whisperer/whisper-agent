@@ -166,10 +166,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::Api {
-                        status: status.as_u16(),
-                        body,
-                    });
+                    return Err(ModelError::api(status.as_u16(), body));
                 }
                 let parsed: LoadCodeAssistResponse = resp
                     .json()
@@ -385,10 +382,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::Api {
-                        status: status.as_u16(),
-                        body,
-                    });
+                    return Err(ModelError::api(status.as_u16(), body));
                 }
                 let parsed: ListModelsResponse = resp
                     .json()
@@ -1297,7 +1291,7 @@ pub(crate) fn classify_http_error(status: u16, body: String) -> ModelError {
             .unwrap_or_else(|| std::time::Duration::from_secs(10));
         ModelError::RateLimited { retry_after, body }
     } else {
-        ModelError::Api { status, body }
+        ModelError::api(status, body)
     }
 }
 
@@ -2206,7 +2200,7 @@ mod tests {
     #[test]
     fn classify_non_429_stays_api_error() {
         match classify_http_error(500, "boom".into()) {
-            ModelError::Api { status, body } => {
+            ModelError::Api { status, body, .. } => {
                 assert_eq!(status, 500);
                 assert_eq!(body, "boom");
             }

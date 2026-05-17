@@ -831,6 +831,24 @@ async fn consume_stream(
                     },
                 });
             }
+            Ok(ModelEvent::ProviderWarning { code, message }) => {
+                // Provider signalled a non-fatal degradation alongside an
+                // otherwise-successful call (Gemini SAFETY, OpenAI
+                // content_filter, …). The Completed event still lands;
+                // this fires beforehand so the warning shows up in
+                // `kubectl logs` adjacent to the turn it came from.
+                // Does not set `any_delta_emitted` — adapters emit this
+                // either before or after deltas, and either way the
+                // retry classifier should key off the actual content
+                // events, not the warning.
+                tracing::warn!(
+                    %thread_id,
+                    backend = %backend_name,
+                    code = %code,
+                    message = %message,
+                    "model provider warning"
+                );
+            }
             Ok(ModelEvent::ProviderUsage { snapshot }) => {
                 // Per-backend account/quota snapshot from the provider
                 // (today: Codex header scrape). Forward off-thread to

@@ -82,10 +82,7 @@ impl AnthropicClient {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
         let parsed: MessageResponse = tokio::select! {
             r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -129,7 +126,7 @@ impl AnthropicClient {
             let status = resp.status();
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
-                Err(ModelError::Api { status: status.as_u16(), body: err_body })?;
+                Err(ModelError::api(status.as_u16(), err_body))?;
                 return;
             }
             let mut bytes = resp.bytes_stream();
@@ -188,10 +185,7 @@ impl AnthropicClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ModelError::Api {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(ModelError::api(status.as_u16(), body));
         }
         let parsed: ListModelsResponse = resp
             .json()
@@ -929,10 +923,7 @@ impl StreamState {
             }
             AnthropicStreamEvent::Ping | AnthropicStreamEvent::Other => {}
             AnthropicStreamEvent::Error { error } => {
-                Err(ModelError::Api {
-                    status: 500,
-                    body: error.message,
-                })?;
+                Err(ModelError::api(500, error.message))?;
             }
         }
         Ok(out)
