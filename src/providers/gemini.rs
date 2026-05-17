@@ -38,8 +38,8 @@ use whisper_agent_protocol::{
 
 use crate::providers::gemini_auth::GeminiAuth;
 use crate::providers::model::{
-    BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, ToolSpec,
+    BoxFuture, BoxStream, ForensicContext, ModelError, ModelEvent, ModelInfo, ModelProvider,
+    ModelRequest, ModelResponse, ProviderErrorDetail, ToolSpec,
 };
 
 pub const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -166,7 +166,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::api(status.as_u16(), body));
+                    return Err(classify_http_error(status.as_u16(), body));
                 }
                 let parsed: LoadCodeAssistResponse = resp
                     .json()
@@ -195,13 +195,26 @@ impl GeminiClient {
         let inner = build_gemini_request(req);
         match &self.auth {
             ClientAuth::ApiKey(key) => {
+                let body_str = serde_json::to_string(&inner)
+                    .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+                let forensic = ForensicContext {
+                    backend: PROVIDER_TAG.to_string(),
+                    model: req.model.to_string(),
+                    request_body: body_str.clone(),
+                    request_content_type: "application/json",
+                };
                 let url = format!(
                     "{}/models/{}:generateContent?key={}",
                     self.base_url,
                     req.model,
                     urlencode(key)
                 );
-                let send = self.http.post(&url).json(&inner).send();
+                let send = self
+                    .http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .body(body_str)
+                    .send();
                 let resp = tokio::select! {
                     r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled),
@@ -212,7 +225,11 @@ impl GeminiClient {
                         b = resp.text() => b.unwrap_or_default(),
                         _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                     };
-                    return Err(classify_http_error(status.as_u16(), body));
+                    return Err(classify_http_error_with_forensic(
+                        status.as_u16(),
+                        body,
+                        forensic,
+                    ));
                 }
                 let parsed: GenerateContentResponse = tokio::select! {
                     r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -234,12 +251,21 @@ impl GeminiClient {
                     project,
                     request: inner,
                 };
+                let body_str = serde_json::to_string(&envelope)
+                    .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+                let forensic = ForensicContext {
+                    backend: PROVIDER_TAG.to_string(),
+                    model: req.model.to_string(),
+                    request_body: body_str.clone(),
+                    request_content_type: "application/json",
+                };
                 let url = format!("{}:generateContent", self.base_url);
                 let send = self
                     .http
                     .post(&url)
                     .bearer_auth(&bearer)
-                    .json(&envelope)
+                    .header("content-type", "application/json")
+                    .body(body_str)
                     .send();
                 let resp = tokio::select! {
                     r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -251,7 +277,11 @@ impl GeminiClient {
                         b = resp.text() => b.unwrap_or_default(),
                         _ = cancel.cancelled() => return Err(ModelError::Cancelled),
                     };
-                    return Err(classify_http_error(status.as_u16(), body));
+                    return Err(classify_http_error_with_forensic(
+                        status.as_u16(),
+                        body,
+                        forensic,
+                    ));
                 }
                 let wrapped: CaGenerateContentResponse = tokio::select! {
                     r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -274,19 +304,32 @@ impl GeminiClient {
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
             let inner = build_gemini_request(req);
-            let resp = match &self.auth {
+            let (resp, forensic) = match &self.auth {
                 ClientAuth::ApiKey(key) => {
+                    let body_str = serde_json::to_string(&inner).map_err(|e| {
+                        ModelError::Transport(format!("serialize request body: {e}"))
+                    })?;
+                    let forensic = ForensicContext {
+                        backend: PROVIDER_TAG.to_string(),
+                        model: req.model.to_string(),
+                        request_body: body_str.clone(),
+                        request_content_type: "application/json",
+                    };
                     let url = format!(
                         "{}/models/{}:streamGenerateContent?alt=sse&key={}",
                         self.base_url,
                         req.model,
                         urlencode(key)
                     );
-                    let send = self.http.post(&url).json(&inner).send();
-                    tokio::select! {
+                    let send = self.http.post(&url)
+                        .header("content-type", "application/json")
+                        .body(body_str)
+                        .send();
+                    let resp = tokio::select! {
                         r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
                         _ = cancel.cancelled() => Err(ModelError::Cancelled),
-                    }?
+                    }?;
+                    (resp, forensic)
                 }
                 ClientAuth::GeminiCli { .. } => {
                     let project = tokio::select! {
@@ -302,6 +345,15 @@ impl GeminiClient {
                         project,
                         request: inner,
                     };
+                    let body_str = serde_json::to_string(&envelope).map_err(|e| {
+                        ModelError::Transport(format!("serialize request body: {e}"))
+                    })?;
+                    let forensic = ForensicContext {
+                        backend: PROVIDER_TAG.to_string(),
+                        model: req.model.to_string(),
+                        request_body: body_str.clone(),
+                        request_content_type: "application/json",
+                    };
                     // The Code Assist backend uses `alt=sse` as a query arg on
                     // the same `streamGenerateContent` verb — envelope shape
                     // is identical to the unary path.
@@ -309,20 +361,34 @@ impl GeminiClient {
                     let send = self.http
                         .post(&url)
                         .bearer_auth(&bearer)
-                        .json(&envelope)
+                        .header("content-type", "application/json")
+                        .body(body_str)
                         .send();
-                    tokio::select! {
+                    let resp = tokio::select! {
                         r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
                         _ = cancel.cancelled() => Err(ModelError::Cancelled),
-                    }?
+                    }?;
+                    (resp, forensic)
                 }
             };
             let status = resp.status();
             if !status.is_success() {
                 let err_body = resp.text().await.unwrap_or_default();
-                Err(classify_http_error(status.as_u16(), err_body))?;
+                Err(classify_http_error_with_forensic(
+                    status.as_u16(),
+                    err_body,
+                    forensic,
+                ))?;
                 return;
             }
+            // Gemini's SSE stream has no mid-stream error event shape —
+            // mid-call failures show up either as a pre-stream HTTP
+            // non-2xx (handled above) or as a finishReason / promptFeedback
+            // signal that surfaces as a `ProviderWarning` from
+            // `state.consume()`. So we don't need a `ForensicBuf` here.
+            // The captured `forensic` context is dropped at end-of-scope
+            // for the success path.
+            let _ = forensic;
             let codex_mode = matches!(self.auth, ClientAuth::GeminiCli { .. });
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
@@ -382,7 +448,7 @@ impl GeminiClient {
                 let status = resp.status();
                 if !status.is_success() {
                     let body = resp.text().await.unwrap_or_default();
-                    return Err(ModelError::api(status.as_u16(), body));
+                    return Err(classify_http_error(status.as_u16(), body));
                 }
                 let parsed: ListModelsResponse = resp
                     .json()
@@ -1108,11 +1174,44 @@ struct GeminiStreamState {
     stop_reason: Option<String>,
     saw_function_call: bool,
     usage: Option<Usage>,
+    /// True once we've emitted a `ProviderWarning` for this turn's
+    /// finish_reason — prevents duplicate warnings if the terminal
+    /// chunk replays the reason on multiple events.
+    finish_warned: bool,
+    /// Same idea but for promptFeedback-based prompt-level blocks
+    /// (the whole turn rejected before candidate generation).
+    prompt_block_warned: bool,
+}
+
+/// True when a Gemini `finishReason` indicates a non-normal turn end
+/// that should surface as a `ProviderWarning`. Normal terminations
+/// (`STOP`, `MAX_TOKENS`, tool_use synthesis) stay silent.
+fn finish_reason_warrants_warning(reason: &str) -> bool {
+    !matches!(reason, "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED")
 }
 
 impl GeminiStreamState {
     fn consume(&mut self, chunk: GenerateContentResponse) -> Vec<ModelEvent> {
         let mut out = Vec::new();
+
+        // Surface a prompt-level block (the whole turn was rejected
+        // before reasoning even started). Once per stream — we set the
+        // sentinel so a repeated promptFeedback chunk doesn't fire
+        // multiple warnings.
+        if let Some(pf) = chunk.prompt_feedback.as_ref()
+            && let Some(reason) = pf.block_reason.as_deref()
+            && !reason.is_empty()
+            && !self.prompt_block_warned
+        {
+            self.prompt_block_warned = true;
+            out.push(ModelEvent::ProviderWarning {
+                code: format!("prompt_block:{reason}"),
+                message: pf
+                    .block_reason_message
+                    .clone()
+                    .unwrap_or_else(|| format!("Gemini blocked the prompt (reason={reason})")),
+            });
+        }
 
         // Capture finish_reason + usage opportunistically. They typically
         // arrive on the same terminal chunk, but either can slip earlier
@@ -1121,6 +1220,21 @@ impl GeminiStreamState {
             && let Some(fr) = cand.finish_reason.as_deref()
         {
             self.stop_reason = Some(fr.to_string());
+            // Non-STOP / non-MAX_TOKENS finishes (SAFETY, RECITATION,
+            // OTHER, BLOCKLIST, PROHIBITED_CONTENT, …) become a
+            // ProviderWarning so an operator sees the cause in
+            // `kubectl logs` rather than only as an opaque
+            // stop_reason on the persisted turn. Once per stream.
+            if !self.finish_warned && finish_reason_warrants_warning(fr) {
+                self.finish_warned = true;
+                out.push(ModelEvent::ProviderWarning {
+                    code: fr.to_string(),
+                    message: cand
+                        .finish_message
+                        .clone()
+                        .unwrap_or_else(|| format!("Gemini finishReason={fr}")),
+                });
+            }
         }
         if let Some(u) = chunk.usage_metadata {
             // Gemini sends cumulative `usage_metadata` on every chunk;
@@ -1289,10 +1403,73 @@ pub(crate) fn classify_http_error(status: u16, body: String) -> ModelError {
         let retry_after = parse_retry_after_seconds(&body)
             .map(std::time::Duration::from_secs)
             .unwrap_or_else(|| std::time::Duration::from_secs(10));
-        ModelError::RateLimited { retry_after, body }
-    } else {
-        ModelError::api(status, body)
+        return ModelError::RateLimited { retry_after, body };
     }
+    let detail = parse_gemini_error_envelope(&body);
+    ModelError::Api {
+        status,
+        body,
+        detail: detail.map(Box::new),
+        forensic: None,
+    }
+}
+
+/// Same as [`classify_http_error`] but also captures the request body
+/// and response excerpt into a [`ForensicArtifact`] attached to the
+/// resulting `ModelError::Api`. Used by the model-call paths where we
+/// have a [`ForensicContext`] in hand; the auxiliary `list_models` /
+/// `load_code_assist` paths still use the simpler classify variant.
+pub(crate) fn classify_http_error_with_forensic(
+    status: u16,
+    body: String,
+    forensic: ForensicContext,
+) -> ModelError {
+    if status == 429 {
+        let retry_after = parse_retry_after_seconds(&body)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(10));
+        // RateLimited is the dedicated retry path and doesn't carry a
+        // forensic field today — drop the capture rather than smuggle
+        // it through Api; rate-limit waits are noisy and not worth a
+        // dump on disk.
+        return ModelError::RateLimited { retry_after, body };
+    }
+    let detail = parse_gemini_error_envelope(&body);
+    let artifact = forensic.into_http_error_artifact(body.as_bytes().to_vec());
+    ModelError::Api {
+        status,
+        body,
+        detail: detail.map(Box::new),
+        forensic: Some(std::sync::Arc::new(artifact)),
+    }
+}
+
+/// Parse Gemini's standard error envelope. Gemini ships
+/// `{"error":{"code":<HTTP>, "message":"...", "status":"RESOURCE_EXHAUSTED",
+/// "details":[...]}}`. We map `status` (the string enum) onto
+/// `code` because it's the useful classifier (`UNAUTHENTICATED`,
+/// `INVALID_ARGUMENT`, `FAILED_PRECONDITION`); the numeric
+/// `error.code` is redundant with the HTTP status.
+fn parse_gemini_error_envelope(body: &str) -> Option<ProviderErrorDetail> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: Inner,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        #[serde(default)]
+        message: String,
+        #[serde(default)]
+        status: Option<String>,
+    }
+    serde_json::from_str::<Envelope>(body)
+        .ok()
+        .map(|env| ProviderErrorDetail {
+            code: env.error.status.filter(|s| !s.is_empty()),
+            kind: None,
+            response_id: None,
+            message: Some(env.error.message).filter(|s| !s.is_empty()),
+        })
 }
 
 /// Extract the first `N` from phrases like "Your quota will reset after 6s."
@@ -1469,6 +1646,24 @@ pub(crate) struct GenerateContentResponse {
     pub(crate) candidates: Vec<Candidate>,
     #[serde(default)]
     pub(crate) usage_metadata: Option<UsageMetadata>,
+    /// Present when the *prompt itself* was rejected (the candidate
+    /// list will be empty). Carries a `blockReason` enum
+    /// (`BLOCK_REASON_UNSPECIFIED`, `SAFETY`, `OTHER`,
+    /// `BLOCKLIST`, `PROHIBITED_CONTENT`) so we can surface why the
+    /// turn produced nothing rather than reporting an empty success.
+    #[serde(default)]
+    pub(crate) prompt_feedback: Option<PromptFeedback>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptFeedback {
+    #[serde(default)]
+    pub(crate) block_reason: Option<String>,
+    /// Free-form detail Google sometimes supplies alongside the
+    /// reason; absent on most blocks.
+    #[serde(default)]
+    pub(crate) block_reason_message: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1478,6 +1673,12 @@ pub(crate) struct Candidate {
     pub(crate) content: Option<Content>,
     #[serde(default)]
     pub(crate) finish_reason: Option<String>,
+    /// Optional free-form explanation supplied by Gemini on
+    /// non-`STOP` finishes — sometimes blank, occasionally informative
+    /// (e.g. listing the safety category that tripped). Surfaced on
+    /// the `ProviderWarning` message field when present.
+    #[serde(default)]
+    pub(crate) finish_message: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -1700,8 +1901,10 @@ mod tests {
                     ],
                 }),
                 finish_reason: None,
+                finish_message: None,
             }],
             usage_metadata: None,
+            prompt_feedback: None,
         };
         let resp = parsed_to_model_response(parsed);
         assert_eq!(resp.content.len(), 2);
@@ -2343,5 +2546,128 @@ mod tests {
             }
             _ => panic!("expected Completed"),
         }
+    }
+
+    #[test]
+    fn http_error_envelope_maps_google_status_to_provider_code() {
+        // Standard Google API error body — `status` is the useful
+        // category string, not the numeric `code` (which mirrors HTTP).
+        let body = r#"{"error":{"code":403,"message":"Permission denied on resource","status":"PERMISSION_DENIED"}}"#;
+        let err = classify_http_error(403, body.to_string());
+        let detail = err.provider_detail().cloned().expect("detail extracted");
+        assert_eq!(detail.code.as_deref(), Some("PERMISSION_DENIED"));
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("Permission denied on resource")
+        );
+    }
+
+    #[test]
+    fn http_error_with_forensic_attaches_artifact_and_skips_429_rate_limit() {
+        // 500 → forensic attached.
+        let ctx = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "gemini-2.5-pro".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err =
+            classify_http_error_with_forensic(500, r#"{"error":{"message":"x"}}"#.into(), ctx);
+        assert!(err.forensic().is_some());
+        // 429 still routes through RateLimited (no forensic, by design).
+        let ctx2 = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "gemini-2.5-pro".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err2 = classify_http_error_with_forensic(
+            429,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#.into(),
+            ctx2,
+        );
+        assert!(matches!(err2, ModelError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn finish_reason_safety_emits_provider_warning() {
+        let mut state = GeminiStreamState::default();
+        let chunk = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".into()),
+                    parts: vec![],
+                }),
+                finish_reason: Some("SAFETY".into()),
+                finish_message: Some("Tripped harm category 2".into()),
+            }],
+            usage_metadata: None,
+            prompt_feedback: None,
+        };
+        let evs = state.consume(chunk);
+        let warn = evs
+            .iter()
+            .find_map(|e| match e {
+                ModelEvent::ProviderWarning { code, message } => {
+                    Some((code.clone(), message.clone()))
+                }
+                _ => None,
+            })
+            .expect("ProviderWarning for SAFETY");
+        assert_eq!(warn.0, "SAFETY");
+        assert_eq!(warn.1, "Tripped harm category 2");
+    }
+
+    #[test]
+    fn prompt_feedback_block_emits_provider_warning_once() {
+        let mut state = GeminiStreamState::default();
+        let block_chunk = GenerateContentResponse {
+            candidates: vec![],
+            usage_metadata: None,
+            prompt_feedback: Some(PromptFeedback {
+                block_reason: Some("SAFETY".into()),
+                block_reason_message: None,
+            }),
+        };
+        let evs1 = state.consume(block_chunk);
+        assert!(evs1.iter().any(|e| matches!(e, ModelEvent::ProviderWarning { code, .. } if code == "prompt_block:SAFETY")));
+        // Second identical chunk should not re-emit — `prompt_block_warned`
+        // sentinel.
+        let block_chunk2 = GenerateContentResponse {
+            candidates: vec![],
+            usage_metadata: None,
+            prompt_feedback: Some(PromptFeedback {
+                block_reason: Some("SAFETY".into()),
+                block_reason_message: None,
+            }),
+        };
+        let evs2 = state.consume(block_chunk2);
+        assert!(
+            !evs2
+                .iter()
+                .any(|e| matches!(e, ModelEvent::ProviderWarning { .. }))
+        );
+    }
+
+    #[test]
+    fn stop_finish_reason_emits_no_warning() {
+        let mut state = GeminiStreamState::default();
+        let chunk = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".into()),
+                    parts: vec![],
+                }),
+                finish_reason: Some("STOP".into()),
+                finish_message: None,
+            }],
+            usage_metadata: None,
+            prompt_feedback: None,
+        };
+        let evs = state.consume(chunk);
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, ModelEvent::ProviderWarning { .. }))
+        );
     }
 }
