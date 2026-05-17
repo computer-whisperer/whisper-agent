@@ -33,9 +33,14 @@ use tokio_util::sync::CancellationToken;
 use whisper_agent_protocol::{ContentBlock, Message, Role, ToolResultContent, Usage};
 
 use crate::providers::model::{
-    BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, ToolSpec,
+    BoxFuture, BoxStream, ForensicBuf, ForensicContext, ModelError, ModelEvent, ModelInfo,
+    ModelProvider, ModelRequest, ModelResponse, ProviderErrorDetail, ToolSpec,
 };
+
+/// Identifier stamped on [`ForensicContext`] / `ForensicArtifact`
+/// records minted by this adapter. Independent of the user-configured
+/// backend name (which io_dispatch tacks onto dump filenames).
+const PROVIDER_TAG: &str = "openai_chat";
 
 pub struct OpenAiChatClient {
     http: reqwest::Client,
@@ -110,8 +115,20 @@ impl OpenAiChatClient {
             return_progress: None,
         };
 
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: req.model.to_string(),
+            request_body: body_str.clone(),
+            request_content_type: "application/json",
+        };
         let url = format!("{}/chat/completions", self.base_url);
-        let builder = self.http.post(&url).json(&body);
+        let builder = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body_str);
         let send = self.apply_auth(builder).send();
         let resp = tokio::select! {
             r = send => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -123,7 +140,7 @@ impl OpenAiChatClient {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::api(status.as_u16(), body));
+            return Err(http_error_to_model_error(status.as_u16(), body, forensic));
         }
         let parsed: OaResponse = tokio::select! {
             r = resp.json() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
@@ -219,8 +236,18 @@ impl OpenAiChatClient {
                 return_progress: if self.request_prompt_progress { Some(true) } else { None },
             };
 
+            let body_str = serde_json::to_string(&body)
+                .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+            let forensic = ForensicContext {
+                backend: PROVIDER_TAG.to_string(),
+                model: req.model.to_string(),
+                request_body: body_str.clone(),
+                request_content_type: "application/json",
+            };
             let url = format!("{}/chat/completions", self.base_url);
-            let builder = self.http.post(&url).json(&body);
+            let builder = self.http.post(&url)
+                .header("content-type", "application/json")
+                .body(body_str);
             let send = self.apply_auth(builder).send();
             let resp: reqwest::Response = tokio::select! {
                 r = send => r.map_err(|e| ModelError::Transport(e.to_string())),
@@ -229,12 +256,13 @@ impl OpenAiChatClient {
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                Err(ModelError::api(status.as_u16(), body))?;
+                Err(http_error_to_model_error(status.as_u16(), body, forensic))?;
                 return;
             }
 
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
+            let mut forensic_buf = ForensicBuf::default();
             let mut state = ChatStreamState::default();
             loop {
                 let next = tokio::select! {
@@ -246,6 +274,7 @@ impl OpenAiChatClient {
                     _ = cancel.cancelled() => Err(ModelError::Cancelled),
                 };
                 let Some(chunk) = next? else { break };
+                forensic_buf.push(&chunk);
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -253,6 +282,31 @@ impl OpenAiChatClient {
                     };
                     if raw == "[DONE]" {
                         yield state.finalize()?;
+                        return;
+                    }
+                    // Some compat servers (and OpenAI itself on rare
+                    // mid-stream failures) inline a `{"error":{...}}`
+                    // data frame instead of dropping the stream. Detect
+                    // that shape first so we surface a structured error
+                    // with the matching ProviderErrorDetail rather than
+                    // silently skipping the frame on the OaStreamEvent
+                    // parse failure.
+                    if let Ok(env) = serde_json::from_str::<InlineErrorEnvelope>(&raw) {
+                        let detail = env.into_detail();
+                        let body = detail
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| raw.clone());
+                        let artifact = forensic.clone().into_artifact_with_response(ForensicBuf {
+                            bytes: forensic_buf.bytes.clone(),
+                            truncated: forensic_buf.truncated,
+                        });
+                        Err(ModelError::Api {
+                            status: 500,
+                            body,
+                            detail: Some(Box::new(detail)),
+                            forensic: Some(std::sync::Arc::new(artifact)),
+                        })?;
                         return;
                     }
                     let ev: OaStreamEvent = match serde_json::from_str(&raw) {
@@ -754,6 +808,70 @@ fn normalize_finish_reason(s: String) -> String {
     }
 }
 
+/// Inline `{"error":{...}}` shape — either an HTTP non-2xx body or a
+/// mid-stream data frame on routes that error after `[DONE]`-less
+/// stream interruption. Shape matches OpenAI's standard error
+/// envelope (and Azure, vLLM, llama.cpp compat servers all use it).
+#[derive(Deserialize)]
+struct InlineErrorEnvelope {
+    error: InlineError,
+}
+
+#[derive(Deserialize)]
+struct InlineError {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+impl InlineErrorEnvelope {
+    fn into_detail(self) -> ProviderErrorDetail {
+        ProviderErrorDetail {
+            code: self.error.code.filter(|s| !s.is_empty()),
+            kind: self.error.kind.filter(|s| !s.is_empty()),
+            response_id: self.error.request_id.filter(|s| !s.is_empty()),
+            message: Some(self.error.message).filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// Parse an HTTP non-2xx body into a `ModelError::Api`, mining the
+/// standard OpenAI `{"error":{...}}` envelope into
+/// [`ProviderErrorDetail`] when present and always attaching the
+/// forensic capture so an operator can read the original wire bytes
+/// from disk.
+fn http_error_to_model_error(status: u16, body: String, forensic: ForensicContext) -> ModelError {
+    let detail = serde_json::from_str::<InlineErrorEnvelope>(&body)
+        .ok()
+        .map(InlineErrorEnvelope::into_detail);
+    let artifact = forensic.into_http_error_artifact(body.as_bytes().to_vec());
+    ModelError::Api {
+        status,
+        body,
+        detail: detail.map(Box::new),
+        forensic: Some(std::sync::Arc::new(artifact)),
+    }
+}
+
+/// `finish_reason` values that indicate a non-normal completion the
+/// caller probably wants to know about. `stop`/`tool_calls`/`length`
+/// are normal terminations; everything else (`content_filter`,
+/// server-specific extras) becomes a ProviderWarning.
+fn warning_for_finish_reason(raw: &str) -> Option<ModelEvent> {
+    match raw {
+        "stop" | "tool_calls" | "function_call" | "length" => None,
+        other => Some(ModelEvent::ProviderWarning {
+            code: other.to_string(),
+            message: format!("chat completion ended with finish_reason={other}"),
+        }),
+    }
+}
+
 // ---------- Wire types (private to this module) ----------
 
 #[derive(Serialize, Debug)]
@@ -1174,6 +1292,13 @@ impl ChatStreamState {
                 }
             }
             if let Some(fr) = choice.finish_reason {
+                // Surface non-normal finish_reasons (content_filter,
+                // server-specific oddities) as a ProviderWarning *before*
+                // the implicit `Completed` so operators see the cause
+                // adjacent to the call.
+                if let Some(warning) = warning_for_finish_reason(&fr) {
+                    out.push(warning);
+                }
                 // Flush all accumulated tool calls now that the model
                 // has declared it's done emitting them. Consumers see a
                 // single `ToolCall` event per call with the full parsed
@@ -2051,5 +2176,67 @@ mod tests {
         let payload = b"data: {\"first\":1}\ndata:{\"second\":2}\n\n";
         let data = parse_sse_data(payload).unwrap();
         assert_eq!(data, "{\"first\":1}\n{\"second\":2}");
+    }
+
+    #[test]
+    fn http_error_envelope_extracts_code_and_kind() {
+        // Standard OpenAI 4xx error envelope. Verify code/type/message
+        // all land on ProviderErrorDetail so io_dispatch can grep by
+        // either `error.code = invalid_api_key` or `error.kind =
+        // authentication_error`.
+        let body = r#"{"error":{"message":"Invalid API key","type":"authentication_error","code":"invalid_api_key"}}"#;
+        let ctx = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "gpt-4".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err = http_error_to_model_error(401, body.to_string(), ctx);
+        let detail = err.provider_detail().cloned().expect("detail extracted");
+        assert_eq!(detail.code.as_deref(), Some("invalid_api_key"));
+        assert_eq!(detail.kind.as_deref(), Some("authentication_error"));
+        assert_eq!(detail.message.as_deref(), Some("Invalid API key"));
+        assert!(err.forensic().is_some());
+    }
+
+    #[test]
+    fn warning_for_finish_reason_filters_normal_terminations() {
+        assert!(warning_for_finish_reason("stop").is_none());
+        assert!(warning_for_finish_reason("tool_calls").is_none());
+        assert!(warning_for_finish_reason("function_call").is_none());
+        assert!(warning_for_finish_reason("length").is_none());
+        match warning_for_finish_reason("content_filter") {
+            Some(ModelEvent::ProviderWarning { code, .. }) => {
+                assert_eq!(code, "content_filter");
+            }
+            other => panic!("expected ProviderWarning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_content_filter_finish_reason_emits_provider_warning() {
+        // Content-filter terminations are a real failure mode for chat
+        // completions on hosted models. Verify the warning rides on
+        // the stream so io_dispatch logs it before the implicit
+        // Completed event.
+        let frames = [r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#];
+        let evs = run_stream(&frames);
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                ModelEvent::ProviderWarning { code, .. } if code == "content_filter"
+            )),
+            "expected ProviderWarning(content_filter), got {evs:?}"
+        );
+    }
+
+    fn run_stream(frames: &[&str]) -> Vec<ModelEvent> {
+        let mut state = ChatStreamState::default();
+        let mut out = Vec::new();
+        for f in frames {
+            let ev: OaStreamEvent = serde_json::from_str(f).unwrap();
+            out.extend(state.consume(ev).unwrap());
+        }
+        out
     }
 }
