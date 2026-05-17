@@ -40,8 +40,8 @@ use whisper_agent_protocol::{
 };
 
 use crate::providers::model::{
-    BoxFuture, BoxStream, ModelError, ModelEvent, ModelInfo, ModelProvider, ModelRequest,
-    ModelResponse, ToolSpec, UpdateAuthError,
+    BoxFuture, BoxStream, ForensicBuf, ForensicContext, ModelError, ModelEvent, ModelInfo,
+    ModelProvider, ModelRequest, ModelResponse, ProviderErrorDetail, ToolSpec, UpdateAuthError,
 };
 
 pub const OPENAI_API_BASE: &str = "https://api.openai.com/v1";
@@ -131,7 +131,7 @@ impl OpenAiResponsesClient {
         &self,
         req: &ModelRequest<'_>,
         cancel: &CancellationToken,
-    ) -> Result<reqwest::Response, ModelError> {
+    ) -> Result<(reqwest::Response, ForensicContext), ModelError> {
         let mut input: Vec<RspItem> = Vec::new();
         for m in req.messages {
             convert_message(m, &mut input);
@@ -162,6 +162,19 @@ impl OpenAiResponsesClient {
         // scheduler's `max_turns` still bounds the overall loop.
         let _ = req.max_tokens;
 
+        // Serialize once, ourselves, so the forensic context can hold a
+        // copy of the exact body that went on the wire. `.json(&body)`
+        // would serialize internally and discard it before we get a
+        // chance to grab a reference.
+        let body_str = serde_json::to_string(&body)
+            .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: req.model.to_string(),
+            request_body: body_str.clone(),
+            request_content_type: "application/json",
+        };
+
         let url = format!("{}/responses", self.base_url);
         let prepare = self.prepare_headers();
         let (bearer, extra_headers) = tokio::select! {
@@ -173,7 +186,8 @@ impl OpenAiResponsesClient {
             .post(&url)
             .bearer_auth(&bearer)
             .header("accept", "text/event-stream")
-            .json(&body);
+            .header("content-type", "application/json")
+            .body(body_str);
         for (k, v) in &extra_headers {
             builder = builder.header(*k, v);
         }
@@ -184,13 +198,17 @@ impl OpenAiResponsesClient {
         };
         let status = resp.status();
         if !status.is_success() {
-            let body = tokio::select! {
+            let body_text = tokio::select! {
                 b = resp.text() => b.unwrap_or_default(),
                 _ = cancel.cancelled() => return Err(ModelError::Cancelled),
             };
-            return Err(ModelError::api(status.as_u16(), body));
+            return Err(http_error_to_model_error(
+                status.as_u16(),
+                body_text,
+                forensic,
+            ));
         }
-        Ok(resp)
+        Ok((resp, forensic))
     }
 
     async fn do_create_message(
@@ -198,7 +216,7 @@ impl OpenAiResponsesClient {
         req: &ModelRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelResponse, ModelError> {
-        let resp = self.send_request(req, cancel).await?;
+        let (resp, forensic) = self.send_request(req, cancel).await?;
         // Buffer the full SSE stream and dig out the `response.completed` event
         // — its `response` field has the status / usage / incomplete_details
         // bits we still need even when using the streaming assembly.
@@ -206,7 +224,7 @@ impl OpenAiResponsesClient {
             r = resp.text() => r.map_err(|e| ModelError::Transport(e.to_string()))?,
             _ = cancel.cancelled() => return Err(ModelError::Cancelled),
         };
-        let parsed: RspResponse = extract_completed_response(&raw)?;
+        let parsed: RspResponse = extract_completed_response(&raw, Some(&forensic))?;
         let (content, stop_reason, usage) = finalize_response(
             parsed.output,
             parsed.status,
@@ -226,7 +244,7 @@ impl OpenAiResponsesClient {
         cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
-            let resp = self.send_request(req, cancel).await?;
+            let (resp, forensic) = self.send_request(req, cancel).await?;
             // Extract Codex-route usage headers before the response is
             // consumed by `bytes_stream` — these are the per-account
             // 5h/weekly utilization counters the ChatGPT backend ships
@@ -240,6 +258,7 @@ impl OpenAiResponsesClient {
             }
             let mut bytes = resp.bytes_stream();
             let mut sse_buf: Vec<u8> = Vec::new();
+            let mut forensic_buf = ForensicBuf::default();
             let mut state = RspStreamState::default();
             loop {
                 let next = tokio::select! {
@@ -251,6 +270,7 @@ impl OpenAiResponsesClient {
                     _ = cancel.cancelled() => Err(ModelError::Cancelled),
                 };
                 let Some(chunk) = next? else { break };
+                forensic_buf.push(&chunk);
                 sse_buf.extend_from_slice(&chunk);
                 while let Some(event_payload) = take_sse_event(&mut sse_buf) {
                     let Some(raw) = parse_sse_data(&event_payload) else {
@@ -266,7 +286,7 @@ impl OpenAiResponsesClient {
                         // time; we don't want to hard-error on them.
                         Err(_) => continue,
                     };
-                    for out in state.consume(ev)? {
+                    for out in state.consume(ev, &forensic, &forensic_buf)? {
                         yield out;
                     }
                     if state.done {
@@ -860,8 +880,13 @@ fn spec_to_rsp_tool(t: &ToolSpec) -> RspTool {
 /// metadata + accumulated items as the output.
 ///
 /// `response.failed` short-circuits to [`ModelError::Api`] so terminal
-/// server-side errors surface cleanly to the caller.
-fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
+/// server-side errors surface cleanly to the caller. When `forensic`
+/// is `Some`, the assembled body bytes ride along on the error for the
+/// forensic dump path.
+fn extract_completed_response(
+    body: &str,
+    forensic: Option<&ForensicContext>,
+) -> Result<RspResponse, ModelError> {
     let mut items: Vec<RspOutputItem> = Vec::new();
     for line in body.lines() {
         let Some(payload) = line.strip_prefix("data:") else {
@@ -886,15 +911,17 @@ fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
                 return Ok(response);
             }
             SseEvent::ResponseFailed { response, error } => {
-                let detail = error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "response.failed".to_string());
-                let status = response
-                    .as_ref()
-                    .and_then(|r| r.status.clone())
-                    .unwrap_or_else(|| "failed".to_string());
-                return Err(ModelError::api(500, format!("{status}: {detail}")));
+                let (status, body) = response_failed_body(&response, &error);
+                let detail = response_failed_detail(response.as_ref(), error.as_ref());
+                let artifact = forensic
+                    .cloned()
+                    .map(|ctx| ctx.into_http_error_artifact(body.as_bytes().to_vec()));
+                return Err(ModelError::Api {
+                    status: 500,
+                    body: format!("{status}: {body}"),
+                    detail: Some(Box::new(detail)),
+                    forensic: artifact.map(std::sync::Arc::new),
+                });
             }
             SseEvent::Other => {}
         }
@@ -902,6 +929,96 @@ fn extract_completed_response(body: &str) -> Result<RspResponse, ModelError> {
     Err(ModelError::Transport(
         "SSE stream ended without response.completed".into(),
     ))
+}
+
+/// Pull `(status_label, human_message)` out of a `response.failed`
+/// payload for the user-visible `ModelError::Api.body` string. Status
+/// is the parent `response.status`; message prefers the most-specific
+/// nested error.message over the top-level one (the codex backend
+/// puts the real detail on `response.error.message`).
+fn response_failed_body(
+    response: &Option<RspResponse>,
+    error: &Option<SseError>,
+) -> (String, String) {
+    let nested = response.as_ref().and_then(|r| r.error.as_ref());
+    let msg = nested
+        .map(|e| e.message.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "response.failed".into());
+    let status = response
+        .as_ref()
+        .and_then(|r| r.status.clone())
+        .unwrap_or_else(|| "failed".into());
+    (status, msg)
+}
+
+/// Build a [`ProviderErrorDetail`] from a `response.failed` payload.
+/// Reads both the top-level `error` and the nested `response.error`
+/// since chatgpt.com/codex routes the useful fields through the
+/// nested envelope, while api.openai.com uses the top level. Prefers
+/// the nested values when populated.
+fn response_failed_detail(
+    response: Option<&RspResponse>,
+    top_error: Option<&SseError>,
+) -> ProviderErrorDetail {
+    let nested = response.and_then(|r| r.error.as_ref());
+    let pick = |nested: Option<&String>, top: Option<&String>| -> Option<String> {
+        nested
+            .filter(|s| !s.is_empty())
+            .or(top.filter(|s| !s.is_empty()))
+            .cloned()
+    };
+    ProviderErrorDetail {
+        code: pick(
+            nested.and_then(|e| e.code.as_ref()),
+            top_error.and_then(|e| e.code.as_ref()),
+        ),
+        kind: pick(
+            nested.and_then(|e| e.kind.as_ref()),
+            top_error.and_then(|e| e.kind.as_ref()),
+        ),
+        response_id: response.and_then(|r| r.id.clone()).or_else(|| {
+            // Fallback: some payloads put the request id on the error
+            // envelope instead of the parent response.
+            top_error
+                .and_then(|e| e.request_id.clone())
+                .or_else(|| nested.and_then(|e| e.request_id.clone()))
+        }),
+        message: pick(nested.map(|e| &e.message), top_error.map(|e| &e.message)),
+    }
+}
+
+/// Build a [`ModelError`] from an HTTP non-2xx response body. Tries to
+/// deserialize the body as the standard OpenAI `{ "error": { ... } }`
+/// envelope; falls back to all-None detail when the body isn't JSON
+/// (e.g. a Cloudflare HTML page in front of a real outage). Always
+/// attaches the forensic context — the body IS the response excerpt.
+fn http_error_to_model_error(status: u16, body: String, forensic: ForensicContext) -> ModelError {
+    #[derive(Deserialize)]
+    struct Envelope {
+        error: SseError,
+    }
+    let detail = serde_json::from_str::<Envelope>(&body)
+        .ok()
+        .map(|env| ProviderErrorDetail {
+            code: env.error.code.filter(|s| !s.is_empty()),
+            kind: env.error.kind.filter(|s| !s.is_empty()),
+            response_id: env.error.request_id.filter(|s| !s.is_empty()),
+            message: Some(env.error.message).filter(|s| !s.is_empty()),
+        });
+    let artifact = forensic.into_http_error_artifact(body.as_bytes().to_vec());
+    ModelError::Api {
+        status,
+        body,
+        detail: detail.map(Box::new),
+        forensic: Some(std::sync::Arc::new(artifact)),
+    }
 }
 
 /// Collapse Responses' `status` + `incomplete_details.reason` + whether the
@@ -1057,7 +1174,12 @@ struct ResponsesStreamingCall {
 const TOOL_STREAMING_CHAR_STEP: u32 = 32;
 
 impl RspStreamState {
-    fn consume(&mut self, event: RspStreamEvent) -> Result<Vec<ModelEvent>, ModelError> {
+    fn consume(
+        &mut self,
+        event: RspStreamEvent,
+        forensic: &ForensicContext,
+        forensic_buf: &ForensicBuf,
+    ) -> Result<Vec<ModelEvent>, ModelError> {
         let mut out = Vec::new();
         match event {
             RspStreamEvent::OutputTextDelta { delta } => {
@@ -1190,6 +1312,26 @@ impl RspStreamState {
                 } else {
                     response.output
                 };
+                // If the turn ended `incomplete` for any reason other
+                // than hitting max_output_tokens, surface a warning so
+                // an operator sees content_filter / safety / unknown
+                // truncations in `kubectl logs` rather than only as a
+                // mystery `stop_reason`.
+                if response.status.as_deref() == Some("incomplete") {
+                    let reason = response
+                        .incomplete_details
+                        .as_ref()
+                        .and_then(|d| d.reason.as_deref())
+                        .unwrap_or("unspecified");
+                    if reason != "max_output_tokens" {
+                        out.push(ModelEvent::ProviderWarning {
+                            code: format!("incomplete:{reason}"),
+                            message: format!(
+                                "Responses API returned incomplete status (reason={reason})"
+                            ),
+                        });
+                    }
+                }
                 let (content, stop_reason, usage) = finalize_response(
                     items,
                     response.status,
@@ -1204,15 +1346,18 @@ impl RspStreamState {
                 self.done = true;
             }
             RspStreamEvent::ResponseFailed { response, error } => {
-                let detail = error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "response.failed".to_string());
-                let status = response
-                    .as_ref()
-                    .and_then(|r| r.status.clone())
-                    .unwrap_or_else(|| "failed".to_string());
-                return Err(ModelError::api(500, format!("{status}: {detail}")));
+                let (status, body) = response_failed_body(&response, &error);
+                let detail = response_failed_detail(response.as_ref(), error.as_ref());
+                let artifact = forensic.clone().into_artifact_with_response(ForensicBuf {
+                    bytes: forensic_buf.bytes.clone(),
+                    truncated: forensic_buf.truncated,
+                });
+                return Err(ModelError::Api {
+                    status: 500,
+                    body: format!("{status}: {body}"),
+                    detail: Some(Box::new(detail)),
+                    forensic: Some(std::sync::Arc::new(artifact)),
+                });
             }
             RspStreamEvent::Other => {}
         }
@@ -1555,14 +1700,34 @@ enum SseEvent {
     Other,
 }
 
-#[derive(Deserialize, Debug)]
+/// Top-level `error` payload on a `response.failed` SSE event, or the
+/// error envelope returned in an HTTP non-2xx JSON body. OpenAI ships
+/// the same shape both places.
+#[derive(Deserialize, Debug, Default)]
 struct SseError {
     #[serde(default)]
     message: String,
+    /// Provider-shaped code: `context_length_exceeded`,
+    /// `invalid_api_key`, etc. Optional because some payloads only
+    /// carry a `type`.
+    #[serde(default)]
+    code: Option<String>,
+    /// Coarser category: `invalid_request_error`, `server_error`,
+    /// `rate_limit_error`.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// OpenAI request id. Sometimes lives here on the API-key route;
+    /// the subscription route puts it on the parent envelope instead.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 struct RspResponse {
+    /// Response id (the `resp_...` token the API mints for this turn).
+    /// Empty on the older subscription-path replies that omit it.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     output: Vec<RspOutputItem>,
     #[serde(default)]
@@ -1571,6 +1736,13 @@ struct RspResponse {
     incomplete_details: Option<RspIncompleteDetails>,
     #[serde(default)]
     usage: Option<RspUsage>,
+    /// Nested error envelope — populated by the chatgpt.com/codex route
+    /// on `response.failed` instead of (or in addition to) the
+    /// top-level `error` field. The api.openai.com route ships info
+    /// on top-level; subscription is inconsistent. Read both, prefer
+    /// whichever has the most filled fields.
+    #[serde(default)]
+    error: Option<SseError>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -2003,7 +2175,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"id":"r_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":3,"output_tokens":1}}}
 
 "#;
-        let r = extract_completed_response(stream).unwrap();
+        let r = extract_completed_response(stream, None).unwrap();
         assert_eq!(r.status.as_deref(), Some("completed"));
         assert_eq!(r.usage.as_ref().unwrap().output_tokens, 1);
         assert_eq!(r.output.len(), 1);
@@ -2026,7 +2198,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"id":"r_1","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}
 
 "#;
-        let r = extract_completed_response(stream).unwrap();
+        let r = extract_completed_response(stream, None).unwrap();
         assert_eq!(r.output.len(), 2);
         assert!(matches!(&r.output[0], RspOutputItem::Message { .. }));
         assert!(matches!(&r.output[1], RspOutputItem::FunctionCall { .. }));
@@ -2035,7 +2207,7 @@ data: {"type":"response.completed","response":{"id":"r_1","status":"completed","
     #[test]
     fn sse_stream_without_completed_errors() {
         let stream = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
-        let err = extract_completed_response(stream).unwrap_err();
+        let err = extract_completed_response(stream, None).unwrap_err();
         assert!(matches!(err, ModelError::Transport(_)));
     }
 
@@ -2045,7 +2217,7 @@ data: {"type":"response.completed","response":{"id":"r_1","status":"completed","
 data: {"type":"response.failed","response":{"status":"failed"},"error":{"message":"rate limited"}}
 
 "#;
-        let err = extract_completed_response(stream).unwrap_err();
+        let err = extract_completed_response(stream, None).unwrap_err();
         match err {
             ModelError::Api { status, body, .. } => {
                 assert_eq!(status, 500);
@@ -2053,6 +2225,135 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             }
             _ => panic!("expected Api error"),
         }
+    }
+
+    #[test]
+    fn response_failed_with_nested_response_error_extracts_detail() {
+        // chatgpt.com/codex shape: error payload lives on
+        // `response.error.{code,message}` not on the top-level
+        // `error`. Verifies we mine the nested envelope into
+        // ProviderErrorDetail so io_dispatch can log the actual code.
+        let stream = r#"event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_abc123","status":"failed","error":{"code":"server_error","type":"server_error","message":"Sorry, something went wrong"}}}
+
+"#;
+        let err = extract_completed_response(stream, None).unwrap_err();
+        let detail = err.provider_detail().cloned().expect("detail attached");
+        assert_eq!(detail.code.as_deref(), Some("server_error"));
+        assert_eq!(detail.kind.as_deref(), Some("server_error"));
+        assert_eq!(detail.response_id.as_deref(), Some("resp_abc123"));
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("Sorry, something went wrong")
+        );
+        match err {
+            ModelError::Api { status, body, .. } => {
+                assert_eq!(status, 500);
+                assert!(
+                    body.contains("Sorry, something went wrong"),
+                    "body was: {body}"
+                );
+            }
+            _ => panic!("expected Api error"),
+        }
+    }
+
+    #[test]
+    fn response_failed_prefers_nested_when_both_envelopes_present() {
+        // Pathological-but-real shape from the chatgpt subscription
+        // route: both top-level `error.message` and `response.error`
+        // populated. The nested one carries the specific code, so it
+        // wins.
+        let stream = r#"event: response.failed
+data: {"type":"response.failed","response":{"id":"resp_xyz","status":"failed","error":{"code":"context_length_exceeded","message":"Request exceeds context window"}},"error":{"message":"top-level fallback"}}
+
+"#;
+        let err = extract_completed_response(stream, None).unwrap_err();
+        let detail = err.provider_detail().cloned().unwrap();
+        assert_eq!(detail.code.as_deref(), Some("context_length_exceeded"));
+        assert_eq!(
+            detail.message.as_deref(),
+            Some("Request exceeds context window")
+        );
+        assert_eq!(detail.response_id.as_deref(), Some("resp_xyz"));
+    }
+
+    #[test]
+    fn response_failed_with_forensic_attaches_artifact() {
+        // Verify the forensic context flows through to the error so
+        // io_dispatch's dump-to-disk path has the request body to
+        // record alongside the failed response.
+        let stream = r#"event: response.failed
+data: {"type":"response.failed","response":{"status":"failed"},"error":{"message":"boom"}}
+
+"#;
+        let ctx = ForensicContext {
+            backend: "openai_responses".into(),
+            model: "gpt-5".into(),
+            request_body: r#"{"hello":"world"}"#.into(),
+            request_content_type: "application/json",
+        };
+        let err = extract_completed_response(stream, Some(&ctx)).unwrap_err();
+        let artifact = err.forensic().expect("artifact attached");
+        assert_eq!(artifact.backend, "openai_responses");
+        assert_eq!(artifact.model, "gpt-5");
+        assert_eq!(artifact.request_body, r#"{"hello":"world"}"#);
+        assert!(
+            std::str::from_utf8(&artifact.response_excerpt)
+                .unwrap()
+                .contains("boom"),
+            "excerpt should include the failure body"
+        );
+        assert!(!artifact.response_truncated);
+    }
+
+    #[test]
+    fn http_error_envelope_parses_into_provider_detail() {
+        // Standard OpenAI 4xx body shape — verify we mine code/type/
+        // message into ProviderErrorDetail so a 400 from a malformed
+        // request shows up as `error.code = invalid_request_error`
+        // in the logs instead of just a raw body.
+        let body = r#"{"error":{"message":"Invalid model","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let ctx = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "bad-model".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err = http_error_to_model_error(400, body.to_string(), ctx);
+        let detail = err.provider_detail().cloned().expect("detail extracted");
+        assert_eq!(detail.code.as_deref(), Some("model_not_found"));
+        assert_eq!(detail.kind.as_deref(), Some("invalid_request_error"));
+        assert_eq!(detail.message.as_deref(), Some("Invalid model"));
+        let artifact = err.forensic().expect("artifact attached");
+        assert_eq!(artifact.request_body, "{}");
+        assert!(
+            std::str::from_utf8(&artifact.response_excerpt)
+                .unwrap()
+                .contains("Invalid model")
+        );
+    }
+
+    #[test]
+    fn http_error_with_non_json_body_still_attaches_forensic_without_detail() {
+        // Cloudflare HTML page or similar — body isn't JSON, so detail
+        // stays None but the forensic capture still records the bytes
+        // so an operator can see what the upstream actually returned.
+        let body = "<html><body>502 Bad Gateway</body></html>";
+        let ctx = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "gpt-5".into(),
+            request_body: "{}".into(),
+            request_content_type: "application/json",
+        };
+        let err = http_error_to_model_error(502, body.to_string(), ctx);
+        assert!(err.provider_detail().is_none(), "no structured detail");
+        let artifact = err.forensic().expect("artifact still attached");
+        assert!(
+            std::str::from_utf8(&artifact.response_excerpt)
+                .unwrap()
+                .contains("502 Bad Gateway")
+        );
     }
 
     #[test]
@@ -2521,9 +2822,16 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
     fn feed_events(events: &[&str]) -> (Vec<ModelEvent>, RspStreamState) {
         let mut state = RspStreamState::default();
         let mut out = Vec::new();
+        let forensic = ForensicContext {
+            backend: PROVIDER_TAG.to_string(),
+            model: "test".into(),
+            request_body: String::new(),
+            request_content_type: "application/json",
+        };
+        let buf = ForensicBuf::default();
         for ev_json in events {
             let ev: RspStreamEvent = serde_json::from_str(ev_json).unwrap();
-            out.extend(state.consume(ev).unwrap());
+            out.extend(state.consume(ev, &forensic, &buf).unwrap());
         }
         (out, state)
     }

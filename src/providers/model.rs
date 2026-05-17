@@ -216,6 +216,72 @@ pub struct ForensicArtifact {
 /// JSON file. Exposed so adapters and tests share one constant.
 pub const FORENSIC_RESPONSE_CAP_BYTES: usize = 256 * 1024;
 
+/// Per-call forensic context built up by the adapter before it ships
+/// any bytes. Captures the request body once so error paths can attach
+/// it without re-serializing. Pair with a [`ForensicBuf`] that
+/// accumulates response bytes; on failure call
+/// [`Self::into_artifact_with_response`] (streaming) or
+/// [`Self::into_http_error_artifact`] (pre-stream non-2xx) to mint the
+/// final [`ForensicArtifact`].
+#[derive(Debug, Clone)]
+pub struct ForensicContext {
+    /// Stable provider-shaped id ("openai_responses", "anthropic", …).
+    /// Distinct from the user-configured backend label which io_dispatch
+    /// tacks onto the dump filename — adapters don't know the latter.
+    pub backend: String,
+    pub model: String,
+    pub request_body: String,
+    pub request_content_type: &'static str,
+}
+
+impl ForensicContext {
+    pub fn into_artifact_with_response(self, buf: ForensicBuf) -> ForensicArtifact {
+        ForensicArtifact {
+            backend: self.backend,
+            model: self.model,
+            request_body: self.request_body,
+            request_content_type: self.request_content_type,
+            response_excerpt: buf.bytes,
+            response_truncated: buf.truncated,
+        }
+    }
+
+    /// Build an artifact for a pre-stream HTTP-error capture — the
+    /// entire error body is the response and was read whole, so the
+    /// truncated flag is always false.
+    pub fn into_http_error_artifact(self, body: impl Into<Vec<u8>>) -> ForensicArtifact {
+        ForensicArtifact {
+            backend: self.backend,
+            model: self.model,
+            request_body: self.request_body,
+            request_content_type: self.request_content_type,
+            response_excerpt: body.into(),
+            response_truncated: false,
+        }
+    }
+}
+
+/// Rolling response-bytes window used during streaming consumption.
+/// Keeps the most-recent [`FORENSIC_RESPONSE_CAP_BYTES`] bytes so that
+/// a terminal failure mid-stream still captures the events leading up
+/// to it without unbounded memory growth on multi-MB streams.
+#[derive(Debug, Default)]
+pub struct ForensicBuf {
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+impl ForensicBuf {
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > FORENSIC_RESPONSE_CAP_BYTES {
+            let drop = self.bytes.len() - FORENSIC_RESPONSE_CAP_BYTES;
+            self.bytes.drain(..drop);
+            self.truncated = true;
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error("transport error: {0}")]
