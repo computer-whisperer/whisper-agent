@@ -5708,6 +5708,15 @@ impl App for ChatApp {
             }
         }
 
+        // Per-binding session-option toggles. Lives at the top level
+        // (not inside the overrides modal) because the picker chip
+        // editor is part of the main thread-creation form — gating it
+        // behind `new_thread_overrides_open` would swallow every
+        // click.
+        if self.handle_picker_host_env_option_event(&event) {
+            return;
+        }
+
         // Per-entry runas text input. Same shape as the workspace_root
         // route handler below — checked first because its prefix would
         // otherwise overlap with the wsroot one if we ever shortened
@@ -8211,10 +8220,6 @@ impl ChatApp {
         }
 
         if self.handle_new_thread_tunable_event(event) {
-            return true;
-        }
-
-        if self.handle_picker_host_env_option_event(event) {
             return true;
         }
 
