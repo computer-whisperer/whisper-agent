@@ -76,11 +76,22 @@ ProtectHostname=yes
 # Process surface
 LockPersonality=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID is deliberately off: the daemon's worker spawn
+# drops uid to the pod-binding's `runas` user via setgroups + setgid
+# + setuid in the forked child's pre_exec, before landlock seals it.
+# RestrictSUIDSGID=yes would kill the worker with SIGSYS on the very
+# first of those calls. The daemon itself stays root; the carve-out
+# only enables the legitimate drop-uid path on each spawn.
+RestrictSUIDSGID=no
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# Strip @privileged and @resources, then add back exactly the three
+# privileged calls the worker spawn's drop-uid chain needs
+# (setgroups / setgid / setuid). Everything else in @privileged
+# (mount, swapon, ptrace targets, etc.) stays denied.
 SystemCallFilter=~@privileged @resources
+SystemCallFilter=setgroups setgid setuid
 
 [Install]
 WantedBy=multi-user.target
