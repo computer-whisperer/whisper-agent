@@ -2435,6 +2435,12 @@ pub enum ServerToClient {
     ThreadToolCallEnd {
         thread_id: String,
         tool_use_id: String,
+        /// Full text body of the tool result. The `_preview` suffix is
+        /// kept for protocol stability; historically the runtime
+        /// truncated this to 200 chars, but worker-side caps already
+        /// bound the size (bash: 30 KiB, MCP tools similar) and the
+        /// snapshot path always carried the full body — clipping here
+        /// just hid content the UI was otherwise ready to render.
         result_preview: String,
         is_error: bool,
         /// Image attachments lifted from the tool result's content

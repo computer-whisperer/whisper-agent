@@ -1104,10 +1104,19 @@ impl Thread {
         // refresh forced a snapshot resync — the image bytes are
         // already in `content` but the wire-level ToolCallEnd only
         // ships `result_preview`.
+        //
+        // `result_preview` ships the full text now. Worker-side caps
+        // (bash: BASH_MAX_OUTPUT_BYTES = 30 KiB, MCP tools similar)
+        // already bound the size, so a wire-level second truncate just
+        // hides content the UI is otherwise ready to render — the live
+        // event was clipping non-streaming tools (read_file, grep, …)
+        // to 200 chars even though the snapshot path showed the full
+        // text on reload. The field keeps its `_preview` name for
+        // protocol stability.
         let attachments: Vec<ImageSource> = content.image_sources().into_iter().cloned().collect();
         events.push(ThreadEvent::ToolCallEnd {
             tool_use_id: tool_use_id.clone(),
-            result_preview: truncate(preview, 200),
+            result_preview: preview,
             is_error,
             attachments,
         });

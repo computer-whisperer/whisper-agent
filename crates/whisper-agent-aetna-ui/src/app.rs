@@ -4239,11 +4239,13 @@ impl ChatApp {
                     }) = view.items.iter_mut().rev().find(|it| {
                         matches!(it, DisplayItem::ToolCall { tool_use_id: id, .. } if id == &tool_use_id)
                     }) {
-                        // `ThreadToolCallEnd.result_preview` is intentionally
-                        // small for collapsed headers. If the tool streamed
-                        // text content while it ran, keep that accumulated
-                        // full output as the expanded result body instead of
-                        // replacing it with the clipped preview at completion.
+                        // `ThreadToolCallEnd.result_preview` carries the full
+                        // tool body (worker-side caps already bound it). If
+                        // the tool also streamed chunks while it ran, prefer
+                        // the accumulated `streaming_output` — the chunks
+                        // already paint as the assistant watches it, and
+                        // replacing them at completion would flash the same
+                        // text through the layout engine a second time.
                         let full_or_preview = if streaming_output.trim().is_empty() {
                             result_preview
                         } else {
