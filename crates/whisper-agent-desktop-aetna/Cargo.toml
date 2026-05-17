@@ -17,8 +17,8 @@ whisper-agent-protocol = { workspace = true }
 # Aetna's optional native winit + wgpu host. Owns window creation,
 # event loop, surface configuration, and frame submission so this
 # binary only has to plug a `ChatApp` into it.
-aetna-core = "0.3.5"
-aetna-winit-wgpu = "0.3.5"
+aetna-core = "0.3.6"
+aetna-winit-wgpu = "0.3.6"
 # aetna-core = { path = "../../../../aetna/aetna.main/crates/aetna-core" }
 # aetna-winit-wgpu = { path = "../../../../aetna/aetna.main/crates/aetna-winit-wgpu" }
 
