@@ -58,6 +58,19 @@ pub struct ModelRequest<'a> {
     /// adjacent same-prefix calls across cache-cold nodes. Providers
     /// without a routing-key concept ignore this field.
     pub request_cache_key: Option<&'a str>,
+    /// Server-process lifetime identifier. Forwarded as the
+    /// `session-id` header on routes that recognize it (OpenAI Codex).
+    /// Fresh per server-process startup; constant for every thread
+    /// served by that process. Used by the backend for routing /
+    /// observability and to associate /responses requests with a
+    /// single "session" in codex's vocabulary.
+    pub session_id: Option<&'a str>,
+    /// Per-deployment identifier persisted under the data directory.
+    /// Forwarded as `x-codex-installation-id` on the Codex route so
+    /// the backend can correlate requests from the same install
+    /// across server restarts. Ignored by routes that don't recognize
+    /// codex-namespaced headers.
+    pub installation_id: Option<&'a str>,
 }
 
 /// Logical positions at which a cache checkpoint can be attached. Translated into

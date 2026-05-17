@@ -1213,6 +1213,8 @@ mod tests {
             cache_breakpoints: &[],
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1239,6 +1241,8 @@ mod tests {
             cache_breakpoints: &[CacheBreakpoint::AfterSystem],
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1266,6 +1270,8 @@ mod tests {
             cache_breakpoints: &[CacheBreakpoint::AfterSystem],
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1298,6 +1304,8 @@ mod tests {
             cache_breakpoints: &[CacheBreakpoint::AfterTools],
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1323,6 +1331,8 @@ mod tests {
             cache_breakpoints: &[CacheBreakpoint::AfterMessage(2)],
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();
@@ -1353,6 +1363,8 @@ mod tests {
             cache_breakpoints: &breakpoints,
             tunables: &tunables,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         };
         let body = build_request_body(&req);
         let v = serde_json::to_value(&body).unwrap();

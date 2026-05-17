@@ -71,6 +71,13 @@ pub const CHATGPT_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/u
 /// frontier models from the picker.
 const CODEX_CLIENT_VERSION: &str = "99.0.0";
 
+/// `originator` request-header value advertised on Codex-route /responses
+/// calls. Mirrors codex's `DEFAULT_ORIGINATOR` (see
+/// `codex-rs/login/src/auth/default_client.rs`); the chatgpt.com backend
+/// may gate features by originator, and our reasons for impersonating the
+/// official client are the same as for [`CODEX_CLIENT_VERSION`].
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
 pub struct OpenAiResponsesClient {
     http: reqwest::Client,
     base_url: String,
@@ -191,6 +198,25 @@ impl OpenAiResponsesClient {
             .body(body_str);
         for (k, v) in &extra_headers {
             builder = builder.header(*k, v);
+        }
+        // Identity headers — mirror what the official codex CLI sends so
+        // the chatgpt.com backend treats us as a real client (its routing
+        // and observability hang off these). `session-id` / `thread-id`
+        // are general OpenAI conventions; `x-codex-installation-id` and
+        // `originator` are codex-namespaced and only ride the Codex
+        // route. api.openai.com may 400 on unknown headers, so the
+        // codex-prefixed ones stay gated behind the auth variant.
+        if let Some(thread_id) = req.request_cache_key {
+            builder = builder.header("thread-id", thread_id);
+        }
+        if let Some(session_id) = req.session_id {
+            builder = builder.header("session-id", session_id);
+        }
+        if matches!(self.auth, ClientAuth::Codex(_)) {
+            if let Some(install) = req.installation_id {
+                builder = builder.header("x-codex-installation-id", install);
+            }
+            builder = builder.header("originator", CODEX_ORIGINATOR);
         }
         let send = builder.send();
         let resp = tokio::select! {

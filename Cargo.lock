@@ -6969,6 +6969,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "whisper-agent-auth",
  "whisper-agent-host-proto",
  "whisper-agent-protocol",

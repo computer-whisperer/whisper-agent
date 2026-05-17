@@ -127,6 +127,16 @@ pub struct ServerConfig {
     /// io_dispatch still fires.
     pub forensics_dir: PathBuf,
     pub host_id: String,
+    /// Per-deployment identifier, loaded-or-created at startup and
+    /// persisted under the data dir. Forwarded to provider adapters
+    /// (OpenAI Codex consumes it as the `x-codex-installation-id`
+    /// header) so requests from the same install correlate across
+    /// server restarts.
+    pub installation_id: String,
+    /// Fresh per-server-process identifier minted at startup. Forwarded
+    /// to provider adapters (OpenAI Codex consumes it as the
+    /// `session-id` header). New value on every restart.
+    pub session_id: String,
     /// Pods root directory. If `None`, persistence is disabled.
     pub pods_root: Option<PathBuf>,
     /// Knowledge buckets root directory. Sibling of `pods_root`. When
@@ -253,6 +263,8 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
     let (mut scheduler, stream_rx, usage_rx, bucket_task_rx, resync_request_rx) = Scheduler::new(
         default_pod,
         config.host_id,
+        config.installation_id,
+        config.session_id,
         config.backends,
         config.embedding_providers,
         config.rerank_providers,

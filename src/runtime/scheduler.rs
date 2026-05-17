@@ -703,6 +703,17 @@ pub struct Scheduler {
     /// `None` when started with the env-key fallback (no `--config`).
     /// Runtime config-edit handlers refuse to write back without it.
     server_config_path: Option<PathBuf>,
+    /// Per-deployment identifier, persisted under the data directory
+    /// across restarts. Surfaced to provider adapters via
+    /// `ModelRequest::installation_id`. OpenAI's Codex route maps it
+    /// onto the `x-codex-installation-id` header so requests from the
+    /// same install correlate server-side.
+    installation_id: String,
+    /// Server-process lifetime identifier — minted fresh at startup,
+    /// constant for every thread served by this process. Surfaced to
+    /// provider adapters via `ModelRequest::session_id`. OpenAI's
+    /// Codex route maps it onto the `session-id` header.
+    session_id: String,
     persister: Option<Persister>,
     /// v2 host-env link registry. Holds the admitted-name set
     /// (sourced from `[[auth.daemons]]` at startup) plus the live WS
@@ -908,6 +919,8 @@ impl Scheduler {
     pub async fn new(
         default_pod: Pod,
         host_id: String,
+        installation_id: String,
+        session_id: String,
         backends: HashMap<String, BackendEntry>,
         embedding_providers: HashMap<String, EmbeddingProviderEntry>,
         rerank_providers: HashMap<String, RerankProviderEntry>,
@@ -1007,6 +1020,8 @@ impl Scheduler {
                 rerank_providers,
                 bucket_registry,
                 server_config_path,
+                installation_id,
+                session_id,
                 persister: None,
                 v2_daemon_registry,
                 v2_sessions: V2SessionStore::new(),
@@ -1051,6 +1066,20 @@ impl Scheduler {
     /// router.
     pub(crate) fn stream_sender(&self) -> mpsc::UnboundedSender<StreamUpdate> {
         self.stream_tx.clone()
+    }
+
+    /// Per-deployment identifier persisted under the data dir. Used by
+    /// `io_dispatch::build_model_request` to forward as
+    /// [`ModelRequest::installation_id`].
+    pub(crate) fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Server-process lifetime identifier. Used by
+    /// `io_dispatch::build_model_request` to forward as
+    /// [`ModelRequest::session_id`].
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Clone of the forensic disk-dump sink. io_dispatch's `model_call`

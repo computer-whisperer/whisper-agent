@@ -173,6 +173,12 @@ hf-hub = { version = "0.5", default-features = false, features = ["rustls-tls", 
 # slot-open time.
 memmap2 = "0.9"
 
+# uuid for session/installation identifiers sent on every /responses
+# request. Session id is minted fresh per server-process startup;
+# installation id is generated once per deployment and persisted under
+# the data dir so it stays stable across restarts.
+uuid = { version = "1", features = ["v4"] }
+
 # `half` for f16 quantization in vectors.bin and the f16-backed HNSW
 # index. Already in the lock file transitively (hnsw_rs / tantivy pull
 # it in); listed explicitly so we can name the type. The `serde` feature

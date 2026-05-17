@@ -1778,6 +1778,8 @@ mod tests {
             cache_breakpoints: &[],
             tunables: &EMPTY_TUNABLES,
             request_cache_key: None,
+            session_id: None,
+            installation_id: None,
         }
     }
 

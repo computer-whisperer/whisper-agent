@@ -121,6 +121,15 @@ struct ServeArgs {
     #[arg(long, default_value = "audit.jsonl")]
     audit_log: PathBuf,
 
+    /// Path to a file holding the per-deployment installation UUID.
+    /// Loaded at startup if it exists, else a fresh UUIDv4 is generated
+    /// and persisted there. Forwarded to provider adapters that surface
+    /// it on the wire (OpenAI Codex consumes it as the
+    /// `x-codex-installation-id` header) so requests from the same
+    /// install correlate across server restarts.
+    #[arg(long, default_value = "installation_id")]
+    installation_id_file: PathBuf,
+
     /// Directory for forensic dumps written when a model-call retry
     /// budget is exhausted. Each terminal failure produces one JSON
     /// file containing the request body, the captured response
@@ -242,6 +251,39 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// Load the per-deployment installation UUID from `path`, generating
+/// and persisting a fresh one if the file doesn't exist (or contains a
+/// non-UUID body). Forwarded to provider adapters as the `x-codex-
+/// installation-id` request header on the OpenAI Codex route so the
+/// backend correlates requests from the same install across server
+/// restarts.
+///
+/// Whitespace is trimmed on read so a stray trailing newline doesn't
+/// invalidate an otherwise-good UUID file.
+fn load_or_create_installation_id(path: &std::path::Path) -> Result<String> {
+    if let Ok(body) = std::fs::read_to_string(path) {
+        let trimmed = body.trim();
+        if uuid::Uuid::parse_str(trimmed).is_ok() {
+            return Ok(trimmed.to_string());
+        }
+        info!(
+            file = %path.display(),
+            "installation_id file present but contents are not a valid UUID; regenerating"
+        );
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent dir for {}", path.display()))?;
+    }
+    std::fs::write(path, &fresh)
+        .with_context(|| format!("write installation_id to {}", path.display()))?;
+    info!(file = %path.display(), id = %fresh, "minted fresh installation_id");
+    Ok(fresh)
 }
 
 /// Parse a `name=url` pair for `--shared-mcp-host`. Names must be non-empty
@@ -579,6 +621,8 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         audit_log_path: args.audit_log,
         forensics_dir: args.forensics_dir,
         host_id: "default".into(),
+        installation_id: load_or_create_installation_id(&args.installation_id_file)?,
+        session_id: uuid::Uuid::new_v4().to_string(),
         pods_root,
         buckets_root,
         shared_mcp_catalog: shared_mcp_catalog_store,

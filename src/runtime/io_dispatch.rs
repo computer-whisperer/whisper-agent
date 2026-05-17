@@ -603,6 +603,8 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             cache_breakpoints: &owned_req.cache_breakpoints,
             tunables: &owned_req.tunables,
             request_cache_key: Some(owned_req.request_cache_key.as_str()),
+            session_id: Some(owned_req.session_id.as_str()),
+            installation_id: Some(owned_req.installation_id.as_str()),
         };
         let result = match stream_with_retry(
             provider.as_ref(),
@@ -1275,6 +1277,15 @@ struct OwnedModelRequest {
     /// [`ModelRequest::request_cache_key`]. Sourced from `thread_id`
     /// so every request for the same thread shares it.
     request_cache_key: String,
+    /// Server-process lifetime identifier. Surfaced to providers as
+    /// [`ModelRequest::session_id`]. Cloned from the scheduler's
+    /// startup-minted UUID; same value for every thread served by
+    /// this process.
+    session_id: String,
+    /// Per-deployment identifier persisted under the data dir.
+    /// Surfaced to providers as [`ModelRequest::installation_id`].
+    /// Cloned from the scheduler's load-or-create startup value.
+    installation_id: String,
 }
 
 fn build_model_request(
@@ -1315,6 +1326,8 @@ fn build_model_request(
     let cache_breakpoints = default_cache_policy(&messages);
     let tunables = task.config.tunables.clone();
     let request_cache_key = thread_id.to_string();
+    let session_id = scheduler.session_id().to_string();
+    let installation_id = scheduler.installation_id().to_string();
     (
         OwnedModelRequest {
             model: model.clone(),
@@ -1325,6 +1338,8 @@ fn build_model_request(
             cache_breakpoints,
             tunables,
             request_cache_key,
+            session_id,
+            installation_id,
         },
         model,
         backend_name,
