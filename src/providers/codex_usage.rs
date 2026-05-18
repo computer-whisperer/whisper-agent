@@ -159,6 +159,77 @@ pub fn parse_wham_usage_response(body: &str) -> Result<Option<BackendUsage>, ser
     }))
 }
 
+/// Decoded shape of a `codex.rate_limits` WS frame. The chatgpt.com
+/// codex backend ships per-window utilization on the SSE path as
+/// `x-codex-*` response headers and on the WS path as one of these
+/// frames at the start of the response stream. Same data, different
+/// envelope — see [`parse_codex_rate_limits_frame`] for the
+/// frame-side parser that emits the same `BackendUsage` shape the
+/// header path does.
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitsFrame {
+    #[serde(rename = "type")]
+    ty: String,
+    #[serde(rename = "plan_type")]
+    plan_type: Option<String>,
+    rate_limits: Option<CodexRateLimitsBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitsBody {
+    primary: Option<CodexRateLimitsWindow>,
+    secondary: Option<CodexRateLimitsWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexRateLimitsWindow {
+    used_percent: Option<f32>,
+    window_minutes: Option<u32>,
+    reset_at: Option<i64>,
+}
+
+/// Parse a WS event frame as a `codex.rate_limits` snapshot, returning
+/// the same `BackendUsage` shape the SSE header parser produces.
+/// Returns `None` if the frame is not a rate-limits event, doesn't
+/// parse, or carries no usable window data — the caller is expected
+/// to fall through to the regular event-frame parser in that case.
+pub fn parse_codex_rate_limits_frame(text: &str) -> Option<BackendUsage> {
+    // Cheap discriminator probe — avoid parsing every event frame's
+    // body when only a small fraction are rate-limits events.
+    if !text.contains("\"codex.rate_limits\"") {
+        return None;
+    }
+    let parsed: CodexRateLimitsFrame = serde_json::from_str(text).ok()?;
+    if parsed.ty != "codex.rate_limits" {
+        return None;
+    }
+    let rl = parsed.rate_limits?;
+    let primary = rl.primary.and_then(codex_window_to_usage);
+    let secondary = rl.secondary.and_then(codex_window_to_usage);
+    if primary.is_none() && secondary.is_none() && parsed.plan_type.is_none() {
+        return None;
+    }
+    Some(BackendUsage {
+        primary,
+        secondary,
+        // The frame doesn't include credits — the codex CLI surfaces
+        // those only via the wham/usage poll. Leave None here; the
+        // on-demand poll fills it when the user opens the dropdown.
+        credits: None,
+        plan_type: parsed.plan_type,
+        captured_at: Utc::now().to_rfc3339(),
+        source: UsageSource::Headers,
+    })
+}
+
+fn codex_window_to_usage(w: CodexRateLimitsWindow) -> Option<UsageWindow> {
+    w.used_percent.map(|used_percent| UsageWindow {
+        used_percent,
+        window_minutes: w.window_minutes,
+        resets_at_epoch: w.reset_at,
+    })
+}
+
 fn wham_to_window(w: WhamWindow) -> Option<UsageWindow> {
     w.used_percent.map(|used_percent| UsageWindow {
         used_percent,
@@ -194,6 +265,51 @@ mod tests {
     #[test]
     fn headers_empty_returns_none() {
         assert!(parse_codex_headers(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn ws_rate_limits_frame_parses() {
+        // Sample lifted from a live `codex.rate_limits` WS frame.
+        // The fields we care about: type discriminator, plan_type at
+        // the top level, primary + secondary windows under
+        // `rate_limits`.
+        let frame = r#"{
+            "type": "codex.rate_limits",
+            "plan_type": "pro",
+            "rate_limits": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary": {"used_percent": 12.5, "window_minutes": 300, "reset_after_seconds": 600, "reset_at": 1764554400},
+                "secondary": {"used_percent": 73, "window_minutes": 10080, "reset_after_seconds": 600, "reset_at": 1764615600}
+            }
+        }"#;
+        let snap = parse_codex_rate_limits_frame(frame).expect("should parse");
+        assert_eq!(snap.plan_type.as_deref(), Some("pro"));
+        let primary = snap.primary.expect("primary window");
+        assert!((primary.used_percent - 12.5).abs() < 0.001);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at_epoch, Some(1764554400));
+        let secondary = snap.secondary.expect("secondary window");
+        assert!((secondary.used_percent - 73.0).abs() < 0.001);
+        assert_eq!(secondary.window_minutes, Some(10080));
+        // Frames don't carry credits — those only come from the
+        // wham/usage poll.
+        assert!(snap.credits.is_none());
+    }
+
+    #[test]
+    fn ws_rate_limits_frame_rejects_unrelated_event_types() {
+        let frame = r#"{"type": "response.created", "response": {}}"#;
+        assert!(parse_codex_rate_limits_frame(frame).is_none());
+    }
+
+    #[test]
+    fn ws_rate_limits_frame_rejects_garbage() {
+        // Not JSON.
+        assert!(parse_codex_rate_limits_frame("codex.rate_limits = oops").is_none());
+        // JSON but missing rate_limits body — nothing actionable.
+        let frame = r#"{"type":"codex.rate_limits"}"#;
+        assert!(parse_codex_rate_limits_frame(frame).is_none());
     }
 
     #[test]

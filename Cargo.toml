@@ -179,6 +179,14 @@ memmap2 = "0.9"
 # the data dir so it stays stable across restarts.
 uuid = { version = "1", features = ["v4"] }
 
+# tokio-tungstenite for the chatgpt.com codex-route WebSocket transport
+# of /responses. One long-lived `wss://` connection per turn pins the
+# load-balancer route to one cache shard, closing the residual prompt-
+# cache miss rate the SSE transport leaves on the table. `native-roots`
+# uses the OS trust store — chatgpt.com's cert chain validates fine
+# under it.
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+
 # `half` for f16 quantization in vectors.bin and the f16-backed HNSW
 # index. Already in the lock file transitively (hnsw_rs / tantivy pull
 # it in); listed explicitly so we can name the type. The `serde` feature

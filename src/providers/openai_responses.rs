@@ -26,12 +26,18 @@
 //! dropped — their opaque blob is meaningless here.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_stream::try_stream;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{
+    HeaderName as WsHeaderName, HeaderValue as WsHeaderValue,
+};
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 use whisper_agent_auth::{ClientAuth, CodexAuth, CodexAuthSlot, SlotUpdateError};
 use whisper_agent_protocol::{
@@ -87,44 +93,136 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 /// and the prompt cache misses.
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
+/// Wire transport for `/responses` requests. `Sse` is the original
+/// HTTP-POST-with-SSE-body path (one short-lived TCP connection per
+/// model call). `WebSocket` opens a long-lived `wss://` connection per
+/// turn and multiplexes every model call within that turn through it,
+/// physically pinning the load balancer route to one cache shard.
+///
+/// Lives next to the provider rather than reusing
+/// `crate::pod::config::OpenAiResponsesTransport` so the provider
+/// doesn't have to depend on the config layer; the config-driven
+/// builder converts via `From`. See
+/// `BackendConfig::OpenAiResponses::transport` in `pod/config.rs` for
+/// the operator-facing surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    Sse,
+    WebSocket,
+}
+
+impl From<crate::pod::config::OpenAiResponsesTransport> for Transport {
+    fn from(value: crate::pod::config::OpenAiResponsesTransport) -> Self {
+        match value {
+            crate::pod::config::OpenAiResponsesTransport::Sse => Transport::Sse,
+            crate::pod::config::OpenAiResponsesTransport::Websocket => Transport::WebSocket,
+        }
+    }
+}
+
+/// One open `wss://` connection plus the turn-routing-token Arc the
+/// connection was opened for. Stored in
+/// [`OpenAiResponsesClient::ws_sessions`]; one entry per currently-
+/// active turn, keyed by `thread_id`.
+///
+/// Lifecycle:
+///   - First call of a turn: no entry (or stale entry — Arc::ptr_eq
+///     against `routing_token` fails because the Thread minted a fresh
+///     `OnceLock` in `submit_user_message`). The entry is opened
+///     lazily, its WS upgrade sends whatever `x-codex-turn-state`
+///     value the slot currently holds (empty on first call, populated
+///     on later calls or on reconnect mid-turn).
+///   - Subsequent calls within the same turn: cache hit on the Arc
+///     identity check; the same connection is reused so the load
+///     balancer keeps routing every request through one node.
+///   - Connection drop / error: the entry is evicted and the next call
+///     reopens. The new upgrade replays the captured token (if any) so
+///     the server can pin the new connection back to the same shard.
+///
+/// `conn` is wrapped in an async Mutex because a single turn's request
+/// stream must serialize through one connection (codex's WS contract
+/// is request/response-frame interleaved on one socket; concurrent
+/// sends would scramble the framing).
+struct WsTurnSession {
+    routing_token: Arc<OnceLock<String>>,
+    conn: AsyncMutex<Option<WsConn>>,
+}
+
+type WsConn =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Wire envelope for a `/responses` WebSocket request frame. Mirrors
+/// codex's `ResponsesWsRequest::ResponseCreate` shape — the body is
+/// otherwise identical to the HTTP POST body, just wrapped with a
+/// `type: "response.create"` discriminator that the server uses to
+/// route the frame.
+#[derive(Serialize, Debug)]
+struct WsResponseCreate<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    #[serde(flatten)]
+    inner: RspRequest<'a>,
+}
+
 pub struct OpenAiResponsesClient {
     http: reqwest::Client,
     base_url: String,
     auth: ClientAuth,
+    transport: Transport,
+    /// Per-thread WS session registry — one open connection per
+    /// currently-active turn, keyed by `thread_id`. Always present
+    /// regardless of `transport` so the type signature stays stable;
+    /// only populated by the WebSocket path. Wrapped in an async Mutex
+    /// because the lookup/insert is interleaved with the WS-connect
+    /// await on a cache miss.
+    ws_sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<WsTurnSession>>>>,
 }
 
 impl OpenAiResponsesClient {
     /// API-key flow — Bearer the key against `base_url` (typically
-    /// `https://api.openai.com/v1`).
+    /// `https://api.openai.com/v1`). Always SSE — the WS upgrade is a
+    /// chatgpt.com codex-route extension and `api.openai.com` 4xxs the
+    /// upgrade.
     pub fn with_api_key(base_url: String, api_key: String) -> Self {
-        Self::new(base_url, ClientAuth::ApiKey(api_key))
+        Self::new(base_url, ClientAuth::ApiKey(api_key), Transport::Sse)
     }
 
     /// ChatGPT-subscription flow — Bearer the access_token from
     /// `auth` plus a `chatgpt-account-id` header, against `base_url`
-    /// (typically [`CHATGPT_CODEX_BASE`]).
+    /// (typically [`CHATGPT_CODEX_BASE`]). Defaults to SSE; the
+    /// [`Self::with_codex_slot`] constructor (used by config-driven
+    /// callers) takes an explicit transport to thread the operator's
+    /// `transport = "websocket"` choice through.
     pub fn with_codex_auth(base_url: String, auth: CodexAuth) -> Self {
         Self::new(
             base_url,
             ClientAuth::Codex(Arc::new(CodexAuthSlot::loaded(auth))),
+            Transport::Sse,
         )
     }
 
     /// Pre-built shared slot variant. Used by call sites that need
     /// the slot to outlive the constructor (e.g. wiring the same
     /// slot into a daemon-driven publication path *and* the provider
-    /// at startup).
-    pub fn with_codex_slot(base_url: String, slot: Arc<CodexAuthSlot>) -> Self {
-        Self::new(base_url, ClientAuth::Codex(slot))
+    /// at startup). The `transport` argument is the operator-selected
+    /// wire shape from `BackendConfig::OpenAiResponses::transport`.
+    pub fn with_codex_slot(
+        base_url: String,
+        slot: Arc<CodexAuthSlot>,
+        transport: Transport,
+    ) -> Self {
+        Self::new(base_url, ClientAuth::Codex(slot), transport)
     }
 
-    fn new(base_url: String, auth: ClientAuth) -> Self {
+    fn new(base_url: String, auth: ClientAuth, transport: Transport) -> Self {
         crate::ensure_default_crypto_provider();
         let base_url = base_url.trim_end_matches('/').to_string();
         Self {
             http: reqwest::Client::new(),
             base_url,
             auth,
+            transport,
+            ws_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -148,41 +246,17 @@ impl OpenAiResponsesClient {
         req: &ModelRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<(reqwest::Response, ForensicContext), ModelError> {
-        let mut input: Vec<RspItem> = Vec::new();
-        for m in req.messages {
-            convert_message(m, &mut input);
-        }
-
-        let tools: Vec<RspTool> = req.tools.iter().map(spec_to_rsp_tool).collect();
-
-        let body = RspRequest {
-            model: req.model,
-            instructions: if req.system_prompt.is_empty() {
-                None
-            } else {
-                Some(req.system_prompt)
-            },
-            input,
-            tools: if tools.is_empty() { None } else { Some(tools) },
-            include: REQUEST_INCLUDES,
-            store: false,
-            // The ChatGPT-subscription backend refuses stream:false with
-            // "Stream must be set to true". api.openai.com accepts either; we
-            // always stream and reassemble so both routes share one code path.
-            stream: true,
-            service_tier: pick_service_tier(req.tunables),
-            prompt_cache_key: req.request_cache_key,
-        };
         // req.max_tokens is ignored: the ChatGPT-subscription route rejects
         // `max_output_tokens` outright, and Codex's own client doesn't send it
         // on either route. The backend picks an output cap per model; the
         // scheduler's `max_turns` still bounds the overall loop.
         let _ = req.max_tokens;
-
-        // Serialize once, ourselves, so the forensic context can hold a
-        // copy of the exact body that went on the wire. `.json(&body)`
-        // would serialize internally and discard it before we get a
-        // chance to grab a reference.
+        // Build the body via the shared helper so SSE and WS transports
+        // stay byte-for-byte equivalent. Serialize once, ourselves, so
+        // the forensic context can hold a copy of the exact body that
+        // went on the wire — `.json(&body)` would serialize internally
+        // and discard it.
+        let body = build_rsp_request(req);
         let body_str = serde_json::to_string(&body)
             .map_err(|e| ModelError::Transport(format!("serialize request body: {e}")))?;
         let forensic = ForensicContext {
@@ -289,6 +363,17 @@ impl OpenAiResponsesClient {
         req: &'a ModelRequest<'a>,
         cancel: &'a CancellationToken,
     ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        match self.transport {
+            Transport::Sse => self.do_create_message_streaming_sse(req, cancel),
+            Transport::WebSocket => self.do_create_message_streaming_ws(req, cancel),
+        }
+    }
+
+    fn do_create_message_streaming_sse<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
         Box::pin(try_stream! {
             let (resp, forensic) = self.send_request(req, cancel).await?;
             // Extract Codex-route usage headers before the response is
@@ -360,6 +445,263 @@ impl OpenAiResponsesClient {
                 "SSE stream ended without response.completed".into(),
             ))?;
         })
+    }
+
+    fn do_create_message_streaming_ws<'a>(
+        &'a self,
+        req: &'a ModelRequest<'a>,
+        cancel: &'a CancellationToken,
+    ) -> BoxStream<'a, Result<ModelEvent, ModelError>> {
+        Box::pin(try_stream! {
+            // Thread id and turn-routing slot are required on the WS
+            // path: the session registry is keyed by the former, and
+            // the Arc-identity of the latter is what tells us whether
+            // an existing entry is for the current turn or a stale
+            // hangover from a prior one. The model layer always
+            // populates both for the codex route via
+            // `build_model_request`; an empty value indicates a
+            // configuration bug, not user-visible state, so error out
+            // loudly rather than silently degrade to a no-affinity
+            // call.
+            let thread_id = req.request_cache_key.ok_or_else(|| {
+                ModelError::Transport(
+                    "openai_responses WS transport requires request_cache_key on the model request".into(),
+                )
+            })?;
+            let routing_token = req.turn_routing_token.ok_or_else(|| {
+                ModelError::Transport(
+                    "openai_responses WS transport requires turn_routing_token on the model request".into(),
+                )
+            })?;
+            // Serialize the request body once. Mirrors the SSE path's
+            // forensic-context build — keeps a copy of the exact bytes
+            // that went on the wire for failure-dump purposes.
+            let (forensic, frame_text) = build_ws_response_create(req)?;
+            // Reuse-or-open the session for this thread. The
+            // Arc::ptr_eq check inside drops a stale connection when
+            // the Thread minted a fresh routing slot (= new turn).
+            let session = self.get_or_open_ws_session(thread_id, routing_token).await;
+            // Hold the connection mutex for the lifetime of this
+            // request's stream — the scheduler serializes model calls
+            // per thread anyway, so contention is impossible, but the
+            // lock enforces the invariant that one in-flight request
+            // owns the socket exclusively.
+            let mut conn_guard = session.conn.lock().await;
+            // Connect on first use, or after a prior connection was
+            // dropped by an error path. The upgrade sends the captured
+            // `x-codex-turn-state` if any (none on the first turn-call,
+            // populated on reconnects within a turn) and any other
+            // identity headers the codex backend expects.
+            if conn_guard.is_none() {
+                let conn = self.open_ws_connection(req, cancel).await?;
+                *conn_guard = Some(conn);
+            }
+            // Send the response.create frame. tokio::select! arms can't
+            // host a `?` (the macro arm is a plain expr context, not the
+            // try_stream body), so resolve the arm to a Result and `?`
+            // outside. We re-acquire the &mut from `conn_guard` per step
+            // so a teardown branch (`*conn_guard = None`) doesn't
+            // overlap with a live borrow of the socket.
+            let send_result: Result<(), ModelError> = {
+                let conn = conn_guard.as_mut().expect("ws connection just opened");
+                tokio::select! {
+                    r = conn.send(WsMessage::Text(frame_text.clone().into())) =>
+                        r.map_err(|e| ModelError::Transport(format!("ws send: {e}"))),
+                    _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                }
+            };
+            if let Err(e) = send_result {
+                // Drop the socket so the next call reopens.
+                *conn_guard = None;
+                Err(e)?;
+            }
+            // Stream the response frames.
+            let mut forensic_buf = ForensicBuf::default();
+            let mut state = RspStreamState::default();
+            loop {
+                let next: Result<Option<WsMessage>, ModelError> = {
+                    let conn = conn_guard.as_mut().expect("ws connection still open");
+                    tokio::select! {
+                        n = conn.next() => match n {
+                            Some(Ok(m)) => Ok(Some(m)),
+                            Some(Err(e)) => Err(ModelError::Transport(format!("ws recv: {e}"))),
+                            None => Ok(None),
+                        },
+                        _ = cancel.cancelled() => Err(ModelError::Cancelled),
+                    }
+                };
+                let msg = match next {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        // Stream ended without response.completed. Drop
+                        // the socket and surface a transport error.
+                        *conn_guard = None;
+                        Err(ModelError::Transport(
+                            "ws stream ended without response.completed".into(),
+                        ))?;
+                        return;
+                    }
+                    Err(e) => {
+                        // Tear down on cancel/recv-error — a partial
+                        // response on a kept-alive socket would scramble
+                        // framing for the next call.
+                        *conn_guard = None;
+                        Err(e)?;
+                        return;
+                    }
+                };
+                let text = match msg {
+                    WsMessage::Text(t) => t,
+                    WsMessage::Binary(_) => {
+                        *conn_guard = None;
+                        Err(ModelError::Transport(
+                            "unexpected binary frame on ws /responses".into(),
+                        ))?;
+                        return;
+                    }
+                    WsMessage::Close(_) => {
+                        *conn_guard = None;
+                        Err(ModelError::Transport(
+                            "ws closed by server before response.completed".into(),
+                        ))?;
+                        return;
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {
+                        continue;
+                    }
+                };
+                let raw: &str = text.as_str();
+                forensic_buf.push(raw.as_bytes());
+                // codex.rate_limits arrives as a JSON event frame
+                // instead of as response headers (the SSE path picks
+                // it up from `x-codex-*` headers). Translate to the
+                // same ProviderUsage snapshot the SSE path emits so
+                // the live UI chip lights up identically on either
+                // transport.
+                if let Some(snapshot) =
+                    crate::providers::codex_usage::parse_codex_rate_limits_frame(raw)
+                {
+                    yield ModelEvent::ProviderUsage { snapshot };
+                    continue;
+                }
+                let ev: RspStreamEvent = match serde_json::from_str(raw) {
+                    Ok(ev) => ev,
+                    Err(_) => continue,
+                };
+                for out in state.consume(ev, &forensic, &forensic_buf)? {
+                    yield out;
+                }
+                if state.done {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Find-or-mint the WS session entry for `thread_id`. Replaces a
+    /// stale entry (Arc::ptr_eq fails against the current turn's
+    /// routing token) with a fresh, lazy-open session. Returned Arc
+    /// is cloneable so the caller can release the registry lock
+    /// before touching the connection.
+    async fn get_or_open_ws_session(
+        &self,
+        thread_id: &str,
+        routing_token: &Arc<OnceLock<String>>,
+    ) -> Arc<WsTurnSession> {
+        let mut sessions = self.ws_sessions.lock().await;
+        if let Some(existing) = sessions.get(thread_id)
+            && Arc::ptr_eq(&existing.routing_token, routing_token)
+        {
+            return Arc::clone(existing);
+        }
+        let session = Arc::new(WsTurnSession {
+            routing_token: Arc::clone(routing_token),
+            conn: AsyncMutex::new(None),
+        });
+        sessions.insert(thread_id.to_string(), Arc::clone(&session));
+        session
+    }
+
+    /// Open a fresh `wss://` connection to the codex `/responses`
+    /// endpoint with the same auth + identity + turn-state headers the
+    /// SSE path attaches. Returns the connected stream ready to send
+    /// `response.create` frames on.
+    async fn open_ws_connection(
+        &self,
+        req: &ModelRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<WsConn, ModelError> {
+        let prepare = self.prepare_headers();
+        let (bearer, extra_headers) = tokio::select! {
+            r = prepare => r?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
+        // Build the WS URL by upgrading the scheme on `base_url`. The
+        // /responses path is the same on both transports.
+        let url = format!("{}/responses", self.base_url);
+        let ws_url = url
+            .strip_prefix("https://")
+            .map(|rest| format!("wss://{rest}"))
+            .or_else(|| {
+                url.strip_prefix("http://")
+                    .map(|rest| format!("ws://{rest}"))
+            })
+            .unwrap_or(url);
+        let mut request = ws_url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| ModelError::Transport(format!("build ws request: {e}")))?;
+        let headers = request.headers_mut();
+        let mut put = |name: &'static str, value: &str| {
+            let n = WsHeaderName::from_static(name);
+            if let Ok(v) = WsHeaderValue::from_str(value) {
+                headers.insert(n, v);
+            }
+        };
+        put("authorization", &format!("Bearer {bearer}"));
+        for (k, v) in &extra_headers {
+            put(k, v);
+        }
+        if let Some(thread_id) = req.request_cache_key {
+            put("thread-id", thread_id);
+        }
+        if let Some(session_id) = req.session_id {
+            put("session-id", session_id);
+        }
+        if matches!(self.auth, ClientAuth::Codex(_)) {
+            if let Some(install) = req.installation_id {
+                put("x-codex-installation-id", install);
+            }
+            put("originator", CODEX_ORIGINATOR);
+            // Replay the captured turn-state if any. The header is
+            // dormant on this backend today (no `x-codex-turn-state`
+            // arrives on either transport in current probes), but the
+            // codex CLI sends it the same way and the contract is
+            // forward-compatible: if the server starts issuing it,
+            // we'll already be replaying correctly.
+            if let Some(slot) = req.turn_routing_token
+                && let Some(token) = slot.get()
+            {
+                put(X_CODEX_TURN_STATE_HEADER, token.as_str());
+            }
+        }
+        let connect = tokio_tungstenite::connect_async(request);
+        let (ws, response) = tokio::select! {
+            r = connect => r.map_err(|e| ModelError::Transport(format!("ws connect: {e}")))?,
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+        };
+        // Capture the routing token from the upgrade response if the
+        // server included one. Same mechanism as the SSE path's
+        // header-capture site. Dormant today; defensive for tomorrow.
+        if let Some(slot) = req.turn_routing_token
+            && let Some(header_value) = response
+                .headers()
+                .get(X_CODEX_TURN_STATE_HEADER)
+                .and_then(|v| v.to_str().ok())
+        {
+            let _ = slot.set(header_value.to_string());
+        }
+        Ok(ws)
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, ModelError> {
@@ -531,6 +873,58 @@ impl ModelProvider for OpenAiResponsesClient {
                 })
         })
     }
+}
+
+// ---------- Request body construction ----------
+
+/// Build the `RspRequest` body the SSE path POSTs and the WS path sends
+/// as a `response.create` frame. Single source of truth so both
+/// transports stay byte-for-byte equivalent (cache hashing on the
+/// server side hinges on this).
+fn build_rsp_request<'a>(req: &'a ModelRequest<'a>) -> RspRequest<'a> {
+    let mut input: Vec<RspItem> = Vec::new();
+    for m in req.messages {
+        convert_message(m, &mut input);
+    }
+    let tools: Vec<RspTool> = req.tools.iter().map(spec_to_rsp_tool).collect();
+    RspRequest {
+        model: req.model,
+        instructions: if req.system_prompt.is_empty() {
+            None
+        } else {
+            Some(req.system_prompt)
+        },
+        input,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        include: REQUEST_INCLUDES,
+        store: false,
+        stream: true,
+        service_tier: pick_service_tier(req.tunables),
+        prompt_cache_key: req.request_cache_key,
+    }
+}
+
+/// Build the `{type: "response.create", ...}` WS frame body and a
+/// matching `ForensicContext` so error dumps can replay exactly what
+/// went on the wire. Returns the frame as a `String` ready to ship as
+/// a `WsMessage::Text`.
+fn build_ws_response_create(
+    req: &ModelRequest<'_>,
+) -> Result<(ForensicContext, String), ModelError> {
+    let inner = build_rsp_request(req);
+    let frame = WsResponseCreate {
+        ty: "response.create",
+        inner,
+    };
+    let text = serde_json::to_string(&frame)
+        .map_err(|e| ModelError::Transport(format!("serialize ws frame: {e}")))?;
+    let forensic = ForensicContext {
+        backend: PROVIDER_TAG.to_string(),
+        model: req.model.to_string(),
+        request_body: text.clone(),
+        request_content_type: "application/json",
+    };
+    Ok((forensic, text))
 }
 
 // ---------- Message → Item conversion ----------
@@ -2585,6 +2979,42 @@ data: {"type":"response.failed","response":{"status":"failed"},"error":{"message
             v["prompt_cache_key"],
             serde_json::json!("task-18b03f4cbd87ae97")
         );
+    }
+
+    #[test]
+    fn ws_response_create_frame_wraps_request_body() {
+        // The WS path sends a `{type: "response.create", ...body}`
+        // envelope where the inner body is byte-for-byte identical to
+        // the HTTP POST body. Verify the wrapper serializes that way
+        // (`type` discriminator + flattened RspRequest fields) so the
+        // chatgpt.com backend, which routes WS frames by the type tag,
+        // recognizes it as a response.create.
+        let inner = RspRequest {
+            model: "gpt-5.5",
+            instructions: Some("Be concise."),
+            input: Vec::new(),
+            tools: None,
+            include: REQUEST_INCLUDES,
+            store: false,
+            stream: true,
+            service_tier: None,
+            prompt_cache_key: Some("task-18b03f4cbd87ae97"),
+        };
+        let frame = WsResponseCreate {
+            ty: "response.create",
+            inner,
+        };
+        let v = serde_json::to_value(&frame).unwrap();
+        assert_eq!(v["type"], serde_json::json!("response.create"));
+        assert_eq!(v["model"], serde_json::json!("gpt-5.5"));
+        assert_eq!(v["instructions"], serde_json::json!("Be concise."));
+        assert_eq!(
+            v["prompt_cache_key"],
+            serde_json::json!("task-18b03f4cbd87ae97")
+        );
+        // Flattening — no nested `inner` / `body` keys.
+        assert!(v.get("inner").is_none());
+        assert!(v.get("body").is_none());
     }
 
     #[test]

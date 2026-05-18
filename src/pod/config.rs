@@ -136,6 +136,28 @@ pub use whisper_agent_auth::{
     default_codex_auth_path,
 };
 
+/// Wire transport for the OpenAI Responses backend. See
+/// [`BackendConfig::OpenAiResponses::transport`] for the operational
+/// difference between the two; this enum is the typed TOML surface.
+#[derive(Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAiResponsesTransport {
+    /// HTTP POST with SSE-streamed body. One short-lived connection per
+    /// model call. The default — backward-compatible with every config
+    /// written before the WS path landed, and the only viable shape for
+    /// `api.openai.com` (the WS upgrade is a chatgpt.com codex-route
+    /// extension).
+    #[default]
+    Sse,
+    /// `wss://` connection held open for the duration of a turn (one user
+    /// message + the tool loop it triggers). Every model call in that
+    /// turn rides the same connection, which physically pins routing to
+    /// one backend node and keeps the chatgpt.com prompt cache shard
+    /// warm. Only meaningful on the codex auth route — api.openai.com
+    /// does not expose `/responses` over WebSocket.
+    Websocket,
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendConfig {
@@ -166,6 +188,16 @@ pub enum BackendConfig {
         auth: Auth,
         #[serde(default)]
         default_model: Option<String>,
+        /// Wire transport for `/responses` requests. `sse` (default) sends
+        /// each call as an HTTP POST with an SSE-streamed body — one
+        /// short-lived TCP connection per call. `websocket` opens a
+        /// long-lived `wss://` connection per turn and multiplexes every
+        /// model call within that turn through it; physical connection
+        /// reuse pins the load-balancer route to one cache shard, which
+        /// closes the residual prompt-cache miss rate the SSE path leaves
+        /// on the table.
+        #[serde(default)]
+        transport: OpenAiResponsesTransport,
     },
     /// Google Gemini via the native `generateContent` API. API-key auth today;
     /// gemini-cli OAuth auth follows.
@@ -266,9 +298,12 @@ impl BackendConfig {
                 };
                 Ok(Arc::new(OpenAiChatClient::new(base_url.clone(), key)))
             }
-            BackendConfig::OpenAiResponses { base_url, auth, .. } => {
-                build_openai_responses(base_url.as_deref(), auth)
-            }
+            BackendConfig::OpenAiResponses {
+                base_url,
+                auth,
+                transport,
+                ..
+            } => build_openai_responses(base_url.as_deref(), auth, *transport),
             BackendConfig::Gemini { base_url, auth, .. } => build_gemini(base_url.as_deref(), auth),
             BackendConfig::LlamaCpp { base_url, .. } => {
                 Ok(Arc::new(LlamaCppClient::new(base_url.clone())))
@@ -406,13 +441,27 @@ fn build_gemini(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProv
     }
 }
 
-fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProvider>> {
+fn build_openai_responses(
+    base_url: Option<&str>,
+    auth: &Auth,
+    transport: OpenAiResponsesTransport,
+) -> Result<Arc<dyn ModelProvider>> {
     match auth {
         Auth::ApiKey { .. } => {
             let key = auth.resolve_api_key().context("openai_responses auth")?;
             let url = base_url
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| OPENAI_API_BASE.to_string());
+            if transport == OpenAiResponsesTransport::Websocket {
+                // The WS upgrade is a chatgpt.com codex-route extension;
+                // api.openai.com 4xxs the upgrade. Refuse loudly at boot
+                // rather than silently fall through to SSE — operators
+                // who picked WS deliberately deserve to know it isn't
+                // available here.
+                return Err(anyhow!(
+                    "openai_responses: transport `websocket` requires auth.mode `chatgpt_subscription` (api.openai.com does not expose /responses over WebSocket)"
+                ));
+            }
             Ok(Arc::new(OpenAiResponsesClient::with_api_key(url, key)))
         }
         Auth::ChatgptSubscription {
@@ -451,7 +500,11 @@ fn build_openai_responses(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn
                     .context("load codex auth.json for openai_responses subscription auth")?;
                 Arc::new(CodexAuthSlot::loaded(codex))
             };
-            Ok(Arc::new(OpenAiResponsesClient::with_codex_slot(url, slot)))
+            Ok(Arc::new(OpenAiResponsesClient::with_codex_slot(
+                url,
+                slot,
+                transport.into(),
+            )))
         }
         Auth::GoogleOauth { .. } => Err(anyhow!(
             "openai_responses: auth.mode `google_oauth` not supported"
