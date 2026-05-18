@@ -1193,6 +1193,33 @@ impl Scheduler {
             .unwrap_or_default()
     }
 
+    /// Fire the thread's current cancel token (so in-flight model /
+    /// tool futures abort at the wire) and install a fresh token in
+    /// its place so subsequent dispatches start clean.
+    ///
+    /// `CancellationToken` is one-shot — once fired, every clone is
+    /// permanently cancelled. Without the replace, a single user
+    /// cancel would poison the thread for the rest of the server
+    /// lifetime: the next model_call dispatched after the user sends
+    /// a follow-up message would see `is_cancelled()` on entry and
+    /// fail immediately with `ModelError::Cancelled`, flipping the
+    /// thread to `Failed { at_phase: "model_call", message:
+    /// "cancelled" }`. The state machine treats `Cancelled` as a
+    /// recoverable interruption (is_idle, accepts new user messages)
+    /// so the execution machinery must match.
+    ///
+    /// In-flight futures hold their own `Arc`-shared clone of the
+    /// old token and still see the cancel; only freshly-dispatched
+    /// I/O sees the new token.
+    pub(crate) fn fire_and_reset_cancel_token(&mut self, thread_id: &str) {
+        if let Some(old) = self.cancel_tokens.insert(
+            thread_id.to_string(),
+            tokio_util::sync::CancellationToken::new(),
+        ) {
+            old.cancel();
+        }
+    }
+
     pub(crate) fn backend(&self, name: &str) -> Option<&BackendEntry> {
         self.backends.get(name)
     }

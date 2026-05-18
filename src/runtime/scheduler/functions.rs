@@ -3222,9 +3222,7 @@ impl Scheduler {
                 } else {
                     let mut cancel_events = Vec::new();
                     child.cancel(&mut cancel_events);
-                    if let Some(token) = self.cancel_tokens.get(child_id) {
-                        token.cancel();
-                    }
+                    self.fire_and_reset_cancel_token(child_id);
                     self.router.dispatch_events(child_id, cancel_events);
                     self.mark_dirty(child_id);
                     self.router
@@ -3287,9 +3285,9 @@ impl Scheduler {
         // Fire the per-thread cancel signal so any in-flight
         // model/tool/MCP HTTP request aborts at the wire instead of
         // running to completion and having its result discarded.
-        if let Some(token) = self.cancel_tokens.get(thread_id) {
-            token.cancel();
-        }
+        // Replace (not just fire) so a follow-up user message can
+        // resume the thread — see `fire_and_reset_cancel_token`.
+        self.fire_and_reset_cancel_token(thread_id);
         // Dispatch any synthesized ToolCallEnd events so live
         // subscribers see the interrupted tool-call rows close out.
         self.router.dispatch_events(thread_id, cancel_events);
