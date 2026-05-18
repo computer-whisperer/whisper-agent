@@ -205,7 +205,7 @@ c6i.16xlarge is the natural pick.
 
 - ✅ Stage 1 (local prototype): script run on one real tarball (`2604_001`); 90.7% pandoc success on source-available papers; 88× compression ratio. Done 2026-05-15.
 - ✅ Stage 2 (scaled test, run locally to save EC2 setup): driver + filter pipeline run end-to-end against 12 tarballs (1,706 papers, 6.02 GB) pulled live from requester-pays S3, filtered locally, uploaded to staging bucket `christian-arxiv-staging`. Resume logic verified. 88.6% pandoc success at scale, 75× compression. Done 2026-05-15.
-- 🔄 Stage 3 (in progress 2026-05-15): full archive on c6i.16xlarge spot, watchdog deployed for auto-termination on completion. Bug surfaced + fixed mid-run: pre-2000 papers ship as raw gzipped LaTeX (no tar wrapper); filter now handles both shapes.
+- ✅ Stage 3 (full archive on c6i.16xlarge spot): 12,374 tarballs processed in **18h 53min** wall clock. Output **108.4 GB** across 12,374 `.tar.zst` files = **60.7× compression** vs. 6.59 TB source. Total cost **~$10 EC2 + ~$10 egress ≈ $20**. Done 2026-05-17 09:03 UTC; output on ceph at `/ceph/christian/LTS/arxiv/base/20260517/`. Two issues surfaced and fixed mid-run: (a) pre-2000 papers ship as raw gzipped LaTeX (no tar wrapper); (b) sequential tarball processing left 56% CPU idle. Patched with single-file-bundle handling and 16-way shard parallelism (`--shard N/M` flag).
 
 ### Measured status distribution
 
