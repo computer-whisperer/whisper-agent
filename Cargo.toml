@@ -57,7 +57,7 @@ whisper-agent-auth = { path = "crates/whisper-agent-auth" }
 [package]
 name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
-version = "0.3.22"
+version = "0.3.23"
 edition.workspace = true
 license.workspace = true
 
