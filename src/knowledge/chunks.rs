@@ -691,6 +691,37 @@ pub fn iter_records_with_ids<'a>(
     })
 }
 
+/// Like [`iter_records_with_ids`] but begins the walk at record `start`,
+/// seeking past the first `start` records' bodies without parsing them.
+/// `start` is clamped to `chunk_ids.len()`.
+///
+/// Resume uses this to replay only the *tail* of `chunks.bin` past a
+/// durable index watermark — e.g. tantivy committed fewer records than
+/// `chunks.bin` holds (its commit rides the coarse index-snapshot
+/// barrier, so it lags the fine BatchEmbedded checkpoint). Skipping via
+/// `seek_relative` over the length-prefixed bodies avoids re-reading the
+/// (potentially many-GiB) prefix.
+pub fn iter_records_with_ids_from<'a>(
+    bin_path: &Path,
+    chunk_ids: &'a [ChunkId],
+    start: usize,
+) -> io::Result<RecordIter<'a>> {
+    let start = start.min(chunk_ids.len());
+    let file = File::open(bin_path)?;
+    let mut reader = BufReader::new(file);
+    for _ in 0..start {
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes)?;
+        let body_len = u32::from_le_bytes(len_bytes) as i64;
+        reader.seek_relative(body_len)?;
+    }
+    Ok(RecordIter {
+        reader,
+        chunk_ids,
+        cursor: start,
+    })
+}
+
 /// Iterator returned by [`iter_records_with_ids`]. Reads each record's
 /// 4-byte length prefix, then its body, parses the body via the same
 /// path as [`ChunkStoreReader::fetch`], and yields a full [`Chunk`].
@@ -1269,6 +1300,66 @@ mod tests {
             assert_eq!(chunk.source_ref.source_id, *src);
             assert_eq!(chunk.source_ref.locator.as_deref(), *loc);
         }
+    }
+
+    #[test]
+    fn iter_records_with_ids_from_starts_at_position() {
+        // Tail replay: starting at `start` yields records [start..],
+        // correctly paired with chunk_ids[start..], without re-reading
+        // or mis-pairing the skipped prefix.
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("chunks.bin");
+        let idx = tmp.path().join("chunks.idx");
+
+        let inputs: Vec<(ChunkId, String)> = (0..10)
+            .map(|i| {
+                (
+                    ChunkId::from_source(&[i as u8; 32], i as u64),
+                    format!("body {i}"),
+                )
+            })
+            .collect();
+        {
+            let mut w = ChunkStoreWriter::create(&bin, &idx).unwrap();
+            for (id, text) in &inputs {
+                w.append(*id, &sref("doc", None), text).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let chunk_ids: Vec<ChunkId> = inputs.iter().map(|(id, _)| *id).collect();
+
+        let start = 7;
+        let tail: Vec<Chunk> = iter_records_with_ids_from(&bin, &chunk_ids, start)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(tail.len(), inputs.len() - start);
+        for (offset, chunk) in tail.iter().enumerate() {
+            let (want_id, want_text) = &inputs[start + offset];
+            assert_eq!(chunk.id, *want_id);
+            assert_eq!(chunk.text, *want_text);
+        }
+
+        // `start == len` yields nothing; `start > len` clamps to len.
+        assert!(
+            iter_records_with_ids_from(&bin, &chunk_ids, chunk_ids.len())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(
+            iter_records_with_ids_from(&bin, &chunk_ids, 999)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
+        // `start == 0` matches the full walk.
+        let full = iter_records_with_ids_from(&bin, &chunk_ids, 0)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(full.len(), inputs.len());
     }
 
     #[test]

@@ -1123,6 +1123,7 @@ impl DiskBucket {
             Some(
                 reopen_or_rebuild_sparse(
                     &tantivy_dir,
+                    &slot_path,
                     &chunks_bin,
                     &resumed_chunk_ids,
                     slot_id,
@@ -1668,17 +1669,24 @@ impl DiskBucket {
                 if checkpoint_due {
                     chunk_writer.flush().map_err(BucketError::Io)?;
                     vector_writer.flush().map_err(BucketError::Io)?;
-                    if let Some(builder) = sparse_builder.as_mut() {
-                        builder.commit()?;
+                    // First-batch active install only. Make the partial
+                    // slot queryable as soon as the first checkpoint
+                    // lands; dense + chunks then update in place, and the
+                    // sparse reader is refreshed at the coarse
+                    // index-snapshot barrier below. Re-opening the tantivy
+                    // index on every fine barrier (as we used to) is
+                    // wasted work — no new segments are committed until
+                    // that coarse barrier.
+                    if install_during_build && active_during_build.is_none() {
+                        self.update_active_during_build(
+                            slot_path,
+                            &chunk_writer,
+                            &dense,
+                            &manifest,
+                            install_during_build,
+                            &mut active_during_build,
+                        )?;
                     }
-                    self.update_active_during_build(
-                        slot_path,
-                        &chunk_writer,
-                        &dense,
-                        &manifest,
-                        install_during_build,
-                        &mut active_during_build,
-                    )?;
                     build_state
                         .append(&BuildStateRecord::BatchEmbedded {
                             batch_index: last_batch_index,
@@ -1687,10 +1695,13 @@ impl DiskBucket {
                         })
                         .map_err(BucketError::Io)?;
                     // Durability barrier: BatchEmbedded is the resume
-                    // checkpoint. Writers have already flushed +
-                    // committed above; this fsync makes the log entry
-                    // stating "everything up to here is durable" itself
-                    // durable.
+                    // checkpoint. chunks/vectors are flushed above;
+                    // tantivy and the HNSW dump are made durable together
+                    // at the coarse index-snapshot barrier below, sharing
+                    // `dense.snapshot` as their watermark — resume replays
+                    // the tail past it (tantivy from chunks.bin, HNSW from
+                    // vectors.bin). This fsync makes the log entry stating
+                    // "everything up to here is durable" itself durable.
                     build_state.sync().map_err(BucketError::Io)?;
                     let now = std::time::Instant::now();
                     let elapsed_ms: u64 = prev_checkpoint_at
@@ -1723,9 +1734,35 @@ impl DiskBucket {
                     prev_checkpoint_chunks = chunks_emitted;
                     batches_since_dump += batches_since_checkpoint;
                     batches_since_checkpoint = 0;
+                    // Coarse index-snapshot barrier: commit tantivy and
+                    // dump the HNSW together so `dense.snapshot` (written
+                    // last by `periodic_dump`) is the single durable
+                    // watermark for both. Committing tantivy *first*
+                    // guarantees the snapshot never claims more docs than
+                    // tantivy has durably committed; if a crash lands
+                    // between the commit and the snapshot write, resume's
+                    // delete-then-add replay over the (slightly stale)
+                    // watermark is idempotent.
                     if batches_since_dump >= dense_dump_interval_batches(chunks_emitted) {
+                        if let Some(builder) = sparse_builder.as_mut() {
+                            builder.commit()?;
+                        }
                         periodic_dump(slot_path, slot_id, &dense).await?;
                         batches_since_dump = 0;
+                        // Expose the just-committed sparse segments to
+                        // mid-build queries. No-op on the rebuild path
+                        // (install_during_build = false), where the prior
+                        // active slot keeps serving until promotion.
+                        if install_during_build && active_during_build.is_some() {
+                            self.update_active_during_build(
+                                slot_path,
+                                &chunk_writer,
+                                &dense,
+                                &manifest,
+                                install_during_build,
+                                &mut active_during_build,
+                            )?;
+                        }
                     }
                 }
 
@@ -3289,23 +3326,35 @@ struct EmbeddedBatchMeta {
     records_completed_at_end: u64,
 }
 
-/// Open the resumed slot's tantivy directory for further appending —
-/// or, if it can't be opened (typically a tantivy on-disk-format
-/// version bump), wipe the directory and reseed a fresh BM25 index
-/// from `chunks.bin` so the resume can continue without restarting the
+/// Open the resumed slot's tantivy directory for further appending,
+/// replaying the tail past tantivy's durable watermark — or, if the
+/// directory can't be opened (typically a tantivy on-disk-format
+/// version bump), wipe it and reseed a fresh BM25 index from
+/// `chunks.bin` so the resume can continue without restarting the
 /// embed pipeline.
+///
+/// Tantivy commits at the coarse index-snapshot barrier (alongside the
+/// HNSW dump), sharing `dense.snapshot` as its durable watermark, so a
+/// reopened index can hold *fewer* docs than `chunks.bin` — everything
+/// the fine BatchEmbedded checkpoint advanced past the last coarse
+/// commit. The tail `[dense.snapshot..len]` is replayed from durable
+/// chunk text; [`SparseIndexBuilder::add`] is delete-then-add
+/// idempotent, so re-adding docs that were committed past a stale
+/// snapshot (a crash between the tantivy commit and the snapshot write)
+/// is safe.
 ///
 /// `chunks.bin` is the durable source of truth for chunk text
 /// (already truncated to exactly `chunk_ids.len()` records by the
-/// surrounding resume preamble), so a sparse rebuild is a finite
-/// CPU-bound walk: no re-embedding, no source re-fetching. Cost is
-/// roughly tantivy's add_document throughput (~5–20k docs/sec for
-/// this schema) over the resumed chunk count.
+/// surrounding resume preamble), so both the tail replay and the
+/// full rebuild are finite CPU-bound walks: no re-embedding, no source
+/// re-fetching. Cost is roughly tantivy's add_document throughput
+/// (~5–20k docs/sec for this schema) over the replayed chunk count.
 ///
 /// Done in `spawn_blocking` because tantivy's writer is sync and can
 /// stall a Tokio worker for tens of minutes at wiki scale.
 async fn reopen_or_rebuild_sparse(
     tantivy_dir: &Path,
+    slot_path: &Path,
     chunks_bin: &Path,
     chunk_ids: &[ChunkId],
     slot_id: &str,
@@ -3315,7 +3364,61 @@ async fn reopen_or_rebuild_sparse(
         return SparseIndexBuilder::create(tantivy_dir);
     }
     match SparseIndexBuilder::open_resume(tantivy_dir) {
-        Ok(builder) => Ok(builder),
+        Ok(builder) => {
+            // Replay the tail past the shared `dense.snapshot` watermark.
+            let committed = super::dense::read_dump_snapshot(slot_path)
+                .map_err(BucketError::Io)?
+                .unwrap_or(0) as usize;
+            let total = chunk_ids.len();
+            if committed >= total {
+                // Tantivy already current (e.g. the commit/dump rode the
+                // same checkpoint, as in tests where both intervals are 1).
+                return Ok(builder);
+            }
+            tracing::info!(
+                slot = %slot_id,
+                committed,
+                total,
+                tail = total - committed,
+                "resume_slot: replaying tantivy tail past dense.snapshot from chunks.bin",
+            );
+            let chunks_bin = chunks_bin.to_path_buf();
+            let chunk_ids = chunk_ids.to_vec();
+            let slot_id_owned = slot_id.to_string();
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || -> Result<SparseIndexBuilder, BucketError> {
+                let mut builder = builder;
+                let tail = total - committed;
+                let log_step = tail.max(20).div_ceil(20);
+                let iter =
+                    super::chunks::iter_records_with_ids_from(&chunks_bin, &chunk_ids, committed)
+                        .map_err(BucketError::Io)?;
+                for (i, item) in iter.enumerate() {
+                    if cancel.is_cancelled() {
+                        return Err(BucketError::Cancelled);
+                    }
+                    let chunk = item.map_err(BucketError::Io)?;
+                    builder.add(chunk.id, &chunk.text)?;
+                    if (i + 1).is_multiple_of(log_step) {
+                        tracing::info!(
+                            slot = %slot_id_owned,
+                            replayed = i + 1,
+                            of = tail,
+                            "resume_slot: tantivy tail replay progress",
+                        );
+                    }
+                }
+                builder.commit()?;
+                tracing::info!(
+                    slot = %slot_id_owned,
+                    tail,
+                    "resume_slot: tantivy tail replay complete",
+                );
+                Ok(builder)
+            })
+            .await
+            .map_err(|e| BucketError::Other(format!("spawn_blocking tantivy tail replay: {e}")))?
+        }
         Err(open_err) => {
             tracing::warn!(
                 slot = %slot_id,
@@ -6122,6 +6225,89 @@ embedder = "tei_test"
         assert!(
             !late_hits.is_empty(),
             "post-resume doc must be in rebuilt sparse index",
+        );
+    }
+
+    #[tokio::test]
+    async fn reopen_replays_tantivy_tail_past_stale_snapshot() {
+        // Tantivy now commits at the coarse index-snapshot barrier
+        // (sharing `dense.snapshot` as its watermark), so on resume the
+        // reopened index can hold fewer docs than chunks.bin.
+        // `reopen_or_rebuild_sparse` must replay the tail
+        // [dense.snapshot..len] from durable chunk text. Build a
+        // finalized chunk store of N records, a tantivy index committed
+        // to only the first `committed`, and a `dense.snapshot` at
+        // `committed`; the reopen must bring tantivy back to all N.
+        use crate::knowledge::sparse::SparseIndex;
+        use crate::knowledge::types::SourceRef;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let slot_path = tmp.path();
+        let chunks_bin = slot::chunks_bin_path(slot_path);
+        let chunks_idx = slot::chunks_idx_path(slot_path);
+        let tantivy_dir = slot::tantivy_dir(slot_path);
+
+        let n = 50usize;
+        let chunk_ids: Vec<_> = (0..n)
+            .map(|i| ChunkId::from_source(&[i as u8; 32], i as u64))
+            .collect();
+        let text = |i: usize| format!("doc-{i:04} body text");
+
+        // Finalized chunk store — the durable source of truth for replay.
+        {
+            let mut w = ChunkStoreWriter::create(&chunks_bin, &chunks_idx).unwrap();
+            for (i, id) in chunk_ids.iter().enumerate() {
+                let sref = SourceRef {
+                    source_id: format!("doc-{i:04}"),
+                    locator: None,
+                };
+                w.append(*id, &sref, &text(i)).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        // Tantivy committed to only the first `committed` records, the
+        // way a coarse barrier that lagged the fine checkpoint leaves it.
+        let committed = n - 7;
+        {
+            let mut sb = SparseIndexBuilder::create(&tantivy_dir).unwrap();
+            for (i, id) in chunk_ids.iter().enumerate().take(committed) {
+                sb.add(*id, &text(i)).unwrap();
+            }
+            sb.commit().unwrap();
+        }
+        assert_eq!(SparseIndex::open(&tantivy_dir).unwrap().len(), committed);
+
+        // Shared watermark points at the committed prefix.
+        fs::write(
+            slot_path.join("dense.snapshot"),
+            (committed as u64).to_le_bytes(),
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let builder = reopen_or_rebuild_sparse(
+            &tantivy_dir,
+            slot_path,
+            &chunks_bin,
+            &chunk_ids,
+            "test-slot",
+            &cancel,
+        )
+        .await
+        .unwrap();
+        builder.finalize().unwrap();
+
+        // Tantivy now covers all N records — the tail [committed..n] was
+        // replayed from chunks.bin.
+        let idx = SparseIndex::open(&tantivy_dir).unwrap();
+        assert_eq!(idx.len(), n, "tail [committed..n] must be replayed");
+        // A specific tail doc is searchable (count alone could mask
+        // wrong ids; this proves the replayed ids/text are correct).
+        let hits = idx.search(&format!("doc-{:04}", n - 1), 5).unwrap();
+        assert!(
+            hits.iter().any(|(id, _)| *id == chunk_ids[n - 1]),
+            "replayed tail doc must be findable in the sparse index",
         );
     }
 

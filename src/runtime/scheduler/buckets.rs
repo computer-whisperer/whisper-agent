@@ -47,6 +47,20 @@ use crate::server::thread_router::ThreadEventRouter;
 /// rhythm.
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 
+/// A build emitting no forward progress (source records / chunks) for
+/// this long is treated as stalled. The progress emitter fires the
+/// build's cancel token — which unwinds a stall blocked on a
+/// *cancellable* await (e.g. a hung embedder request) — and logs at
+/// ERROR so a hard wedge (e.g. a deadlocked sync index commit, which
+/// cancel can't interrupt) is operator-visible instead of sitting at
+/// "building" silently forever.
+///
+/// Set well above the longest *legitimate* no-progress window: the
+/// coarse index-snapshot barrier (HNSW dump + tantivy commit) freezes
+/// the progress counters for minutes at wiki scale, so a healthy build
+/// must never trip this.
+const BUILD_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Scope-aware key for the in-flight-build maps and per-build progress
 /// state. Server-scope buckets share a global namespace
 /// (`pod_id = None`); pod-scope buckets are keyed by their owning pod
@@ -1229,15 +1243,43 @@ async fn run_build(
     let pod_id_for_emit = pod_id.clone();
     let progress_for_emit = progress.clone();
     let task_tx_for_emit = task_tx.clone();
+    let cancel_for_watchdog = cancel.clone();
     let emitter = tokio::spawn(async move {
         let mut interval = tokio::time::interval(PROGRESS_THROTTLE);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Stall watchdog: track the last (source_records, chunks) marker
+        // that advanced and when. If it stops advancing for
+        // BUILD_STALL_TIMEOUT, fire cancel and log once (see the const).
+        let mut last_marker: (u64, u64) = (0, 0);
+        let mut last_progress_at = tokio::time::Instant::now();
+        let mut stall_logged = false;
         loop {
             interval.tick().await;
             if progress_for_emit.done.load(Ordering::Acquire) {
                 break;
             }
             let snap = progress_for_emit.snapshot();
+            let marker = (snap.source_records, snap.chunks);
+            if marker != last_marker {
+                last_marker = marker;
+                last_progress_at = tokio::time::Instant::now();
+                stall_logged = false;
+            } else if !stall_logged && last_progress_at.elapsed() >= BUILD_STALL_TIMEOUT {
+                stall_logged = true;
+                tracing::error!(
+                    bucket_id = %bucket_id_for_emit,
+                    pod_id = ?pod_id_for_emit,
+                    source_records = snap.source_records,
+                    chunks = snap.chunks,
+                    stalled_for_s = last_progress_at.elapsed().as_secs(),
+                    "bucket build stalled: no forward progress for {}s — firing cancel. A \
+                     cancellable stall (e.g. a hung embedder request) will unwind and report \
+                     BuildEnded; a hard sync-index deadlock can't be interrupted and needs a \
+                     process restart (the slot stays resumable from its last checkpoint).",
+                    BUILD_STALL_TIMEOUT.as_secs(),
+                );
+                cancel_for_watchdog.cancel();
+            }
             let _ = task_tx_for_emit.send(BucketTaskUpdate::Progress {
                 bucket_id: bucket_id_for_emit.clone(),
                 pod_id: pod_id_for_emit.clone(),
