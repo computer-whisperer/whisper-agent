@@ -1911,6 +1911,7 @@ impl Scheduler {
             .iter()
             .map(|t| format!("{}:{}", t.scope.as_str(), t.name))
             .collect();
+        let sparse_timeout_ms = self.knowledge_config.query.sparse_timeout();
         pending_io.push(Box::pin(async move {
             let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -1977,6 +1978,7 @@ impl Scheduler {
             let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
             let params = crate::knowledge::QueryParams {
                 top_k: top_k as usize,
+                sparse_timeout_ms,
                 ..Default::default()
             };
             let hits = match engine.query(&buckets, &query_text, &params, &cancel).await {

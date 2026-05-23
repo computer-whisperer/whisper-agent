@@ -1596,6 +1596,7 @@ impl Scheduler {
         let registry = self.bucket_registry.clone();
         let pod_id_for_load = pod_id.clone();
         let task_tx = self.bucket_task_sender();
+        let sparse_timeout_ms = self.knowledge_config.query.sparse_timeout();
 
         // Detached task: HNSW rebuild on first load and the subsequent
         // dense+sparse+rerank round trip both want to be off the
@@ -1636,6 +1637,7 @@ impl Scheduler {
             let buckets: Vec<Arc<dyn Bucket>> = vec![bucket];
             let params = QueryParams {
                 top_k: top_k as usize,
+                sparse_timeout_ms,
                 ..Default::default()
             };
             match engine.query(&buckets, &query, &params, &cancel).await {

@@ -390,6 +390,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         auth_clients,
         auth_admins,
         mut auth_daemons,
+        knowledge_config,
     ) = match &resolved_config {
         Some(path) => {
             info!(config = %path.display(), "loading backend catalog");
@@ -448,6 +449,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 cfg.auth.clients,
                 cfg.auth.admins,
                 cfg.auth.daemons,
+                cfg.knowledge,
             )
         }
         None => {
@@ -480,6 +482,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                whisper_agent::pod::config::KnowledgeConfig::default(),
             )
         }
     };
@@ -632,6 +635,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         auth_admins,
         auth_daemons,
         server_config_path: resolved_config,
+        knowledge: knowledge_config,
     };
     server::serve(args.listen, server_config).await
 }

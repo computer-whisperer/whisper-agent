@@ -315,10 +315,12 @@ impl Scheduler {
         }
 
         let restart_sections = restart_required_sections(&old_cfg, &new_cfg);
+        let knowledge_changed = old_cfg.knowledge != new_cfg.knowledge;
         let write_needed = !diff.is_noop()
             || !embed_diff.is_noop()
             || !rerank_diff.is_noop()
-            || !restart_sections.is_empty();
+            || !restart_sections.is_empty()
+            || knowledge_changed;
 
         for thread_id in &cancel_list {
             self.execute_cancel_thread(thread_id, pending_io);
@@ -358,6 +360,13 @@ impl Scheduler {
             if let Some(entry) = new_rerank_entries.remove(name) {
                 self.rerank_providers.insert(name.clone(), entry);
             }
+        }
+
+        // `[knowledge]` is a plain value (no per-entry build); a single
+        // assignment swaps every tunable atomically. The next query
+        // call site reads the fresh value from `self.knowledge_config`.
+        if knowledge_changed {
+            self.knowledge_config = new_cfg.knowledge.clone();
         }
 
         // Disk write follows the in-memory swap: the scheduler is

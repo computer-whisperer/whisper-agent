@@ -174,6 +174,10 @@ pub struct ServerConfig {
     /// fallback) — runtime config-edit endpoints reject in that mode
     /// since there's no on-disk file to round-trip through.
     pub server_config_path: Option<PathBuf>,
+    /// `[knowledge]` table from the server config. Empty / default is
+    /// the right initial value when the server boots without a config
+    /// file or with the section omitted.
+    pub knowledge: crate::pod::config::KnowledgeConfig,
 }
 
 /// Paths to the PEM-encoded cert chain and private key. Loaded from
@@ -275,6 +279,7 @@ pub async fn serve(listen: SocketAddr, config: ServerConfig) -> anyhow::Result<(
         config.shared_mcp_overlays,
         live_daemon_registry.clone(),
         config.server_config_path,
+        config.knowledge,
     )
     .await
     .context("scheduler init")?;

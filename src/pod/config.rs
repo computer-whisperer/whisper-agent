@@ -80,6 +80,13 @@ pub struct Config {
     /// always separate processes). Hot-swappable.
     #[serde(default)]
     pub rerank_providers: BTreeMap<String, RerankProviderConfig>,
+    /// Optional `[knowledge]` table — server-level tunables for the
+    /// hybrid retrieval pipeline. Defaults are tuned for wikipedia-scale
+    /// buckets; smaller deployments rarely need to touch this.
+    /// Hot-swappable: edits take effect on the next query without a
+    /// server restart.
+    #[serde(default)]
+    pub knowledge: KnowledgeConfig,
 }
 
 /// Client-auth section. Tokens are stored in cleartext alongside other
@@ -412,6 +419,60 @@ impl RerankProviderConfig {
             }
         }
     }
+}
+
+/// `[knowledge]` table — server-level tunables for the hybrid retrieval
+/// pipeline (see `crate::knowledge`). Empty subtables fall back to
+/// per-field defaults, so an operator only declares the knobs they want
+/// to override.
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeConfig {
+    #[serde(default)]
+    pub query: KnowledgeQueryConfig,
+}
+
+/// `[knowledge.query]` — per-query defaults applied at every query site
+/// (WebUI `QueryBuckets`, the LLM-facing `knowledge_query` tool, and the
+/// autoquery nudge path).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeQueryConfig {
+    /// Per-bucket cap on sparse (BM25) search latency, in milliseconds.
+    /// When a bucket's sparse path takes longer than this, the bucket
+    /// contributes 0 sparse candidates for the query and the dense hits
+    /// proceed alone. `0` disables the cap entirely (sparse always
+    /// completes, however long it takes).
+    ///
+    /// The default is sized for wikipedia-scale corpora where broad
+    /// queries routinely run 600–2000 ms in tantivy. Smaller buckets
+    /// may want a much tighter value (e.g. 250) so a pathological query
+    /// can't stall the whole pipeline.
+    #[serde(default = "default_sparse_timeout_ms")]
+    pub sparse_timeout_ms: u64,
+}
+
+impl Default for KnowledgeQueryConfig {
+    fn default() -> Self {
+        Self {
+            sparse_timeout_ms: default_sparse_timeout_ms(),
+        }
+    }
+}
+
+impl KnowledgeQueryConfig {
+    /// Translate the TOML-friendly `u64` (with `0` as a sentinel) into
+    /// the `Option<u64>` shape that `QueryParams` consumes.
+    pub fn sparse_timeout(&self) -> Option<u64> {
+        match self.sparse_timeout_ms {
+            0 => None,
+            n => Some(n),
+        }
+    }
+}
+
+fn default_sparse_timeout_ms() -> u64 {
+    2_000
 }
 
 fn build_gemini(base_url: Option<&str>, auth: &Auth) -> Result<Arc<dyn ModelProvider>> {
@@ -827,6 +888,44 @@ endpoint = "http://localhost:8081"
                 assert!(auth.is_none());
             }
         }
+    }
+
+    #[test]
+    fn parses_knowledge_section() {
+        // Every sub-config still needs the one required section
+        // (`[backends.*]`); `knowledge` rides alongside it.
+        let base = |knowledge: &str| {
+            format!(
+                r#"
+[backends.cloud]
+kind = "anthropic"
+auth = {{ mode = "api_key", value = "sk-test" }}
+{knowledge}
+"#
+            )
+        };
+
+        // Explicit override.
+        let cfg: Config =
+            toml::from_str(&base("[knowledge.query]\nsparse_timeout_ms = 500")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.knowledge.query.sparse_timeout_ms, 500);
+        assert_eq!(cfg.knowledge.query.sparse_timeout(), Some(500));
+
+        // `0` is the "disable the cap" sentinel → None.
+        let disabled: Config =
+            toml::from_str(&base("[knowledge.query]\nsparse_timeout_ms = 0")).unwrap();
+        assert_eq!(disabled.knowledge.query.sparse_timeout(), None);
+
+        // Omitted section falls back to the wikipedia-scale default.
+        let bare: Config = toml::from_str(&base("")).unwrap();
+        assert_eq!(bare.knowledge.query.sparse_timeout_ms, 2_000);
+        assert_eq!(bare.knowledge.query.sparse_timeout(), Some(2_000));
+
+        // Unknown keys are rejected (deny_unknown_fields catches typos).
+        assert!(
+            toml::from_str::<Config>(&base("[knowledge.query]\nsparse_timout_ms = 5")).is_err()
+        );
     }
 
     #[test]

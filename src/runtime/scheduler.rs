@@ -793,6 +793,10 @@ pub struct Scheduler {
     /// the next model call before retrieval finishes, making the nudge
     /// arrive after the turn is already terminal.
     knowledge_autoquery_in_flight: HashSet<String>,
+    /// Server-level `[knowledge]` tunables (sparse timeout, …). Cloned
+    /// into each query call site at use time. Refreshed in place by
+    /// the runtime config-edit handler.
+    knowledge_config: crate::pod::config::KnowledgeConfig,
 
     tasks: HashMap<String, Thread>,
     /// Per-thread cancel signal. Cloned into every dispatched I/O
@@ -931,6 +935,7 @@ impl Scheduler {
         shared_mcp_overlays: Vec<SharedHostOverlay>,
         v2_daemon_registry: Arc<crate::tools::host_env_link::LiveDaemonRegistry>,
         server_config_path: Option<PathBuf>,
+        knowledge_config: crate::pod::config::KnowledgeConfig,
     ) -> anyhow::Result<(
         Self,
         mpsc::UnboundedReceiver<StreamUpdate>,
@@ -1034,6 +1039,7 @@ impl Scheduler {
                 oauth_refresh_no_refresh_token_warned: HashSet::new(),
                 oauth_refresh_failure_counts: HashMap::new(),
                 knowledge_autoquery_in_flight: HashSet::new(),
+                knowledge_config,
                 tasks: HashMap::new(),
                 cancel_tokens: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
@@ -4323,11 +4329,13 @@ impl Scheduler {
         {
             return;
         }
+        let sparse_timeout_ms = self.knowledge_config.query.sparse_timeout();
         pending_io.push(Box::pin(async move {
             let cancel = tokio_util::sync::CancellationToken::new();
             let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
             let params = crate::knowledge::QueryParams {
                 top_k: config.top_k as usize,
+                sparse_timeout_ms,
                 ..Default::default()
             };
             let result = match engine.query(&buckets, &query_text, &params, &cancel).await {
