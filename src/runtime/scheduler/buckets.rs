@@ -47,13 +47,13 @@ use crate::server::thread_router::ThreadEventRouter;
 /// rhythm.
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 
-/// A build emitting no forward progress (source records / chunks) for
-/// this long is treated as stalled. The progress emitter fires the
-/// build's cancel token — which unwinds a stall blocked on a
-/// *cancellable* await (e.g. a hung embedder request) — and logs at
-/// ERROR so a hard wedge (e.g. a deadlocked sync index commit, which
-/// cancel can't interrupt) is operator-visible instead of sitting at
-/// "building" silently forever.
+/// A build emitting no forward progress (source records / chunks /
+/// dense rebuild inserts) for this long is treated as stalled. The
+/// progress emitter fires the build's cancel token — which unwinds a
+/// stall blocked on a *cancellable* await (e.g. a hung embedder
+/// request) — and logs at ERROR so a hard wedge (e.g. a deadlocked
+/// sync index commit, which cancel can't interrupt) is operator-visible
+/// instead of sitting at "building" silently forever.
 ///
 /// Set well above the longest *legitimate* no-progress window: the
 /// coarse index-snapshot barrier (HNSW dump + tantivy commit) freezes
@@ -1247,10 +1247,16 @@ async fn run_build(
     let emitter = tokio::spawn(async move {
         let mut interval = tokio::time::interval(PROGRESS_THROTTLE);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Stall watchdog: track the last (source_records, chunks) marker
-        // that advanced and when. If it stops advancing for
-        // BUILD_STALL_TIMEOUT, fire cancel and log once (see the const).
-        let mut last_marker: (u64, u64) = (0, 0);
+        // Stall watchdog: track the last (source_records, chunks,
+        // dense_inserted) marker that advanced and when. If none of them
+        // move for BUILD_STALL_TIMEOUT, fire cancel and log once (see the
+        // const). `dense_inserted` is in the marker so the resume
+        // preamble's HNSW rebuild — which ticks dense progress every
+        // 500ms while source_records/chunks sit frozen at the snapshot
+        // values — counts as forward progress. Without it, a healthy
+        // multi-hour resume rebuild trips the watchdog (the bug that
+        // wedged wikipedia_2 post-0.3.23).
+        let mut last_marker: (u64, u64, u64) = (0, 0, 0);
         let mut last_progress_at = tokio::time::Instant::now();
         let mut stall_logged = false;
         loop {
@@ -1259,7 +1265,11 @@ async fn run_build(
                 break;
             }
             let snap = progress_for_emit.snapshot();
-            let marker = (snap.source_records, snap.chunks);
+            let marker = (
+                snap.source_records,
+                snap.chunks,
+                snap.dense_inserted.unwrap_or(0),
+            );
             if marker != last_marker {
                 last_marker = marker;
                 last_progress_at = tokio::time::Instant::now();
@@ -1271,6 +1281,7 @@ async fn run_build(
                     pod_id = ?pod_id_for_emit,
                     source_records = snap.source_records,
                     chunks = snap.chunks,
+                    dense_inserted = ?snap.dense_inserted,
                     stalled_for_s = last_progress_at.elapsed().as_secs(),
                     "bucket build stalled: no forward progress for {}s — firing cancel. A \
                      cancellable stall (e.g. a hung embedder request) will unwind and report \
