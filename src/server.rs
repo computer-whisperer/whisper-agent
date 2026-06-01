@@ -65,13 +65,13 @@ use crate::runtime::scheduler::{
 // compile time. The asset folders must exist when cargo compiles
 // this crate — `scripts/dev.sh` and the Dockerfile both run wasm-
 // pack before the release cargo build, populating
-// `crates/whisper-agent-aetna-ui/pkg/`.
+// `crates/whisper-agent-damascene-ui/pkg/`.
 #[derive(RustEmbed)]
-#[folder = "crates/whisper-agent-aetna-ui/pkg/"]
+#[folder = "crates/whisper-agent-damascene-ui/pkg/"]
 struct WebuiPkg;
 
 #[derive(RustEmbed)]
-#[folder = "crates/whisper-agent-aetna-ui/assets/"]
+#[folder = "crates/whisper-agent-damascene-ui/assets/"]
 struct WebuiAssets;
 
 /// Look up `path` in an embedded asset folder and return it with a

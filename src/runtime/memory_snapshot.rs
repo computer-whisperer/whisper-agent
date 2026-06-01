@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn session_section_lists_host_env_bindings() {
         let dir = scratch_dir();
-        let main_root = std::path::PathBuf::from("/home/christian/workspace/aetna-volume");
+        let main_root = std::path::PathBuf::from("/home/christian/workspace/damascene-volume");
         let other_root = std::path::PathBuf::from("/work/other");
         let envs = [
             HostEnvInfo {
@@ -379,7 +379,7 @@ mod tests {
         let msg = build_block(&dir, fixed_now(), &session);
         let text = text_of(&msg);
         assert!(
-            text.contains("/home/christian/workspace/aetna-volume"),
+            text.contains("/home/christian/workspace/damascene-volume"),
             "missing main workspace path"
         );
         assert!(text.contains("/work/other"), "missing side workspace path");

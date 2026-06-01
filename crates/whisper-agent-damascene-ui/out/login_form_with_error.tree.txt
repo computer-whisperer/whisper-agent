@@ -1,0 +1,34 @@
+root kind=Group rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) source=src/login.rs:161
+  root.card.0 kind=Card rect=(580,24,440,460) size=(Fixed(440.0),Hug) surface_role=panel fill=card source=src/login.rs:151
+    root.card.0.group.0 kind=Group rect=(580,24,440,92) size=(Fill(1.0),Hug) source=src/login.rs:152
+      root.card.0.group.0.heading.0 kind=Heading rect=(604,48,392,16) size=(Hug,Hug) text="whisper-agent" text_role=title text_color=foreground source=src/login.rs:153
+      root.card.0.group.0.text.1 kind=Text rect=(604,72,392,20) size=(Fill(1.0),Hug) text="Sign in to a whisper-agent server" wrap=Wrap text_color=muted-foreground source=src/login.rs:154
+    root.card.0.group.1 kind=Group rect=(580,116,440,312) size=(Fill(1.0),Hug) source=src/login.rs:156
+      root.card.0.group.1.group.0 kind=Group rect=(604,116,392,220) size=(Fill(1.0),Hug) source=src/login.rs:127
+        root.card.0.group.1.group.0.group.0 kind=Group rect=(606,116,388,88) size=(Fill(1.0),Hug) source=src/login.rs:128
+          root.card.0.group.1.group.0.group.0.text.0 kind=Text rect=(606,116,388,20) size=(Fill(1.0),Hug) text="Server URL" overflow=Ellipsis text_role=label text_color=foreground source=src/login.rs:129
+          root.card.0.group.1.group.0.group.0.form_control.1 kind=form_control rect=(606,144,388,32) size=(Fill(1.0),Hug) source=src/login.rs:130
+            root.card.0.group.1.group.0.group.0.form_control.1.text_input[login:server] kind=text_input rect=(606,144,388,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted source=src/login.rs:108
+              root.card.0.group.1.group.0.group.0.form_control.1.text_input[login:server].group.0 kind=Group rect=(616,144,368,32) size=(Fill(1.0),Fill(1.0)) clip=true
+                root.card.0.group.1.group.0.group.0.form_control.1.text_input[login:server].group.0.text.0 kind=Text rect=(616,150,59,20) size=(Hug,Fixed(20.0)) text="not-a-url" text_color=foreground source=src/login.rs:108
+          root.card.0.group.1.group.0.group.0.text.2 kind=Text rect=(606,184,388,20) size=(Fill(1.0),Hug) text="e.g. https://host:port — http://127.0.0.…" wrap=Wrap text_color=muted-foreground source=src/login.rs:131
+        root.card.0.group.1.group.0.group.1 kind=Group rect=(606,216,388,88) size=(Fill(1.0),Hug) source=src/login.rs:133
+          root.card.0.group.1.group.0.group.1.text.0 kind=Text rect=(606,216,388,20) size=(Fill(1.0),Hug) text="Client token" overflow=Ellipsis text_role=label text_color=foreground source=src/login.rs:134
+          root.card.0.group.1.group.0.group.1.form_control.1 kind=form_control rect=(606,244,388,32) size=(Fill(1.0),Hug) source=src/login.rs:135
+            root.card.0.group.1.group.0.group.1.form_control.1.text_input[login:token] kind=text_input rect=(606,244,388,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted source=src/login.rs:112
+              root.card.0.group.1.group.0.group.1.form_control.1.text_input[login:token].group.0 kind=Group rect=(616,244,368,32) size=(Fill(1.0),Fill(1.0)) clip=true
+                root.card.0.group.1.group.0.group.1.form_control.1.text_input[login:token].group.0.text.0 kind=Text rect=(616,250,0,20) size=(Hug,Fixed(20.0)) text="" text_color=foreground source=src/login.rs:112
+          root.card.0.group.1.group.0.group.1.text.2 kind=Text rect=(606,284,388,20) size=(Fill(1.0),Hug) text="blank is OK for loopback servers" wrap=Wrap text_color=muted-foreground source=src/login.rs:136
+        root.card.0.group.1.group.0.group.2 kind=Group rect=(606,316,388,20) size=(Fill(1.0),Hug) source=src/login.rs:138
+          root.card.0.group.1.group.0.group.2.form_control.0 kind=form_control rect=(606,316,388,20) size=(Fill(1.0),Hug) source=src/login.rs:138
+            root.card.0.group.1.group.0.group.2.form_control.0.group.0 kind=Group rect=(606,316,192,20) size=(Hug,Hug) source=src/login.rs:120
+              root.card.0.group.1.group.0.group.2.form_control.0.group.0.checkbox[login:remember] kind=checkbox rect=(606,318,16,16) size=(Fixed(16.0),Fixed(16.0)) fill=primary source=src/login.rs:121
+                root.card.0.group.1.group.0.group.2.form_control.0.group.0.checkbox[login:remember].icon.0 kind=icon rect=(608,320,12,12) size=(Fixed(12.0),Fixed(12.0)) icon=check text_color=primary-foreground source=src/login.rs:121
+              root.card.0.group.1.group.0.group.2.form_control.0.group.0.text.1 kind=Text rect=(630,316,168,20) size=(Hug,Hug) text="Remember on this device" text_color=foreground source=src/login.rs:122
+      root.card.0.group.1.alert.1 kind=alert rect=(604,336,392,68) size=(Fill(1.0),Hug) surface_role=panel fill=destructive text_color=destructive source=src/login.rs:143
+        root.card.0.group.1.alert.1.text.0 kind=Text rect=(616,348,368,20) size=(Fill(1.0),Hug) text="connection failed" overflow=Ellipsis text_role=label text_color=destructive source=src/login.rs:144
+        root.card.0.group.1.alert.1.text.1 kind=Text rect=(616,372,368,20) size=(Fill(1.0),Hug) text="invalid server URL: relative URL without…" wrap=Wrap text_color=destructive source=src/login.rs:145
+    root.card.0.group.2 kind=Group rect=(580,428,440,56) size=(Fill(1.0),Hug) source=src/login.rs:157
+      root.card.0.group.2.group.0 kind=Group rect=(604,428,392,32) size=(Fill(1.0),Hug) source=src/login.rs:157
+        root.card.0.group.2.group.0.spacer.0 kind=Spacer rect=(604,428,315,32) size=(Fill(1.0),Fill(1.0)) source=src/login.rs:157
+        root.card.0.group.2.group.0.button[login:connect] kind=button rect=(919,428,77,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Connect" text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/login.rs:118

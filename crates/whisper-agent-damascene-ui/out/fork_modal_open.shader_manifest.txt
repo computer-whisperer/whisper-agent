@@ -1,0 +1,76 @@
+stock::rounded_rect  used 29 times
+  root.group.0.group.0 fill=card inner_rect=(0.00,0.00,320.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 shadow=4.00 stroke=border stroke_width=1.00 surface_role=1.00
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0 fill=muted inner_rect=(18.00,80.00,284.00,40.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] fill=accent inner_rect=(22.00,84.00,136.00,32.00) radii=(8.00,4.00,4.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] fill=accent inner_rect=(18.00,180.00,284.00,52.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 fill=primary inner_rect=(18.00,180.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 fill=primary inner_rect=(18.00,236.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.group.0.group.0.group.2 inner_rect=(16.00,808.00,288.00,76.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.0.group.2.group.1.group.0.status-dot.0 fill=success inner_rect=(27.00,866.00,8.00,8.00) radii=(4.00,4.00,4.00,4.00) radius=4.00 surface_role=0.00
+  root.group.0.group[sidebar:resize].resize-handle-hairline.0 fill=border inner_rect=(323.00,0.00,2.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.group.0 inner_rect=(328.00,0.00,1272.00,84.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.2.group.0.group.0.group.0.badge.2 fill=muted inner_rect=(1509.49,22.00,34.51,20.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0 fill=info inner_rect=(336.00,92.00,1250.00,56.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.log_gutter.0 fill=info inner_rect=(336.00,92.00,3.00,56.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.log_gutter.0 fill=muted-foreground inner_rect=(336.00,156.00,3.00,56.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[reasoning:accordion:1] fill=card inner_rect=(351.00,164.00,1227.00,40.00) radii=(4.00,4.00,4.00,4.00) radius=4.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.log_gutter.0 fill=success inner_rect=(336.00,220.00,3.00,232.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0 fill=info inner_rect=(336.00,460.00,1250.00,36.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.log_gutter.0 fill=info inner_rect=(336.00,460.00,3.00,36.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.group.2.group.0.group.2 fill=card inner_rect=(328.00,692.00,1272.00,208.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 shadow=4.00 stroke=border stroke_width=1.00 surface_role=1.00
+  root.group.0.group.2.group.0.group.2.group.1.text_area[compose] fill=rgba(30,31,34,255) inner_rect=(340.00,744.00,1137.31,120.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=input stroke_width=1.00 surface_role=7.00
+  root.group.0.group.2.group.0.group.2.group.1.button[send] fill=primary inner_rect=(1533.31,832.00,54.69,32.00) radii=(6.00,6.00,6.00,6.00) radius=6.00 shadow=2.00 stroke=primary stroke_width=1.00 surface_role=2.00
+  root.overlay.1.scrim[fork:dismiss] fill=overlay-scrim inner_rect=(0.00,0.00,1600.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.overlay.1.modal.1 fill=popover inner_rect=(590.00,204.00,420.00,492.00) radii=(12.00,12.00,12.00,12.00) radius=12.00 shadow=24.00 stroke=input stroke_width=1.00 surface_role=4.00
+  root.overlay.1.modal.1.group.1.group.1.group.0.form_control.1.group[fork:archive].switch-track.0 fill=primary inner_rect=(608.00,396.00,36.00,20.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.overlay.1.modal.1.group.1.group.1.group.0.form_control.1.group[fork:archive].switch-thumb.1 fill=primary-foreground inner_rect=(627.00,399.00,14.00,14.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.overlay.1.modal.1.group.1.group.1.group.1.form_control.1.group[fork:reset-caps].switch-track.0 fill=input inner_rect=(608.00,504.00,36.00,20.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.overlay.1.modal.1.group.1.group.1.group.1.form_control.1.group[fork:reset-caps].switch-thumb.1 fill=foreground inner_rect=(611.00,507.00,14.00,14.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.overlay.1.modal.1.group.2.button[fork:cancel] fill=secondary inner_rect=(869.48,648.00,66.47,32.00) radii=(6.00,6.00,6.00,6.00) radius=6.00 shadow=2.00 stroke=border stroke_width=1.00 surface_role=2.00
+  root.overlay.1.modal.1.group.2.button[fork:confirm] fill=primary inner_rect=(943.95,648.00,50.05,32.00) radii=(6.00,6.00,6.00,6.00) radius=6.00 shadow=2.00 stroke=primary stroke_width=1.00 surface_role=2.00
+
+stock::text  used 43 times
+  root.group.0.group.0.group.0.group.0.text.1 text="whisper-ag…" color=foreground size=16.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] text="default" color=accent-foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] text="scratch" color=muted-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 text="Threads (2)" color=muted-foreground size=12.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 text="first conversation" color=foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 text="idle · 8d" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 text="t-2" color=foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 text="working · 8d" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.group.2.group.1.text.1 text="connected" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.group.2.group.1.text.2 text="v0.3.20" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.group.0.group.0.heading.0 text="first conversation" color=foreground size=16.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.group.0.group.0.badge.2 text="idle" color=muted-foreground size=12.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.group.0.group.1.text.0 text="t-1" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.group.0.group.1.text.1 text="anthropic-prod/claude-opus-4…" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.group.0.group.1.text.2 text="↑ 1,234 · ↓ 287 · cache 800r…" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group[chat:user-row:0].text[chat:text:0:user] text="Can you summarize the design…" color=foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[reasoning:accordion:1].text.0 text="User wants a high-level summ…" color=foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.inlines[chat:text:2:assistant:md:p:0..235] attr="The knowledge-bucket layer a…" runs=7 size=14.0 wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.0.group.0.text.0 text="•" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.0.group.1.inlines[chat:text:2:assistant:md:p:236..340] attr="bucket.toml — config: embedd…" runs=2 size=14.0 wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.group.0.text.0 text="•" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.group.1.inlines[chat:text:2:assistant:md:p:341..498] attr="slots/ — append-only segment…" runs=2 size=14.0 wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.group.0.text.0 text="•" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.group.1.inlines[chat:text:2:assistant:md:p:499..635] attr="source-cache/ — raw artifact…" runs=2 size=14.0 wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.text[chat:text:2:assistant:md:p:637..889] text="Embedder rotation is driven …" color=foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.inlines[chat:text:2:assistant:md:p:890..1059] attr="See docs/design_knowledge_db…" runs=3 size=14.0 wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group[chat:user-row:3].text[chat:text:3:user] text="Thanks — that's exactly what…" color=foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.group.2.group.0.button[thread-action:cancel] text="Cancel" color=muted-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.group.2.group.0.button[thread-action:archive] text="Archive" color=muted-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.group.2.group.0.button[thread-action:compact] text="Compact" color=muted-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0.text_area_content.0.text.0 text="" color=foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.group.0.group.2.group.0.group.2.group.1.button[send] text="Send" color=primary-foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Middle
+  root.group.0.group.2.group.0.group.2.group.2.group.1.text.1 text="to send" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.2.group.0.group.2.group.2.text.2 text="Shift+↵ for newline" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.overlay.1.modal.1.group.0.heading.0 text="Fork from this message" color=foreground size=16.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
+  root.overlay.1.modal.1.group.0.text.1 text="Forking at message #1 of the…" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.overlay.1.modal.1.group.1.text.0 text="Forks this thread at the sel…" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.overlay.1.modal.1.group.1.group.1.group.0.text.0 text="Archive original" color=foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Start
+  root.overlay.1.modal.1.group.1.group.1.group.0.text.2 text="Archived threads drop off th…" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.overlay.1.modal.1.group.1.group.1.group.1.text.0 text="Reset capabilities" color=foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Start
+  root.overlay.1.modal.1.group.1.group.1.group.1.text.2 text="Off (default): inherit the s…" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=Wrap anchor=Start
+  root.overlay.1.modal.1.group.2.button[fork:cancel] text="Cancel" color=secondary-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
+  root.overlay.1.modal.1.group.2.button[fork:confirm] text="Fork" color=primary-foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Middle
+

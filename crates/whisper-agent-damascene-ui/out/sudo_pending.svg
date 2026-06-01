@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+<defs>
+  <filter id="shadow-sm" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
+    <feOffset dx="0" dy="2"/>
+    <feComponentTransfer><feFuncA type="linear" slope="0.20"/></feComponentTransfer>
+    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-md" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+    <feOffset dx="0" dy="6"/>
+    <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
+    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-lg" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+    <feOffset dx="0" dy="12"/>
+    <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
+    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+<rect width="100%" height="100%" fill="#09090b"/>
+<rect data-node="root.group.0.group.0" data-shader="stock::rounded_rect" x="0.00" y="0.00" width="320.00" height="900.00" rx="0.00" fill="#18191b" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<svg data-node="root.group.0.group.0.group.0.group.0.icon.0" data-icon="custom" x="16.00" y="16.00" width="48.00" height="48.00" viewBox="0 0 820 820" stroke-linecap="round" stroke-linejoin="round">
+<path d="M820.000 410.000 C820.000 518.739 776.804 623.024 699.914 699.914 C623.024 776.804 518.739 820.000 410.000 820.000 C301.261 820.000 196.976 776.804 120.086 699.914 C43.196 623.024 0.000 518.739 0.000 410.000 C0.000 301.261 43.196 196.976 120.086 120.086 C196.976 43.196 301.261 0.000 410.000 0.000 C518.739 0.000 623.024 43.196 699.914 120.086 C776.804 196.976 820.000 301.261 820.000 410.000 Z" fill="#0e2145" />
+<path d="M820.000 410.000 C820.000 518.739 776.804 623.024 699.914 699.914 C623.024 776.804 518.739 820.000 410.000 820.000 C301.261 820.000 196.976 776.804 120.086 699.914 C43.196 623.024 0.000 518.739 0.000 410.000 C0.000 301.261 43.196 196.976 120.086 120.086 C196.976 43.196 301.261 0.000 410.000 0.000 C518.739 0.000 623.024 43.196 699.914 120.086 C776.804 196.976 820.000 301.261 820.000 410.000 Z" fill="rgba(19,61,133,0.341)" />
+<path d="M165.000 612.000 C129.000 598.000 103.000 565.000 103.000 524.000 L103.000 251.000 C103.000 221.000 120.000 194.000 146.000 177.000 L361.000 39.000 C391.000 20.000 429.000 20.000 459.000 39.000 L674.000 177.000 C700.000 194.000 717.000 221.000 717.000 251.000 L717.000 524.000 C717.000 565.000 691.000 598.000 655.000 612.000" fill="none" stroke="#2162ff" stroke-width="25.00"/>
+<path d="M227.000 300.000 L271.000 300.000 L271.000 467.000 L227.000 467.000 C200.000 467.000 178.000 445.000 178.000 418.000 L178.000 349.000 C178.000 322.000 200.000 300.000 227.000 300.000 Z" fill="#2773ff" />
+<path d="M593.000 300.000 L549.000 300.000 L549.000 467.000 L593.000 467.000 C620.000 467.000 642.000 445.000 642.000 418.000 L642.000 349.000 C642.000 322.000 620.000 300.000 593.000 300.000 Z" fill="#2773ff" />
+<path d="M325.000 190.000 L495.000 190.000 C546.000 190.000 586.000 231.000 586.000 282.000 L586.000 467.000 L234.000 467.000 L234.000 282.000 C234.000 231.000 274.000 190.000 325.000 190.000 Z" fill="#2773ff" />
+<path d="M326.000 216.000 L494.000 216.000 C532.000 216.000 562.000 246.000 562.000 284.000 L562.000 470.000 C562.000 477.000 556.000 483.000 549.000 483.000 L271.000 483.000 C264.000 483.000 258.000 477.000 258.000 470.000 L258.000 284.000 C258.000 246.000 288.000 216.000 326.000 216.000 Z" fill="#020a11" />
+<path d="M338.000 291.000 C342.000 291.000 346.000 292.000 349.000 295.000 L401.000 333.000 C407.000 338.000 407.000 348.000 401.000 353.000 L349.000 392.000 C343.000 397.000 334.000 396.000 329.000 389.000 C325.000 383.000 326.000 375.000 332.000 370.000 L375.000 343.000 L332.000 316.000 C326.000 311.000 325.000 302.000 330.000 296.000 C332.000 293.000 335.000 291.000 338.000 291.000 Z" fill="#fbfaf5" />
+<path d="M426.000 395.000 L487.000 395.000 C490.866 395.000 494.000 398.134 494.000 402.000 L494.000 408.000 C494.000 411.866 490.866 415.000 487.000 415.000 L426.000 415.000 C422.134 415.000 419.000 411.866 419.000 408.000 L419.000 402.000 C419.000 398.134 422.134 395.000 426.000 395.000 Z" fill="#fbfaf5" />
+<path d="M289.500 471.000 L532.500 471.000 C538.299 471.000 543.000 475.701 543.000 481.500 L543.000 481.500 C543.000 487.299 538.299 492.000 532.500 492.000 L289.500 492.000 C283.701 492.000 279.000 487.299 279.000 481.500 L279.000 481.500 C279.000 475.701 283.701 471.000 289.500 471.000 Z" fill="#2162ff" />
+<path d="M306.000 517.000 L306.000 554.000 L212.000 648.000" fill="none" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M359.000 517.000 L359.000 602.000 L310.000 651.000 L310.000 690.000" fill="none" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M410.000 517.000 L410.000 742.000" fill="none" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M461.000 517.000 L461.000 602.000 L510.000 651.000 L510.000 690.000" fill="none" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M514.000 517.000 L514.000 554.000 L608.000 648.000" fill="none" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M229.000 663.000 C229.000 675.703 218.703 686.000 206.000 686.000 C193.297 686.000 183.000 675.703 183.000 663.000 C183.000 650.297 193.297 640.000 206.000 640.000 C218.703 640.000 229.000 650.297 229.000 663.000 Z" fill="#031229" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M332.000 717.000 C332.000 729.703 321.703 740.000 309.000 740.000 C296.297 740.000 286.000 729.703 286.000 717.000 C286.000 704.297 296.297 694.000 309.000 694.000 C321.703 694.000 332.000 704.297 332.000 717.000 Z" fill="#031229" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M433.000 771.000 C433.000 783.703 422.703 794.000 410.000 794.000 C397.297 794.000 387.000 783.703 387.000 771.000 C387.000 758.297 397.297 748.000 410.000 748.000 C422.703 748.000 433.000 758.297 433.000 771.000 Z" fill="#031229" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M534.000 717.000 C534.000 729.703 523.703 740.000 511.000 740.000 C498.297 740.000 488.000 729.703 488.000 717.000 C488.000 704.297 498.297 694.000 511.000 694.000 C523.703 694.000 534.000 704.297 534.000 717.000 Z" fill="#031229" stroke="#2162ff" stroke-width="18.00"/>
+<path d="M637.000 663.000 C637.000 675.703 626.703 686.000 614.000 686.000 C601.297 686.000 591.000 675.703 591.000 663.000 C591.000 650.297 601.297 640.000 614.000 640.000 C626.703 640.000 637.000 650.297 637.000 663.000 Z" fill="#031229" stroke="#2162ff" stroke-width="18.00"/>
+</svg>
+<text data-node="root.group.0.group.0.group.0.group.0.text.1" data-shader="stock::text" x="72.00" y="45.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">whisper-ag…</text>
+<svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:new-pod]" data-icon="plus" x="201.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+<svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files]" data-icon="folder" x="241.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+<svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings]" data-icon="settings" x="281.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
+<clipPath id="clip-6"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-6)">
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="284.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+</g>
+<clipPath id="clip-7"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-7)">
+<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 154.00 A 4.00 4.00 0 0 1 158.00 88.00 V 112.00 A 4.00 4.00 0 0 1 154.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+</g>
+<clipPath id="clip-8"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-8)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="90.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
+</g>
+<clipPath id="clip-9"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-9)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="230.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
+</g>
+<clipPath id="clip-10"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-10)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0" data-shader="stock::text" x="26.00" y="162.37" font-family="Inter Variable" font-size="12.00" font-weight="600" fill="#b0b4ba" text-anchor="start">Threads (2)</text>
+</g>
+<clipPath id="clip-11"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-11)">
+<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="271.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+</g>
+<clipPath id="clip-12"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-12)">
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1]" data-shader="stock::rounded_rect" x="18.00" y="180.00" width="284.00" height="52.00" rx="8.00" fill="rgba(13,40,71,0.094)" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+</g>
+<clipPath id="clip-13"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-13)">
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="180.00" width="3.00" height="52.00" rx="1.50" fill="#0090ff" />
+</g>
+<clipPath id="clip-14"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-14)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="203.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
+</g>
+<clipPath id="clip-15"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-15)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="220.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">idle · 8d</text>
+</g>
+<clipPath id="clip-16"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-16)">
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="236.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
+</g>
+<clipPath id="clip-17"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-17)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="259.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">t-2</text>
+</g>
+<clipPath id="clip-18"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-18)">
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="276.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">working · 8d</text>
+</g>
+<rect data-node="root.group.0.group.0.group.2" data-shader="stock::rounded_rect" x="16.00" y="808.00" width="288.00" height="76.00" rx="0.00" fill="none" stroke="#363a3f" stroke-width="1.00" />
+<svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets]" data-icon="custom" x="233.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M21.000 5.000 C21.000 6.657 16.971 8.000 12.000 8.000 C7.029 8.000 3.000 6.657 3.000 5.000 C3.000 3.343 7.029 2.000 12.000 2.000 C16.971 2.000 21.000 3.343 21.000 5.000 Z" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M3.000 5.000 L3.000 19.000 C3.000 20.657 7.029 22.000 12.000 22.000 C16.971 22.000 21.000 20.657 21.000 19.000 L21.000 5.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M3.000 12.000 C3.000 13.657 7.029 15.000 12.000 15.000 C16.971 15.000 21.000 13.657 21.000 12.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+</svg>
+<svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings]" data-icon="settings" x="273.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
+<rect data-node="root.group.0.group.0.group.2.group.1.group.0.status-dot.0" data-shader="stock::rounded_rect" x="27.00" y="866.00" width="8.00" height="8.00" rx="4.00" fill="#30a46c" />
+<text data-node="root.group.0.group.0.group.2.group.1.text.1" data-shader="stock::text" x="46.00" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">connected</text>
+<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.26" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.20</text>
+<rect data-node="root.group.0.group[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
+<rect data-node="root.group.0.group.2.group.0.group.0" data-shader="stock::rounded_rect" x="328.00" y="0.00" width="1272.00" height="84.00" rx="0.00" fill="none" stroke="#363a3f" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.group.0.group.0.heading.0" data-shader="stock::text" x="344.00" y="37.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
+<rect data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::rounded_rect" x="1509.49" y="22.00" width="34.51" height="20.00" rx="10.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::text" x="1526.74" y="36.37" font-family="Inter Variable" font-size="12.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">idle</text>
+<svg data-node="root.group.0.group.2.group.0.group.0.group.0.icon_button[chat:inspector-toggle]" data-icon="info" x="1561.00" y="25.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7h.01"/></svg>
+<text data-node="root.group.0.group.2.group.0.group.0.group.1.text.0" data-shader="stock::text" x="344.00" y="64.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">t-1</text>
+<text data-node="root.group.0.group.2.group.0.group.0.group.1.text.1" data-shader="stock::text" x="1187.85" y="64.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">anthropic-prod/claude-opus-4-7</text>
+<text data-node="root.group.0.group.2.group.0.group.0.group.1.text.2" data-shader="stock::text" x="1386.12" y="64.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">↑ 1,234 · ↓ 287 · cache 800r/200c</text>
+<rect data-node="root.group.0.group.2.group.0.group.1.alert.0" data-shader="stock::rounded_rect" x="344.00" y="92.00" width="1240.00" height="284.00" rx="8.00" fill="rgba(255,197,61,0.149)" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.text.0" data-shader="stock::text" x="356.00" y="119.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#ffc53d" text-anchor="start">sudo requested · fn #7</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.text.1" data-shader="stock::text" x="356.00" y="138.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#ffc53d" text-anchor="start"></text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.0" data-shader="stock::text" x="356.00" y="163.16" font-family="JetBrains Mono" font-size="12.00" font-weight="400" fill="#edeef0" text-anchor="start">tool: bash</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.1" data-shader="stock::text" x="356.00" y="189.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">{</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.1" data-shader="stock::text" x="356.00" y="209.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">  &quot;command&quot;: &quot;rm -rf node_modules &amp;&amp; npm ci&quot;,</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.1" data-shader="stock::text" x="356.00" y="229.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">  &quot;cwd&quot;: &quot;/repo&quot;</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.1" data-shader="stock::text" x="356.00" y="249.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">}</text>
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text.2" data-shader="stock::text" x="356.00" y="279.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">reason: Need to wipe and reinstall to clear the corrupted lockfile state before retrying the failing test.</text>
+<rect data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:approve:7]" data-shader="stock::rounded_rect" x="356.00" y="292.00" width="77.41" height="32.00" rx="6.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:approve:7]" data-shader="stock::text" x="394.70" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#ffffff" text-anchor="middle">Approve</text>
+<rect data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:remember:7]" data-shader="stock::rounded_rect" x="441.41" y="292.00" width="92.49" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:remember:7]" data-shader="stock::text" x="487.65" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Remember</text>
+<rect data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:reject:7]" data-shader="stock::rounded_rect" x="541.90" y="292.00" width="62.27" height="32.00" rx="6.00" fill="#e5484d" stroke="#e5484d" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.group.3.button[sudo:reject:7]" data-shader="stock::text" x="573.03" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#ffffff" text-anchor="middle">Reject</text>
+<rect data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text_input[sudo:reject-reason:7]" data-shader="stock::rounded_rect" x="356.00" y="332.00" width="1216.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<clipPath id="clip-47"><rect x="366.00" y="332.00" width="1196.00" height="32.00"/></clipPath><g clip-path="url(#clip-47)">
+<text data-node="root.group.0.group.2.group.0.group.1.alert.0.group.2.text_input[sudo:reject-reason:7].group.0.text.0" data-shader="stock::text" x="366.00" y="353.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">reject reason (optional)</text>
+</g>
+<clipPath id="clip-48"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-48)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="344.00" width="3.00" height="56.00" rx="0.00" fill="#b0b4ba" />
+</g>
+<clipPath id="clip-49"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-49)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[reasoning:accordion:1]" data-shader="stock::rounded_rect" x="351.00" y="352.00" width="1227.00" height="40.00" rx="4.00" fill="#18191b" />
+</g>
+<clipPath id="clip-50"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-50)">
+<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[reasoning:accordion:1].icon.1" data-icon="chevron-right" x="1552.00" y="365.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
+</g>
+<clipPath id="clip-51"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-51)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="408.00" width="3.00" height="232.00" rx="0.00" fill="#30a46c" />
+</g>
+<clipPath id="clip-52"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-52)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.inlines[chat:text:2:assistant:md:p:0..235]" data-shader="stock::text" x="351.00" y="431.09" font-size="14.00" text-anchor="start"><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0">The knowledge-bucket layer adds </tspan><tspan font-family="Inter Variable" font-weight="700" font-style="normal" fill="#edeef0">dense + sparse retrieval</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> to whisper-agent. Each bucket is a directory under </tspan><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#edeef0">&lt;buckets_root&gt;/</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> (server scope) or </tspan><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#edeef0">&lt;pods_root&gt;/&lt;pod&gt;/buckets/</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> (pod scope) — same shape on disk, different visibility:</tspan></text>
+</g>
+<clipPath id="clip-53"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-53)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.0.group.0.text.0" data-shader="stock::text" x="357.50" y="487.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="middle">•</text>
+</g>
+<clipPath id="clip-54"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-54)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.0.group.1.inlines[chat:text:2:assistant:md:p:236..340]" data-shader="stock::text" x="372.00" y="487.09" font-size="14.00" text-anchor="start"><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#edeef0">bucket.toml</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> — config: embedder name, chunker settings, source adapter (stored / linked / managed).</tspan></text>
+</g>
+<clipPath id="clip-55"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-55)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.group.0.text.0" data-shader="stock::text" x="357.50" y="511.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="middle">•</text>
+</g>
+<clipPath id="clip-56"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-56)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.group.1.inlines[chat:text:2:assistant:md:p:341..498]" data-shader="stock::text" x="372.00" y="511.09" font-size="14.00" text-anchor="start"><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#edeef0">slots/</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> — append-only segments. Each build writes a fresh slot with its own HNSW + tantivy indexes, so older slots stay readable while a new build runs.</tspan></text>
+</g>
+<clipPath id="clip-57"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-57)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.group.0.text.0" data-shader="stock::text" x="357.50" y="535.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="middle">•</text>
+</g>
+<clipPath id="clip-58"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-58)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.group.1.inlines[chat:text:2:assistant:md:p:499..635]" data-shader="stock::text" x="372.00" y="535.09" font-size="14.00" text-anchor="start"><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#edeef0">source-cache/</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> — raw artifacts the chunker reads. Stored buckets copy bytes in here; linked buckets just point at an external path.</tspan></text>
+</g>
+<clipPath id="clip-59"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-59)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.text[chat:text:2:assistant:md:p:637..889]" data-shader="stock::text" x="351.00" y="571.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">Embedder rotation is driven by the slot model: a new embedder ⇒ a new slot, and the old slot stays serving until you delete it. Pod-scoped buckets are reachable only from their owning</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.text[chat:text:2:assistant:md:p:637..889]" data-shader="stock::text" x="351.00" y="591.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">pod's threads; server-scoped buckets are visible to every thread.</text>
+</g>
+<clipPath id="clip-60"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-60)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.inlines[chat:text:2:assistant:md:p:890..1059]" data-shader="stock::text" x="351.00" y="627.09" font-size="14.00" text-anchor="start"><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0">See </tspan><tspan font-family="JetBrains Mono" font-weight="400" font-style="normal" fill="#70b8ff" text-decoration="underline">docs/design_knowledge_db.md</tspan><tspan font-family="Inter Variable" font-weight="400" font-style="normal" fill="#edeef0"> for the full design — the on-disk format, slot manifest layout, and the resolver logic all live there.</tspan></text>
+</g>
+<clipPath id="clip-61"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-61)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0" data-shader="stock::rounded_rect" x="336.00" y="648.00" width="1250.00" height="36.00" rx="0.00" fill="rgba(0,144,255,0.251)" />
+</g>
+<clipPath id="clip-62"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-62)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="648.00" width="3.00" height="36.00" rx="0.00" fill="#0090ff" />
+</g>
+<clipPath id="clip-63"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-63)">
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group[chat:user-row:3].text[chat:text:3:user]" data-shader="stock::text" x="351.00" y="671.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">Thanks — that's exactly what I needed.</text>
+</g>
+<clipPath id="clip-64"><rect x="328.00" y="384.00" width="1272.00" height="308.00"/></clipPath><g clip-path="url(#clip-64)">
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].scrollbar-thumb" data-shader="stock::rounded_rect" x="1592.00" y="524.99" width="6.00" height="167.01" rx="3.00" fill="rgba(105,110,119,0.471)" />
+</g>
+<rect data-node="root.group.0.group.2.group.0.group.3" data-shader="stock::rounded_rect" x="328.00" y="692.00" width="1272.00" height="208.00" rx="0.00" fill="#18191b" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.3.group.0.button[thread-action:cancel]" data-shader="stock::text" x="1386.92" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Cancel</text>
+<text data-node="root.group.0.group.2.group.0.group.3.group.0.button[thread-action:archive]" data-shader="stock::text" x="1463.70" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Archive</text>
+<text data-node="root.group.0.group.2.group.0.group.3.group.0.button[thread-action:compact]" data-shader="stock::text" x="1547.63" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Compact</text>
+<rect data-node="root.group.0.group.2.group.0.group.3.group.1.text_area[compose]" data-shader="stock::rounded_rect" x="340.00" y="744.00" width="1137.31" height="120.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<clipPath id="clip-70"><rect x="352.00" y="752.00" width="1113.31" height="104.00"/></clipPath><g clip-path="url(#clip-70)">
+<text data-node="root.group.0.group.2.group.0.group.3.group.1.text_area[compose].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="352.00" y="762.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start"></text>
+</g>
+<svg data-node="root.group.0.group.2.group.0.group.3.group.1.icon_button[compose:attach]" data-icon="custom" x="1497.31" y="840.00" width="16.00" height="16.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M13.234 20.252 L21.000 12.300" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M16.000 6.000 L7.586 14.586 C6.805 15.367 6.805 16.633 7.586 17.414 C8.367 18.195 9.633 18.195 10.414 17.414 L18.828 8.828 C20.390 7.266 20.390 4.734 18.828 3.172 C17.266 1.610 14.734 1.610 13.172 3.172 L4.757 11.757 C2.414 14.100 2.414 17.900 4.757 20.243 C7.100 22.586 10.900 22.586 13.243 20.243" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+</svg>
+<rect data-node="root.group.0.group.2.group.0.group.3.group.1.button[send]" data-shader="stock::rounded_rect" x="1533.31" y="832.00" width="54.69" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<text data-node="root.group.0.group.2.group.0.group.3.group.1.button[send]" data-shader="stock::text" x="1560.66" y="853.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="rgba(255,255,255,0.502)" text-anchor="middle">Send</text>
+<svg data-node="root.group.0.group.2.group.0.group.3.group.2.group.1.icon.0" data-icon="custom" x="1404.50" y="873.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M9.000 10.000 L4.000 15.000 L9.000 20.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M20.000 4.000 L20.000 11.000 C20.000 13.209 18.209 15.000 16.000 15.000 L4.000 15.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+</svg>
+<text data-node="root.group.0.group.2.group.0.group.3.group.2.group.1.text.1" data-shader="stock::text" x="1422.50" y="884.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">to send</text>
+<text data-node="root.group.0.group.2.group.0.group.3.group.2.text.2" data-shader="stock::text" x="1476.65" y="884.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Shift+↵ for newline</text>
+</svg>

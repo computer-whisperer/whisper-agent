@@ -25,128 +25,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "aetna-core"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80782adf8ff745d676eab958c0c3ae498746a9ff9dd46f5975e6ede2b24db344"
-dependencies = [
- "aetna-fonts",
- "bytemuck",
- "cosmic-text",
- "fdsm",
- "fdsm-ttf-parser",
- "image",
- "kurbo",
- "lru 0.18.0",
- "lyon_tessellation",
- "nalgebra",
- "roxmltree 0.21.1",
- "rustc-hash 2.1.2",
- "swash",
- "ttf-parser",
- "usvg",
- "web-time",
-]
-
-[[package]]
-name = "aetna-fonts"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b945041afe0413409bc3a6fc7b37688a95406951114d63df780788ad3ede03b1"
-dependencies = [
- "aetna-fonts-emoji",
- "aetna-fonts-inter",
- "aetna-fonts-jetbrains-mono",
- "aetna-fonts-symbols",
-]
-
-[[package]]
-name = "aetna-fonts-emoji"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e25a2ffb1e54e79ffb17195a655c719ca403dd50b2deac0890f7f7e0486e898"
-
-[[package]]
-name = "aetna-fonts-inter"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b8d860e8cf47e60287672af29067f62bed9e22c3c61fbd6edc1be1dbe04ed37"
-
-[[package]]
-name = "aetna-fonts-jetbrains-mono"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6077bd29feff1fc06674708af01c03b41a1d6228797cf4b2934f7064087c9f4d"
-
-[[package]]
-name = "aetna-fonts-symbols"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1af44d458ac64fdf6374444de07b5d13a79bb478da01258d965142f0a86e9cc9"
-
-[[package]]
-name = "aetna-markdown"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "058921871f2aa3d8d88d4cc45d38c7bad32183572909f5a44b4f8f74fbe89623"
-dependencies = [
- "aetna-core",
- "pulldown-cmark",
- "syntect",
- "two-face",
-]
-
-[[package]]
-name = "aetna-web"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e89907ec8dc5e8df6d9fa87954c6fde9b00b801bf611dc3ac1ebe20e6cb3ac2f"
-dependencies = [
- "aetna-core",
- "aetna-wgpu",
- "console_error_panic_hook",
- "console_log",
- "js-sys",
- "log",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "web-time",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "aetna-wgpu"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b8a08274aa9bb7c656ec5770299ffc67b4d5064d96a91e3fc92921b7839b0ae"
-dependencies = [
- "aetna-core",
- "bytemuck",
- "cosmic-text",
- "ttf-parser",
- "web-time",
- "wgpu",
-]
-
-[[package]]
-name = "aetna-winit-wgpu"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a55559f525d24062a4607d3de891988289aa56f99c6f6af06e6483a3ebd53b13"
-dependencies = [
- "aetna-core",
- "aetna-wgpu",
- "arboard",
- "jni",
- "open",
- "pollster",
- "wgpu",
- "winit",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1224,6 +1102,135 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
 
 [[package]]
+name = "damascene-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2237abad896eb8f5686aa813234aae17852428b84be1ad7dfd5153d2b98993dd"
+dependencies = [
+ "bytemuck",
+ "cosmic-text",
+ "damascene-fonts",
+ "fdsm",
+ "fdsm-ttf-parser",
+ "glam 0.33.0",
+ "image",
+ "kurbo",
+ "lru 0.18.0",
+ "lyon_tessellation",
+ "nalgebra",
+ "roxmltree 0.21.1",
+ "rustc-hash 2.1.2",
+ "swash",
+ "ttf-parser",
+ "usvg",
+ "web-time",
+]
+
+[[package]]
+name = "damascene-fonts"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d1ae6d4b14318d45ad4bf15b6bf63ce99e5aca8bdf27f556a7e7346e8d60859"
+dependencies = [
+ "damascene-fonts-emoji",
+ "damascene-fonts-inter",
+ "damascene-fonts-jetbrains-mono",
+ "damascene-fonts-symbols",
+]
+
+[[package]]
+name = "damascene-fonts-emoji"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae1de66882e6a31d3e40da0494c558b80f24bf07cf0a7900ddf442a7eefa5434"
+
+[[package]]
+name = "damascene-fonts-inter"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d084c112dab32387b62226e862f0c13fda21b380da54abdb2cc7a35ec22fffe"
+
+[[package]]
+name = "damascene-fonts-jetbrains-mono"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfd4c719004dc049baa73e4e869cca40c02532f5327ac118b3bb4fcc43a57cdc"
+
+[[package]]
+name = "damascene-fonts-symbols"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0d8aa98fba560c659beac4f4a798cb002bfe908c8c26c3a8eb3195ab9ee0776"
+
+[[package]]
+name = "damascene-markdown"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "903b00230547a2729a40329d6f6ec776d999ed54bcd14b9467d45ebf22cde6ab"
+dependencies = [
+ "damascene-core",
+ "pulldown-cmark",
+ "syntect",
+ "two-face",
+]
+
+[[package]]
+name = "damascene-web"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f54663b0d69b1be24aa1a620504f24bf1f43fe3334b0003bccc062577303b068"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "damascene-core",
+ "damascene-wgpu",
+ "js-sys",
+ "log",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "damascene-wgpu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4811feeed890a48d713ce8b17cd516a36943186a0f538aeddefc53e15e0ef7d2"
+dependencies = [
+ "bytemuck",
+ "cosmic-text",
+ "damascene-core",
+ "ttf-parser",
+ "web-time",
+ "wgpu",
+]
+
+[[package]]
+name = "damascene-winit-wgpu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aff93d90a89e74c82d9a27db63c23188c9d14afb5cb33a0ec5d24fd9881e4426"
+dependencies = [
+ "arboard",
+ "damascene-core",
+ "damascene-wgpu",
+ "dlib",
+ "jni",
+ "open",
+ "pollster",
+ "raw-window-handle",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-sys",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2086,6 +2093,12 @@ name = "glam"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+
+[[package]]
+name = "glam"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fb167719045debebe9f532320accc7b5c993c5a3b813f5696a11d5ca7bdc57b"
 
 [[package]]
 name = "globset"
@@ -6976,12 +6989,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "whisper-agent-aetna-ui"
+name = "whisper-agent-auth"
 version = "0.3.23"
 dependencies = [
- "aetna-core",
- "aetna-markdown",
- "aetna-web",
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "reqwest 0.13.3",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "whisper-agent-damascene-ui"
+version = "0.3.23"
+dependencies = [
  "arboard",
  "chrono",
  "chrono-tz",
@@ -6989,6 +7016,9 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "cron",
+ "damascene-core",
+ "damascene-markdown",
+ "damascene-web",
  "getrandom 0.4.2",
  "image",
  "js-sys",
@@ -7007,30 +7037,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "whisper-agent-auth"
+name = "whisper-agent-desktop-damascene"
 version = "0.3.23"
 dependencies = [
- "anyhow",
- "base64 0.22.1",
- "chrono",
- "reqwest 0.13.3",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "whisper-agent-desktop-aetna"
-version = "0.3.23"
-dependencies = [
- "aetna-core",
- "aetna-winit-wgpu",
  "anyhow",
  "clap",
+ "damascene-core",
+ "damascene-winit-wgpu",
  "futures",
  "rustls",
  "serde",
@@ -7040,7 +7053,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "whisper-agent-aetna-ui",
+ "whisper-agent-damascene-ui",
  "whisper-agent-protocol",
 ]
 
