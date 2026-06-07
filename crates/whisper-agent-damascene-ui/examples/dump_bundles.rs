@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use damascene_core::prelude::{Rect, render_bundle_themed, write_bundle};
-use damascene_core::{App, BuildCx, UiEvent};
+use damascene_core::{App, BuildCx, EventCx, UiEvent};
 use whisper_agent_damascene_ui::{
     ChatApp, Inbound, InboundEvent, LoginApp, LoginInput, SendFn, SubmitFn,
 };
@@ -55,7 +55,7 @@ fn main() -> std::io::Result<()> {
         // Drain the wire seed once (mirrors a real frame start).
         app.before_build();
         for click in scene.clicks() {
-            app.on_event(UiEvent::synthetic_click(click));
+            app.on_event(UiEvent::synthetic_click(click), &EventCx::new());
         }
         // Second drain: scenes that depend on a wire response to a
         // request the click loop just fired (e.g. behavior-editor

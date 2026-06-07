@@ -1103,9 +1103,9 @@ checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
 
 [[package]]
 name = "damascene-core"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2237abad896eb8f5686aa813234aae17852428b84be1ad7dfd5153d2b98993dd"
+checksum = "ced7be8406d726925ec045c072a4c7bfc18d1b8db6e77230d90b84e4b9162366"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1113,6 +1113,7 @@ dependencies = [
  "fdsm",
  "fdsm-ttf-parser",
  "glam 0.33.0",
+ "half",
  "image",
  "kurbo",
  "lru 0.18.0",
@@ -1128,9 +1129,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-fonts"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d1ae6d4b14318d45ad4bf15b6bf63ce99e5aca8bdf27f556a7e7346e8d60859"
+checksum = "9d225808c6a5c9cbe89a06da30b32962e129b6dc24da46de0966c3e1bee7fbc5"
 dependencies = [
  "damascene-fonts-emoji",
  "damascene-fonts-inter",
@@ -1164,9 +1165,9 @@ checksum = "e0d8aa98fba560c659beac4f4a798cb002bfe908c8c26c3a8eb3195ab9ee0776"
 
 [[package]]
 name = "damascene-markdown"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903b00230547a2729a40329d6f6ec776d999ed54bcd14b9467d45ebf22cde6ab"
+checksum = "140905b98a307bd0ef1dac782da319d8727837238d01289be73458b8e84ebd5a"
 dependencies = [
  "damascene-core",
  "pulldown-cmark",
@@ -1176,9 +1177,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-web"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f54663b0d69b1be24aa1a620504f24bf1f43fe3334b0003bccc062577303b068"
+checksum = "817f0f3269d4fa19dd1405a22649e2b5c7f0e73647d14a8f9e04fc5d08f794c4"
 dependencies = [
  "console_error_panic_hook",
  "console_log",
@@ -1196,9 +1197,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-wgpu"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4811feeed890a48d713ce8b17cd516a36943186a0f538aeddefc53e15e0ef7d2"
+checksum = "55b415641e6206798f8a886b55e780cfc8509267c0581b5eaae91b71446c2a0f"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -1210,9 +1211,9 @@ dependencies = [
 
 [[package]]
 name = "damascene-winit-wgpu"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aff93d90a89e74c82d9a27db63c23188c9d14afb5cb33a0ec5d24fd9881e4426"
+checksum = "3c15f19b30fe396b5a53dfbaa8d7b433c0f73dc1ae6db29d354c8c9296299eae"
 dependencies = [
  "arboard",
  "damascene-core",

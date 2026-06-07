@@ -37,7 +37,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use damascene_core::prelude::Rect;
-use damascene_core::{App, BuildCx, El, Selection, Theme, UiEvent};
+use damascene_core::{App, BuildCx, El, EventCx, Selection, Theme, UiEvent};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{
@@ -275,10 +275,10 @@ impl App for RootApp {
         }
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, cx: &EventCx) {
         match &mut self.phase {
-            Phase::Login(app) => app.on_event(event),
-            Phase::Connected(app) => app.on_event(event),
+            Phase::Login(app) => app.on_event(event, cx),
+            Phase::Connected(app) => app.on_event(event, cx),
         }
     }
 
@@ -344,8 +344,8 @@ impl App for DesktopApp {
         self.inner.build(cx)
     }
 
-    fn on_event(&mut self, event: UiEvent) {
-        self.inner.on_event(event);
+    fn on_event(&mut self, event: UiEvent, cx: &EventCx) {
+        self.inner.on_event(event, cx);
     }
 
     fn selection(&self) -> Selection {

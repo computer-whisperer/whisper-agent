@@ -4663,7 +4663,7 @@ impl App for ChatApp {
         )
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // Sidebar resize handle — pointer drag / arrow keys / Home /
         // End on `sidebar:resize` fold into `sidebar_width`. Helper
         // returns `true` if the value changed (no-op for events on

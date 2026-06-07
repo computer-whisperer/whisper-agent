@@ -165,7 +165,7 @@ impl App for LoginApp {
             .height(Size::Fill(1.0))
     }
 
-    fn on_event(&mut self, event: UiEvent) {
+    fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // Server URL field.
         if event.target_key() == Some(KEY_SERVER) {
             text_input::apply_event(&mut self.server, &mut self.selection, KEY_SERVER, &event);
