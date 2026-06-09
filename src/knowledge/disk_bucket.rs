@@ -287,6 +287,15 @@ pub trait BuildObserver: Send + Sync {
     /// Default impl is a no-op so test observers that don't care about
     /// the resume path can stay terse.
     fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {}
+    /// Brackets an uncancellable serialize step — the snapshot-barrier
+    /// `tantivy commit + HNSW dump_to`, and the final `BuildingDense`
+    /// dump. `true` on entry, `false` on exit. None of the progress
+    /// markers tick during these steps, and the dump runs on
+    /// `spawn_blocking` where a fired cancel is not observed until it
+    /// returns — so the scheduler's stall watchdog uses this to avoid
+    /// counting dump time as a stall (the wikipedia_2 snapshot-barrier
+    /// wedge). Default impl is a no-op for observers that don't watchdog.
+    fn on_flushing(&self, _flushing: bool) {}
 }
 
 /// Coarse active-slot loading phase. Mirrors the protocol-level
@@ -1744,10 +1753,17 @@ impl DiskBucket {
                     // delete-then-add replay over the (slightly stale)
                     // watermark is idempotent.
                     if batches_since_dump >= dense_dump_interval_batches(chunks_emitted) {
+                        // Uncancellable serialize: tantivy commit + HNSW
+                        // dump both run without ticking any progress
+                        // marker, and at wikipedia scale the dump alone
+                        // exceeds the watchdog's stall timeout. Bracket it
+                        // so the watchdog doesn't strand the slot.
+                        let _flush = FlushGuard::begin(observer);
                         if let Some(builder) = sparse_builder.as_mut() {
                             builder.commit()?;
                         }
                         periodic_dump(slot_path, slot_id, &dense).await?;
+                        drop(_flush);
                         batches_since_dump = 0;
                         // Expose the just-committed sparse segments to
                         // mid-build queries. No-op on the rebuild path
@@ -1819,7 +1835,13 @@ impl DiskBucket {
         // the phase tag so existing wire consumers / tests don't
         // break, even though counters don't tick.
         publish_phase(BuildPhase::BuildingDense, observer, &mut build_state)?;
-        periodic_dump(slot_path, slot_id, &dense).await?;
+        {
+            // Same uncancellable serialize as the snapshot barrier above;
+            // at wikipedia scale this final dump can exceed the stall
+            // timeout on its own.
+            let _flush = FlushGuard::begin(observer);
+            periodic_dump(slot_path, slot_id, &dense).await?;
+        }
 
         // --- Phase: Finalizing ---
         publish_phase(BuildPhase::Finalizing, observer, &mut build_state)?;
@@ -3154,6 +3176,30 @@ async fn periodic_dump(
     })
     .await
     .map_err(|e| BucketError::Other(format!("spawn_blocking dense dump: {e}")))
+}
+
+/// RAII bracket around an uncancellable serialize step. Calls
+/// `on_flushing(true)` on construction and `on_flushing(false)` on drop,
+/// so the flag is cleared even when the guarded body early-returns via
+/// `?` or panics — otherwise a dump error would leave the stall watchdog
+/// permanently suppressed for the remainder of the build.
+struct FlushGuard<'a>(Option<&'a dyn BuildObserver>);
+
+impl<'a> FlushGuard<'a> {
+    fn begin(observer: Option<&'a dyn BuildObserver>) -> Self {
+        if let Some(obs) = observer {
+            obs.on_flushing(true);
+        }
+        FlushGuard(observer)
+    }
+}
+
+impl Drop for FlushGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(obs) = self.0 {
+            obs.on_flushing(false);
+        }
+    }
 }
 
 /// Notify the observer of a phase transition and append the matching

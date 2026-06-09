@@ -55,11 +55,49 @@ const PROGRESS_THROTTLE: Duration = Duration::from_millis(1000);
 /// sync index commit, which cancel can't interrupt) is operator-visible
 /// instead of sitting at "building" silently forever.
 ///
-/// Set well above the longest *legitimate* no-progress window: the
-/// coarse index-snapshot barrier (HNSW dump + tantivy commit) freezes
-/// the progress counters for minutes at wiki scale, so a healthy build
-/// must never trip this.
+/// Set above the longest legitimate no-progress window that *can* tick a
+/// marker. The coarse index-snapshot barrier (HNSW dump + tantivy
+/// commit) and the final dense dump tick *nothing* and exceed any fixed
+/// timeout at wiki scale, so those are excluded from the stall clock via
+/// the `flushing` flag rather than by inflating this constant — see
+/// [`stall_check`].
 const BUILD_STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Per-tick decision of the build stall watchdog. Extracted as a pure
+/// function so the reset/fire policy is unit-testable without driving the
+/// async build loop.
+#[derive(Debug, PartialEq, Eq)]
+enum StallCheck {
+    /// A progress marker advanced, or the build is inside an
+    /// uncancellable serialize step — reset the stall clock.
+    Progress,
+    /// No movement, but still within the timeout (or already fired).
+    Waiting,
+    /// No movement for `BUILD_STALL_TIMEOUT` and not yet logged — fire
+    /// the cancel and log once.
+    Fire,
+}
+
+/// `flushing` short-circuits to [`StallCheck::Progress`]: during a
+/// snapshot-barrier / final dump no marker can move, and firing cancel is
+/// futile anyway (the dump runs on `spawn_blocking` and only sees the
+/// cancel once it returns), so counting that time would false-trip and
+/// strand the slot.
+fn stall_check(
+    marker: (u64, u64, u64),
+    last_marker: (u64, u64, u64),
+    flushing: bool,
+    since_last_progress: Duration,
+    already_logged: bool,
+) -> StallCheck {
+    if marker != last_marker || flushing {
+        StallCheck::Progress
+    } else if !already_logged && since_last_progress >= BUILD_STALL_TIMEOUT {
+        StallCheck::Fire
+    } else {
+        StallCheck::Waiting
+    }
+}
 
 /// Scope-aware key for the in-flight-build maps and per-build progress
 /// state. Server-scope buckets share a global namespace
@@ -1256,6 +1294,16 @@ async fn run_build(
         // values — counts as forward progress. Without it, a healthy
         // multi-hour resume rebuild trips the watchdog (the bug that
         // wedged wikipedia_2 post-0.3.23).
+        //
+        // The markers cover every phase that *can* tick something, but
+        // the uncancellable serialize steps (snapshot-barrier tantivy
+        // commit + HNSW dump, and the final dense dump) tick nothing and
+        // can each exceed BUILD_STALL_TIMEOUT at wikipedia scale. The
+        // build flags those via `flushing`; we treat it as forward
+        // progress, since firing cancel there is pointless anyway (the
+        // dump runs on spawn_blocking and only observes the cancel once
+        // it returns) and counting it strands the slot — the same
+        // wikipedia_2 wedge, this time at the snapshot-barrier dump.
         let mut last_marker: (u64, u64, u64) = (0, 0, 0);
         let mut last_progress_at = tokio::time::Instant::now();
         let mut stall_logged = false;
@@ -1270,26 +1318,36 @@ async fn run_build(
                 snap.chunks,
                 snap.dense_inserted.unwrap_or(0),
             );
-            if marker != last_marker {
-                last_marker = marker;
-                last_progress_at = tokio::time::Instant::now();
-                stall_logged = false;
-            } else if !stall_logged && last_progress_at.elapsed() >= BUILD_STALL_TIMEOUT {
-                stall_logged = true;
-                tracing::error!(
-                    bucket_id = %bucket_id_for_emit,
-                    pod_id = ?pod_id_for_emit,
-                    source_records = snap.source_records,
-                    chunks = snap.chunks,
-                    dense_inserted = ?snap.dense_inserted,
-                    stalled_for_s = last_progress_at.elapsed().as_secs(),
-                    "bucket build stalled: no forward progress for {}s — firing cancel. A \
-                     cancellable stall (e.g. a hung embedder request) will unwind and report \
-                     BuildEnded; a hard sync-index deadlock can't be interrupted and needs a \
-                     process restart (the slot stays resumable from its last checkpoint).",
-                    BUILD_STALL_TIMEOUT.as_secs(),
-                );
-                cancel_for_watchdog.cancel();
+            match stall_check(
+                marker,
+                last_marker,
+                progress_for_emit.is_flushing(),
+                last_progress_at.elapsed(),
+                stall_logged,
+            ) {
+                StallCheck::Progress => {
+                    last_marker = marker;
+                    last_progress_at = tokio::time::Instant::now();
+                    stall_logged = false;
+                }
+                StallCheck::Waiting => {}
+                StallCheck::Fire => {
+                    stall_logged = true;
+                    tracing::error!(
+                        bucket_id = %bucket_id_for_emit,
+                        pod_id = ?pod_id_for_emit,
+                        source_records = snap.source_records,
+                        chunks = snap.chunks,
+                        dense_inserted = ?snap.dense_inserted,
+                        stalled_for_s = last_progress_at.elapsed().as_secs(),
+                        "bucket build stalled: no forward progress for {}s — firing cancel. A \
+                         cancellable stall (e.g. a hung embedder request) will unwind and report \
+                         BuildEnded; a hard sync-index deadlock can't be interrupted and needs a \
+                         process restart (the slot stays resumable from its last checkpoint).",
+                        BUILD_STALL_TIMEOUT.as_secs(),
+                    );
+                    cancel_for_watchdog.cancel();
+                }
             }
             let _ = task_tx_for_emit.send(BucketTaskUpdate::Progress {
                 bucket_id: bucket_id_for_emit.clone(),
@@ -1747,6 +1805,15 @@ pub struct ProgressShared {
     /// Phase encoded as a u8 (0=Indexing, 1=BuildingDense, 2=Finalizing)
     /// so the throttled emitter can read without a lock.
     phase: AtomicU8,
+    /// Set while the build is inside an uncancellable serialize step
+    /// (snapshot-barrier tantivy commit + HNSW dump, or the final dense
+    /// dump). The stall watchdog treats this as forward progress: none of
+    /// the markers tick during a dump and the dump runs on
+    /// `spawn_blocking` where a fired cancel isn't observed until it
+    /// returns, so counting that time would false-trip the watchdog and
+    /// strand the slot (the wikipedia_2 snapshot-barrier wedge). Not on
+    /// the wire — internal to the watchdog.
+    flushing: AtomicBool,
     done: AtomicBool,
     /// Wall-clock time the build was dispatched. Set once at
     /// construction; the UI uses it to render an elapsed-time stopwatch
@@ -1765,6 +1832,7 @@ impl Default for ProgressShared {
             dense_inserted: AtomicU64::new(0),
             dense_total: AtomicU64::new(0),
             phase: AtomicU8::new(0),
+            flushing: AtomicBool::new(false),
             done: AtomicBool::new(false),
             started_at: chrono::Utc::now(),
         }
@@ -1794,6 +1862,14 @@ impl ProgressShared {
 
     pub fn started_at(&self) -> chrono::DateTime<chrono::Utc> {
         self.started_at
+    }
+
+    fn set_flushing(&self, flushing: bool) {
+        self.flushing.store(flushing, Ordering::Release);
+    }
+
+    fn is_flushing(&self) -> bool {
+        self.flushing.load(Ordering::Acquire)
     }
 }
 
@@ -1983,6 +2059,9 @@ impl BuildObserver for ProgressObserver {
         self.shared
             .dense_inserted
             .store(inserted, Ordering::Release);
+    }
+    fn on_flushing(&self, flushing: bool) {
+        self.shared.set_flushing(flushing);
     }
 }
 
@@ -2431,6 +2510,54 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::knowledge::source::feed::BoxFuture;
+
+    const M0: (u64, u64, u64) = (100, 200, 0);
+
+    #[test]
+    fn stall_check_resets_when_a_marker_advances() {
+        // source_records moved — forward progress, even past the timeout.
+        let after = (101, 200, 0);
+        assert_eq!(
+            stall_check(after, M0, false, BUILD_STALL_TIMEOUT * 2, false),
+            StallCheck::Progress,
+        );
+    }
+
+    #[test]
+    fn stall_check_fires_when_markers_frozen_past_timeout() {
+        assert_eq!(
+            stall_check(M0, M0, false, BUILD_STALL_TIMEOUT, false),
+            StallCheck::Fire,
+        );
+    }
+
+    #[test]
+    fn stall_check_waits_before_timeout() {
+        assert_eq!(
+            stall_check(M0, M0, false, BUILD_STALL_TIMEOUT / 2, false),
+            StallCheck::Waiting,
+        );
+    }
+
+    #[test]
+    fn stall_check_does_not_refire_once_logged() {
+        assert_eq!(
+            stall_check(M0, M0, false, BUILD_STALL_TIMEOUT * 10, true),
+            StallCheck::Waiting,
+        );
+    }
+
+    #[test]
+    fn stall_check_flushing_counts_as_progress_past_timeout() {
+        // The wikipedia_2 snapshot-barrier wedge: every marker is frozen
+        // (None ⇒ dense_inserted 0, source_records/chunks pinned at the
+        // snapshot) for well over the timeout, but the build is inside an
+        // uncancellable HNSW dump. `flushing` must keep it alive.
+        assert_eq!(
+            stall_check(M0, M0, true, BUILD_STALL_TIMEOUT * 5, false),
+            StallCheck::Progress,
+        );
+    }
 
     /// Shared call log so a test holding an `Arc` can inspect calls
     /// after the driver has been moved into a `BuildSource`.
