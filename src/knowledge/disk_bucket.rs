@@ -287,14 +287,17 @@ pub trait BuildObserver: Send + Sync {
     /// Default impl is a no-op so test observers that don't care about
     /// the resume path can stay terse.
     fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {}
-    /// Brackets an uncancellable serialize step — the snapshot-barrier
-    /// `tantivy commit + HNSW dump_to`, and the final `BuildingDense`
-    /// dump. `true` on entry, `false` on exit. None of the progress
-    /// markers tick during these steps, and the dump runs on
-    /// `spawn_blocking` where a fired cancel is not observed until it
-    /// returns — so the scheduler's stall watchdog uses this to avoid
-    /// counting dump time as a stall (the wikipedia_2 snapshot-barrier
-    /// wedge). Default impl is a no-op for observers that don't watchdog.
+    /// Brackets a long phase that ticks no progress marker — the
+    /// snapshot-barrier `tantivy commit + HNSW dump_to`, the final
+    /// `BuildingDense` dump, and the resume preamble's source-iter
+    /// advance + offset scan + sparse reopen. `true` on entry, `false`
+    /// on exit. None of the progress markers tick during these steps,
+    /// and the serialize ones run on `spawn_blocking` where a fired
+    /// cancel is not observed until they return — so the scheduler's
+    /// stall watchdog uses this to avoid counting the time as a stall
+    /// (the wikipedia_2 wedges, at both the snapshot-barrier dump and
+    /// the resume source advance). Default impl is a no-op for observers
+    /// that don't watchdog.
     fn on_flushing(&self, _flushing: bool) {}
 }
 
@@ -1033,6 +1036,21 @@ impl DiskBucket {
         // on the prefix; without it a rebuild on a different snapshot
         // would silently mix old prefix chunks with new post-prefix
         // ones.
+        //
+        // This pass, the chunks.bin offset scan, the writer reopen, and
+        // the sparse reopen/rebuild below all tick *no* watchdog marker
+        // (source_records/chunks/dense_inserted stay frozen at the
+        // checkpoint values), and at wikipedia scale the source advance
+        // alone takes >30 min — longer than BUILD_STALL_TIMEOUT. That
+        // wedged wikipedia_2 on every restart: the watchdog fired cancel
+        // ~30 min into the skip, before resume could finish, and the
+        // cancelled build never retried. Bracket the whole non-ticking
+        // span as `flushing` so the watchdog treats it as forward
+        // progress, exactly like the snapshot-barrier dump sites. The
+        // HNSW hydrate that follows is excluded on purpose: the rebuild
+        // path ticks dense_inserted (genuine stall detection stays live)
+        // and the dump fast-path is sub-minute.
+        let _resume_flush = FlushGuard::begin(observer);
         let mut iter = adapter.enumerate();
         let planned_iter2 = super::planned_log::PlannedReader::open(&planned_path)
             .map_err(BucketError::Io)?
@@ -1143,6 +1161,10 @@ impl DiskBucket {
         } else {
             None
         };
+        // End of the non-ticking resume span; the HNSW hydrate below
+        // reports its own progress (or is sub-minute), so release the
+        // flushing flag and let the stall watchdog resume normal duty.
+        drop(_resume_flush);
 
         // Hydrate the in-memory HNSW for the chunks already on disk
         // so subsequent inserts during the resumed Indexing phase
@@ -6146,6 +6168,128 @@ embedder = "tei_test"
         .unwrap();
         assert_eq!(manifest.state, SlotState::Ready);
         assert_eq!(manifest.stats.chunk_count, total_records as u64);
+    }
+
+    #[tokio::test]
+    async fn resume_preamble_brackets_non_ticking_phases_as_flushing() {
+        // Regression for the wikipedia_2 resume wedge: the resume
+        // preamble's source-iter advance + offset scan + sparse reopen
+        // tick no watchdog marker (source_records/chunks/dense_inserted
+        // stay frozen at the checkpoint), and at wiki scale the advance
+        // alone runs longer than the scheduler's BUILD_STALL_TIMEOUT. The
+        // watchdog therefore fired cancel mid-resume and the build never
+        // finished — re-wedging on every restart. The fix brackets that
+        // span as `flushing` so the watchdog counts it as forward
+        // progress, like the dump sites. Assert the bracket fires, and
+        // that it does so *before* the HNSW rebuild (which ticks
+        // dense_inserted on its own) — i.e. it covers the previously
+        // unprotected preamble, not merely the later dump.
+        use std::sync::Mutex;
+
+        #[derive(Debug, PartialEq)]
+        enum Ev {
+            FlushOn,
+            FlushOff,
+            DenseRebuild,
+        }
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<Ev>>);
+        impl BuildObserver for Recorder {
+            fn on_phase(&self, _phase: BuildPhase) {}
+            fn on_progress(&self, _source_records: u64, _chunks: u64) {}
+            fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {
+                self.0.lock().unwrap().push(Ev::DenseRebuild);
+            }
+            fn on_flushing(&self, flushing: bool) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(if flushing { Ev::FlushOn } else { Ev::FlushOff });
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("notes");
+        fs::create_dir_all(&source).unwrap();
+        let total_records = super::EMBED_BATCH_SIZE + 5;
+        for i in 0..total_records {
+            write_md(
+                &source,
+                &format!("doc-{i:04}.md"),
+                &format!("doc-{i:04} body content"),
+            );
+        }
+
+        let bucket_root = tmp.path().join("bucket");
+        let bucket = open_test_bucket(&bucket_root, &source);
+        let adapter = MarkdownDir::new(&source);
+        let (chunker, chunker_snapshot) = TokenBasedChunker::from_config(&bucket.config().chunker);
+
+        // Cancel after one batch so resume has a non-empty prefix to
+        // advance past, then delete the sidecar to force the HNSW
+        // rebuild path (so on_dense_rebuild_progress is emitted).
+        let cancel = CancellationToken::new();
+        let cancelling = Arc::new(CancellingEmbedder::new(8, 1, cancel.clone()));
+        let _ = bucket
+            .build_slot(
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                cancelling,
+                None,
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+
+        let resumable = bucket.find_resumable_slot().unwrap().unwrap();
+        let slot_path = slot::slot_dir(&bucket_root, &resumable);
+        for f in ["dense.snapshot", "dense.hnsw.graph", "dense.hnsw.data"] {
+            let p = slot_path.join(f);
+            if p.exists() {
+                fs::remove_file(&p).unwrap();
+            }
+        }
+
+        let recorder = Recorder::default();
+        let resume_cancel = CancellationToken::new();
+        let plain: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder::new(8));
+        bucket
+            .resume_slot(
+                &resumable,
+                &adapter,
+                &chunker,
+                chunker_snapshot.clone(),
+                plain,
+                Some(&recorder),
+                &resume_cancel,
+            )
+            .await
+            .unwrap();
+
+        let events = recorder.0.lock().unwrap();
+        let first_flush_on = events
+            .iter()
+            .position(|e| *e == Ev::FlushOn)
+            .expect("resume preamble must bracket its non-ticking span as flushing");
+        let first_rebuild = events
+            .iter()
+            .position(|e| *e == Ev::DenseRebuild)
+            .expect("sidecar-missing resume must hit the HNSW rebuild path");
+        assert!(
+            first_flush_on < first_rebuild,
+            "the flushing bracket must cover the resume preamble (before the HNSW \
+             rebuild), got {events:?}",
+        );
+        // Every bracket is balanced and the flag is left cleared.
+        let ons = events.iter().filter(|e| **e == Ev::FlushOn).count();
+        let offs = events.iter().filter(|e| **e == Ev::FlushOff).count();
+        assert_eq!(ons, offs, "flushing brackets must be balanced: {events:?}");
+        assert_ne!(
+            events.last(),
+            Some(&Ev::FlushOn),
+            "flushing must not be left asserted at end of resume: {events:?}",
+        );
     }
 
     #[tokio::test]
