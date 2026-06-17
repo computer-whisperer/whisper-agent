@@ -48,6 +48,22 @@ use tokio_util::sync::CancellationToken;
 /// [`Bucket`](super::super::bucket::BoxFuture) and providers layers.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Sink for download progress, called repeatedly during a fetch with the
+/// running total of bytes written so far. The build runtime wires this to
+/// the stall watchdog's forward-progress marker so a large base download
+/// that is steadily advancing isn't mistaken for a stall and cancelled —
+/// while one that makes *no* progress for the stall window (a dead
+/// connection, or a wedged write to the data volume) still trips it.
+/// Drivers that don't report progress, and callers that don't care, pass
+/// [`no_download_progress`].
+pub type DownloadProgress<'a> = &'a (dyn Fn(u64) + Send + Sync);
+
+/// A [`DownloadProgress`] sink that discards every sample. For callers
+/// (and small fetches like deltas) that don't feed a watchdog.
+pub fn no_download_progress() -> DownloadProgress<'static> {
+    &|_| {}
+}
+
 /// Driver-specific id for a base snapshot. Wikipedia uses `YYYYMMDD`
 /// (e.g. `"20260401"`); other drivers may use other formats. Treat as
 /// opaque outside the driver — the only operations the rest of the
@@ -155,10 +171,15 @@ pub trait FeedDriver: Send + Sync {
     /// implementations should detect an already-complete file at `dest`
     /// (size + checksum match) and short-circuit. Partial files are
     /// resumed via HTTP `Range` when possible, otherwise re-downloaded.
+    ///
+    /// `progress` is called as bytes land so the build runtime's stall
+    /// watchdog can treat a steadily-advancing multi-GB download as
+    /// forward progress; pass [`no_download_progress`] when unmonitored.
     fn fetch_base<'a>(
         &'a self,
         id: &'a SnapshotId,
         dest: &'a Path,
+        progress: DownloadProgress<'a>,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), FeedError>>;
 

@@ -287,6 +287,15 @@ pub trait BuildObserver: Send + Sync {
     /// Default impl is a no-op so test observers that don't care about
     /// the resume path can stay terse.
     fn on_dense_rebuild_progress(&self, _inserted: u64, _total: u64) {}
+    /// Cumulative bytes fetched during the `Downloading` phase
+    /// (tracked-source base-snapshot download). The scheduler's stall
+    /// watchdog folds this into its forward-progress marker so a large
+    /// but steadily-advancing download — at wikipedia scale a ~24 GB
+    /// base over a slow data volume can take well over an hour — isn't
+    /// mistaken for a stall and cancelled, while a download that makes
+    /// *no* progress for the stall window still trips it. Default impl
+    /// is a no-op for observers that don't watchdog.
+    fn on_download_progress(&self, _bytes_downloaded: u64) {}
     /// Brackets a long phase that ticks no progress marker — the
     /// snapshot-barrier `tantivy commit + HNSW dump_to`, the final
     /// `BuildingDense` dump, and the resume preamble's source-iter

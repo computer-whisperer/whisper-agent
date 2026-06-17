@@ -40,7 +40,9 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use super::{BoxFuture, DeltaId, FeedDriver, FeedError, SnapshotId};
+use super::{
+    BoxFuture, DeltaId, DownloadProgress, FeedDriver, FeedError, SnapshotId, no_download_progress,
+};
 
 /// Default mirror used when [`WikipediaDriver::new`] is called with
 /// `mirror = None`. Trailing slash is *not* included; URL builders add
@@ -161,6 +163,7 @@ impl WikipediaDriver {
         &self,
         url: &str,
         dest: &Path,
+        progress: DownloadProgress<'_>,
         cancel: &CancellationToken,
     ) -> Result<(), FeedError> {
         // Idempotency v1: if `dest` exists with non-zero size, assume
@@ -198,6 +201,7 @@ impl WikipediaDriver {
             .map_err(|e| FeedError::Io(format!("create {}: {e}", tmp.display())))?;
 
         let mut stream = resp.bytes_stream();
+        let mut written: u64 = 0;
         use futures::StreamExt;
         loop {
             tokio::select! {
@@ -219,6 +223,13 @@ impl WikipediaDriver {
                             file.write_all(&chunk).await.map_err(|e| {
                                 FeedError::Io(format!("write {}: {e}", tmp.display()))
                             })?;
+                            // Report *after* the write lands, so the
+                            // marker reflects bytes durably on the data
+                            // volume — a wedged write to the (CephFS)
+                            // dest stops ticking and the watchdog can
+                            // still catch it, not just a dead socket.
+                            written += chunk.len() as u64;
+                            progress(written);
                         }
                     }
                 }
@@ -259,11 +270,12 @@ impl FeedDriver for WikipediaDriver {
         &'a self,
         id: &'a SnapshotId,
         dest: &'a Path,
+        progress: DownloadProgress<'a>,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<(), FeedError>> {
         Box::pin(async move {
             let url = self.base_file_url(id);
-            self.download_to(&url, dest, cancel).await
+            self.download_to(&url, dest, progress, cancel).await
         })
     }
 
@@ -296,7 +308,10 @@ impl FeedDriver for WikipediaDriver {
     ) -> BoxFuture<'a, Result<(), FeedError>> {
         Box::pin(async move {
             let url = self.delta_file_url(id);
-            self.download_to(&url, dest, cancel).await
+            // Deltas are ~810 MB/day — comfortably inside the stall
+            // window — so they don't need watchdog progress reporting.
+            self.download_to(&url, dest, no_download_progress(), cancel)
+                .await
         })
     }
 
@@ -661,13 +676,57 @@ mod tests {
         let dest = tmp.path().join("base/20260401/dump.xml.bz2");
         let cancel = CancellationToken::new();
         driver
-            .fetch_base(&SnapshotId::new("20260401"), &dest, &cancel)
+            .fetch_base(
+                &SnapshotId::new("20260401"),
+                &dest,
+                no_download_progress(),
+                &cancel,
+            )
             .await
             .unwrap();
         let got = std::fs::read(&dest).unwrap();
         assert_eq!(got, payload);
         // No `.partial` file left behind.
         assert!(!dest.with_extension("partial").exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_base_reports_cumulative_download_progress() {
+        // The watchdog fix hinges on fetch_base feeding byte progress so
+        // a long base download counts as forward progress. Assert the
+        // sink is called, samples are monotonic non-decreasing, and the
+        // final sample equals the payload size.
+        let payload: &[u8] = b"\x42\x5a\x68\x39 some fake multistream bz2 payload bytes";
+        let mirror = spawn_mirror(MirrorState {
+            bases: vec!["20260401"],
+            deltas: vec![],
+            canned_payload: payload,
+        })
+        .await;
+        let driver = WikipediaDriver::new("en", Some(mirror));
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("base/20260401/dump.xml.bz2");
+        let cancel = CancellationToken::new();
+
+        let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let s = samples.clone();
+        let report = move |n: u64| s.lock().unwrap().push(n);
+        driver
+            .fetch_base(&SnapshotId::new("20260401"), &dest, &report, &cancel)
+            .await
+            .unwrap();
+
+        let got = samples.lock().unwrap().clone();
+        assert!(!got.is_empty(), "progress sink was never called");
+        assert!(
+            got.windows(2).all(|w| w[0] <= w[1]),
+            "progress not monotonic: {got:?}"
+        );
+        assert_eq!(
+            *got.last().unwrap(),
+            payload.len() as u64,
+            "final progress should equal payload size",
+        );
     }
 
     #[tokio::test]
@@ -687,7 +746,12 @@ mod tests {
         std::fs::write(&dest, b"sentinel").unwrap();
         let cancel = CancellationToken::new();
         driver
-            .fetch_base(&SnapshotId::new("20260401"), &dest, &cancel)
+            .fetch_base(
+                &SnapshotId::new("20260401"),
+                &dest,
+                no_download_progress(),
+                &cancel,
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"sentinel");
@@ -706,7 +770,12 @@ mod tests {
         let dest = tmp.path().join("dump.xml.bz2");
         let cancel = CancellationToken::new();
         let err = driver
-            .fetch_base(&SnapshotId::new("20990101"), &dest, &cancel)
+            .fetch_base(
+                &SnapshotId::new("20990101"),
+                &dest,
+                no_download_progress(),
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FeedError::NotFound(_)), "got {err:?}");
@@ -728,7 +797,12 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel(); // already-cancelled before we start
         let err = driver
-            .fetch_base(&SnapshotId::new("20260401"), &dest, &cancel)
+            .fetch_base(
+                &SnapshotId::new("20260401"),
+                &dest,
+                no_download_progress(),
+                &cancel,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FeedError::Cancelled), "got {err:?}");

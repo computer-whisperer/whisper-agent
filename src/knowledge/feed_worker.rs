@@ -689,6 +689,7 @@ mod tests {
             &'a self,
             _id: &'a SnapshotId,
             _dest: &'a Path,
+            _progress: crate::knowledge::source::feed::DownloadProgress<'a>,
             _cancel: &'a CancellationToken,
         ) -> BoxFuture<'a, Result<(), FeedError>> {
             Box::pin(async { unreachable!("worker does not call fetch_base") })

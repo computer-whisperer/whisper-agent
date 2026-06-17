@@ -84,8 +84,8 @@ enum StallCheck {
 /// cancel once it returns), so counting that time would false-trip and
 /// strand the slot.
 fn stall_check(
-    marker: (u64, u64, u64),
-    last_marker: (u64, u64, u64),
+    marker: (u64, u64, u64, u64),
+    last_marker: (u64, u64, u64, u64),
     flushing: bool,
     since_last_progress: Duration,
     already_logged: bool,
@@ -1286,14 +1286,22 @@ async fn run_build(
         let mut interval = tokio::time::interval(PROGRESS_THROTTLE);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Stall watchdog: track the last (source_records, chunks,
-        // dense_inserted) marker that advanced and when. If none of them
-        // move for BUILD_STALL_TIMEOUT, fire cancel and log once (see the
-        // const). `dense_inserted` is in the marker so the resume
-        // preamble's HNSW rebuild — which ticks dense progress every
-        // 500ms while source_records/chunks sit frozen at the snapshot
-        // values — counts as forward progress. Without it, a healthy
-        // multi-hour resume rebuild trips the watchdog (the bug that
-        // wedged wikipedia_2 post-0.3.23).
+        // dense_inserted, bytes_downloaded) marker that advanced and
+        // when. If none of them move for BUILD_STALL_TIMEOUT, fire cancel
+        // and log once (see the const). `dense_inserted` is in the marker
+        // so the resume preamble's HNSW rebuild — which ticks dense
+        // progress every 500ms while source_records/chunks sit frozen at
+        // the snapshot values — counts as forward progress. Without it, a
+        // healthy multi-hour resume rebuild trips the watchdog (the bug
+        // that wedged wikipedia_2 post-0.3.23). `bytes_downloaded` is in
+        // the marker for the same reason on the *Downloading* phase: a
+        // ~24 GB base over a slow data volume can stream for well over an
+        // hour with source_records/chunks/dense all pinned at 0, so
+        // without it the watchdog cancels every long download mid-stream,
+        // deletes the partial, and the build can never get past
+        // Downloading (the wikipedia_3/_4 wedge). Folding bytes in keeps
+        // a genuinely stuck download — dead socket *or* wedged write to
+        // the CephFS dest — stall-detectable, unlike blanket `flushing`.
         //
         // The markers cover every phase that *can* tick something, but
         // the uncancellable serialize steps (snapshot-barrier tantivy
@@ -1304,7 +1312,7 @@ async fn run_build(
         // dump runs on spawn_blocking and only observes the cancel once
         // it returns) and counting it strands the slot — the same
         // wikipedia_2 wedge, this time at the snapshot-barrier dump.
-        let mut last_marker: (u64, u64, u64) = (0, 0, 0);
+        let mut last_marker: (u64, u64, u64, u64) = (0, 0, 0, 0);
         let mut last_progress_at = tokio::time::Instant::now();
         let mut stall_logged = false;
         loop {
@@ -1317,6 +1325,7 @@ async fn run_build(
                 snap.source_records,
                 snap.chunks,
                 snap.dense_inserted.unwrap_or(0),
+                progress_for_emit.bytes_downloaded(),
             );
             match stall_check(
                 marker,
@@ -1802,6 +1811,13 @@ pub struct ProgressShared {
     /// rebuild is actually ticking.
     dense_inserted: AtomicU64,
     dense_total: AtomicU64,
+    /// Cumulative bytes fetched during the `Downloading` phase. Folded
+    /// into the stall watchdog's forward-progress marker so a large base
+    /// download that's steadily advancing isn't cancelled as a stall;
+    /// frozen (and thus stall-detectable) once the download completes,
+    /// at which point `source_records` takes over as the live marker.
+    /// Not on the wire today — internal to the watchdog.
+    bytes_downloaded: AtomicU64,
     /// Phase encoded as a u8 (0=Indexing, 1=BuildingDense, 2=Finalizing)
     /// so the throttled emitter can read without a lock.
     phase: AtomicU8,
@@ -1831,6 +1847,7 @@ impl Default for ProgressShared {
             chunks: AtomicU64::new(0),
             dense_inserted: AtomicU64::new(0),
             dense_total: AtomicU64::new(0),
+            bytes_downloaded: AtomicU64::new(0),
             phase: AtomicU8::new(0),
             flushing: AtomicBool::new(false),
             done: AtomicBool::new(false),
@@ -1870,6 +1887,10 @@ impl ProgressShared {
 
     fn is_flushing(&self) -> bool {
         self.flushing.load(Ordering::Acquire)
+    }
+
+    fn bytes_downloaded(&self) -> u64 {
+        self.bytes_downloaded.load(Ordering::Acquire)
     }
 }
 
@@ -2059,6 +2080,11 @@ impl BuildObserver for ProgressObserver {
         self.shared
             .dense_inserted
             .store(inserted, Ordering::Release);
+    }
+    fn on_download_progress(&self, bytes_downloaded: u64) {
+        self.shared
+            .bytes_downloaded
+            .store(bytes_downloaded, Ordering::Release);
     }
     fn on_flushing(&self, flushing: bool) {
         self.shared.set_flushing(flushing);
@@ -2299,8 +2325,9 @@ async fn resolve_source(
 
             let dest_dir = base_cache_dir(bucket_dir, &snapshot_id);
             let dest = dest_dir.join(driver.base_filename(&snapshot_id));
+            let report = |bytes| observer.on_download_progress(bytes);
             driver
-                .fetch_base(&snapshot_id, &dest, cancel)
+                .fetch_base(&snapshot_id, &dest, &report, cancel)
                 .await
                 .map_err(|e| match e {
                     crate::knowledge::FeedError::Cancelled => BucketError::Cancelled,
@@ -2430,8 +2457,9 @@ async fn resolve_resync_source(
 
     let dest_dir = base_cache_dir(bucket_dir, &latest);
     let dest = dest_dir.join(driver.base_filename(&latest));
+    let report = |bytes| observer.on_download_progress(bytes);
     driver
-        .fetch_base(&latest, &dest, cancel)
+        .fetch_base(&latest, &dest, &report, cancel)
         .await
         .map_err(|e| match e {
             crate::knowledge::FeedError::Cancelled => BucketError::Cancelled,
@@ -2511,15 +2539,41 @@ mod tests {
 
     use crate::knowledge::source::feed::BoxFuture;
 
-    const M0: (u64, u64, u64) = (100, 200, 0);
+    const M0: (u64, u64, u64, u64) = (100, 200, 0, 0);
 
     #[test]
     fn stall_check_resets_when_a_marker_advances() {
         // source_records moved — forward progress, even past the timeout.
-        let after = (101, 200, 0);
+        let after = (101, 200, 0, 0);
         assert_eq!(
             stall_check(after, M0, false, BUILD_STALL_TIMEOUT * 2, false),
             StallCheck::Progress,
+        );
+    }
+
+    #[test]
+    fn stall_check_resets_when_download_bytes_advance() {
+        // Only `bytes_downloaded` moved — a long base download streaming
+        // with source_records/chunks/dense all still 0. Must count as
+        // forward progress so the watchdog doesn't cancel it mid-stream
+        // (the wikipedia_3/_4 wedge).
+        let after = (100, 200, 0, 8_000_000_000);
+        assert_eq!(
+            stall_check(after, M0, false, BUILD_STALL_TIMEOUT * 2, false),
+            StallCheck::Progress,
+        );
+    }
+
+    #[test]
+    fn stall_check_fires_when_download_bytes_frozen_past_timeout() {
+        // A download stuck at the same byte count past the window (dead
+        // socket, or a wedged write to the data volume) still trips —
+        // folding bytes into the marker keeps stalls detectable, unlike
+        // bracketing the whole phase as `flushing`.
+        let stuck = (0, 0, 0, 8_000_000_000);
+        assert_eq!(
+            stall_check(stuck, stuck, false, BUILD_STALL_TIMEOUT, false),
+            StallCheck::Fire,
         );
     }
 
@@ -2602,6 +2656,7 @@ mod tests {
             &'a self,
             id: &'a SnapshotId,
             dest: &'a Path,
+            _progress: crate::knowledge::source::feed::DownloadProgress<'a>,
             _cancel: &'a CancellationToken,
         ) -> BoxFuture<'a, Result<(), crate::knowledge::FeedError>> {
             let payload = self.payload.clone();
