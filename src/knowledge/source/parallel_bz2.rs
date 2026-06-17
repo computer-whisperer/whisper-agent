@@ -56,7 +56,12 @@ const REORDER_CAPACITY: usize = 4;
 /// keep wrapping it in `BufReader` and feeding it to existing parsers
 /// (the MediaWiki XML iterator) unchanged.
 pub struct ParallelMultiBzDecoder {
-    rx: Receiver<DecompressedChunk>,
+    /// `Option` so `Drop` can `take()` and drop the receiver *before*
+    /// joining the threads — closing this channel is what lets the
+    /// coordinator (and through it the workers) observe a disconnect and
+    /// exit. See the `Drop` impl. `Some` for the decoder's whole usable
+    /// life; only `None` transiently inside `drop`.
+    rx: Option<Receiver<DecompressedChunk>>,
     current: Vec<u8>,
     pos: usize,
     eof: bool,
@@ -144,7 +149,7 @@ impl ParallelMultiBzDecoder {
         }));
 
         Ok(Self {
-            rx: out_rx,
+            rx: Some(out_rx),
             current: Vec::new(),
             pos: 0,
             eof: false,
@@ -156,7 +161,7 @@ impl ParallelMultiBzDecoder {
         let (tx, rx) = mpsc::sync_channel::<DecompressedChunk>(1);
         let _ = tx.send(DecompressedChunk::Eof);
         Self {
-            rx,
+            rx: Some(rx),
             current: Vec::new(),
             pos: 0,
             eof: false,
@@ -183,7 +188,7 @@ impl ParallelMultiBzDecoder {
             }
         });
         Self {
-            rx: out_rx,
+            rx: Some(out_rx),
             current: Vec::new(),
             pos: 0,
             eof: false,
@@ -300,7 +305,12 @@ impl Read for ParallelMultiBzDecoder {
             if self.eof {
                 return Ok(0);
             }
-            match self.rx.recv() {
+            let Some(rx) = self.rx.as_ref() else {
+                // Only `None` after `drop` has taken it; treat as EOF.
+                self.eof = true;
+                return Ok(0);
+            };
+            match rx.recv() {
                 Ok(DecompressedChunk::Bytes(bytes)) => {
                     self.current = bytes;
                     self.pos = 0;
@@ -320,12 +330,24 @@ impl Read for ParallelMultiBzDecoder {
 
 impl Drop for ParallelMultiBzDecoder {
     fn drop(&mut self) {
-        // Drain anything sitting in the consumer channel so a blocked
-        // sender wakes up; closure of `out_rx` then propagates back
-        // through coord → workers → feeder by way of channel-closed
-        // errors on each `send`/`recv`.
         self.eof = true;
-        while self.rx.try_recv().is_ok() {}
+        // Close the consumer channel *before* joining. Dropping the
+        // `out_rx` receiver makes the coordinator's `out_tx.send` return
+        // Err, which trips its `.is_err()` exit; the coordinator then
+        // drops `res_rx`, which trips the workers' `res_tx.send().is_err()`
+        // exit. Only then can every thread reach its end and `join`
+        // return.
+        //
+        // The previous version joined while `rx` was still a live field
+        // (struct fields drop only *after* `Drop::drop` returns) and
+        // merely did a one-shot `try_recv` drain. That deadlocked
+        // whenever the decoder was dropped before EOF — e.g. the resume
+        // source-scan reads only enough records to reposition, then drops
+        // the decoder while workers are still decoding streams ahead: the
+        // coordinator parks forever on a full `out` channel and the
+        // workers park forever on a full `res` channel, so `join` never
+        // returns. Closing the receiver here is what unblocks them.
+        drop(self.rx.take());
         for h in self.threads.drain(..) {
             let _ = h.join();
         }
@@ -543,6 +565,46 @@ mod tests {
         match ParallelMultiBzDecoder::open(&bogus) {
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
             Ok(_) => panic!("expected NotFound"),
+        }
+    }
+
+    #[test]
+    fn drop_before_eof_does_not_deadlock() {
+        // Regression: dropping the decoder mid-stream (consumer abandons
+        // it before EOF) must not hang. The resume source-scan does
+        // exactly this — it reads only enough records to reposition the
+        // iterator, then drops the decoder while workers are still
+        // decoding streams ahead. Before the fix, `Drop` joined the
+        // worker/coordinator threads while the `out` receiver was still a
+        // live field, so the coordinator parked forever on a full `out`
+        // channel and the workers on a full `res` channel, and `join`
+        // never returned. Enough streams + large bodies so the bounded
+        // channels are full by the time we drop.
+        const N: usize = 64;
+        let bodies: Vec<Vec<u8>> = (0..N)
+            .map(|i| format!("stream-{i:04}-").repeat(500).into_bytes())
+            .collect();
+        let mut combined = Vec::new();
+        for body in &bodies {
+            combined.extend_from_slice(&encode_stream(body));
+        }
+        let f = write_to_temp(&combined);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            // `f` is moved in so the mmap'd file outlives the decoder.
+            let mut dec = ParallelMultiBzDecoder::open(f.path()).unwrap();
+            let mut buf = [0u8; 16];
+            // Read far less than the whole archive, then let the workers
+            // run ahead and fill out/res before dropping.
+            let _ = dec.read(&mut buf).unwrap();
+            thread::sleep(std::time::Duration::from_millis(200));
+            drop(dec); // must not deadlock
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(_) => panic!("ParallelMultiBzDecoder::drop deadlocked on mid-stream drop"),
         }
     }
 }
