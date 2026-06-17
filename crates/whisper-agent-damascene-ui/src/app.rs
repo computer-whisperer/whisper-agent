@@ -403,7 +403,7 @@ fn usage_window_row(label: &str, w: &whisper_agent_protocol::UsageWindow) -> El 
     .gap(tokens::SPACE_2)
     .align(Align::Center)
     .width(Size::Fill(1.0));
-    let bar = progress(pct / 100.0, bar_color)
+    let bar = progress_with_color(pct / 100.0, bar_color)
         .width(Size::Fill(1.0))
         .height(Size::Fixed(6.0));
     let mut rows: Vec<El> = vec![label_row, bar];
@@ -4653,7 +4653,7 @@ impl App for ChatApp {
         overlays(
             row([
                 sidebar_el,
-                resize_handle(Axis::Row).key(SIDEBAR_RESIZE_KEY),
+                resize_handle(SIDEBAR_RESIZE_KEY, Axis::Row),
                 self.content(cx),
             ])
             .width(Size::Fill(1.0))
@@ -6769,7 +6769,7 @@ fn checkbox_column(group_prefix: &str, selected: &[String], options: Vec<(String
             let on = selected.iter().any(|s| s == &value);
             let key = checkbox_list_item_key(group_prefix, &value);
             row([
-                checkbox(on).key(&key),
+                checkbox(&key, on),
                 text(label).text_color(tokens::FOREGROUND),
             ])
             .gap(tokens::SPACE_2)
@@ -6943,7 +6943,7 @@ fn render_network_policy_editor(salt: &str, policy: &NetworkPolicy, selection: &
             .enumerate()
             .map(|(idx, host)| {
                 row([
-                    text_input(host, selection, &host_env_network_host_key(salt, idx))
+                    text_input(&host_env_network_host_key(salt, idx), host, selection)
                         .width(Size::Fill(1.0)),
                     icon_button(crate::icons::ICON_X.clone())
                         .key(host_env_network_host_delete_key(salt, idx))
@@ -9804,7 +9804,7 @@ impl ChatApp {
             return None;
         }
         let frac = (processed as f32 / total as f32).clamp(0.0, 1.0);
-        let bar = progress(frac, tokens::INFO)
+        let bar = progress_with_color(frac, tokens::INFO)
             .width(Size::Fill(1.0))
             .height(Size::Fixed(4.0));
         let label = text(format!("prefilling {processed} / {total} tokens"))
@@ -10034,7 +10034,7 @@ impl ChatApp {
         let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
 
         let buf = self.active_compose_text();
-        let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(140.0));
+        let editor = text_area(COMPOSE_KEY, buf, &self.selection).height(Size::Fixed(140.0));
 
         let can_send = !buf.trim().is_empty();
         let mut send = button("Start").key(SEND_KEY).primary();
@@ -10178,9 +10178,9 @@ impl ChatApp {
                     ],
                 ),
                 text_input(
+                    NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
                     &self.new_thread_system_prompt_file_buf,
                     &self.selection,
-                    NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
                 ),
             ])
             .gap(tokens::SPACE_2)
@@ -10196,9 +10196,9 @@ impl ChatApp {
                     ],
                 ),
                 text_area(
+                    NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
                     &self.new_thread_system_prompt_text_buf,
                     &self.selection,
-                    NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
                 )
                 .height(Size::Fixed(120.0)),
             ])
@@ -10339,7 +10339,7 @@ impl ChatApp {
     ) -> El {
         if enabled {
             row([
-                numeric_input(buf, &self.selection, value_key, opts),
+                numeric_input(value_key, buf, &self.selection, opts),
                 button("Use pod default").key(override_key).ghost(),
             ])
             .gap(tokens::SPACE_2)
@@ -10426,9 +10426,9 @@ impl ChatApp {
             );
         };
         let token_threshold = numeric_input(
+            NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
             &self.new_thread_compaction_token_threshold_buf,
             &self.selection,
-            NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
             NumericInputOpts::default()
                 .min(0.0)
                 .max(1_000_000.0)
@@ -10448,8 +10448,10 @@ impl ChatApp {
                 form_label("enabled"),
                 form_control(
                     row([
-                        checkbox(compaction.enabled.unwrap_or(false))
-                            .key(NEW_THREAD_COMPACTION_ENABLED_KEY),
+                        checkbox(
+                            NEW_THREAD_COMPACTION_ENABLED_KEY,
+                            compaction.enabled.unwrap_or(false),
+                        ),
                         text("enabled").muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -10459,17 +10461,17 @@ impl ChatApp {
             form_item([
                 form_label("prompt file"),
                 form_control(text_input(
+                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
                     compaction.prompt_file.as_deref().unwrap_or(""),
                     &self.selection,
-                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
                 )),
             ]),
             form_item([
                 form_label("summary regex"),
                 form_control(text_input(
+                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
                     compaction.summary_regex.as_deref().unwrap_or(""),
                     &self.selection,
-                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
                 )),
             ]),
             form_item([
@@ -10481,9 +10483,9 @@ impl ChatApp {
                 form_label("continuation template"),
                 form_control(
                     text_area(
+                        NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
                         compaction.continuation_template.as_deref().unwrap_or(""),
                         &self.selection,
-                        NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
                     )
                     .height(Size::Fixed(80.0)),
                 ),
@@ -10527,8 +10529,10 @@ impl ChatApp {
                 form_label("enabled"),
                 form_control(
                     row([
-                        checkbox(autoquery.enabled.unwrap_or(false))
-                            .key(NEW_THREAD_AUTOQUERY_ENABLED_KEY),
+                        checkbox(
+                            NEW_THREAD_AUTOQUERY_ENABLED_KEY,
+                            autoquery.enabled.unwrap_or(false),
+                        ),
                         text("enabled").muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -10539,8 +10543,10 @@ impl ChatApp {
                 form_label("hot only"),
                 form_control(
                     row([
-                        checkbox(autoquery.hot_only.unwrap_or(true))
-                            .key(NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY),
+                        checkbox(
+                            NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY,
+                            autoquery.hot_only.unwrap_or(true),
+                        ),
                         text("hot buckets only").muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -10551,8 +10557,10 @@ impl ChatApp {
                 form_label("terminal turns"),
                 form_control(
                     row([
-                        checkbox(autoquery.inject_at_terminal.unwrap_or(false))
-                            .key(NEW_THREAD_AUTOQUERY_TERMINAL_KEY),
+                        checkbox(
+                            NEW_THREAD_AUTOQUERY_TERMINAL_KEY,
+                            autoquery.inject_at_terminal.unwrap_or(false),
+                        ),
                         text("inject at terminal turns").muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -10589,18 +10597,18 @@ impl ChatApp {
             form_item([
                 form_label("top k"),
                 form_control(numeric_input(
+                    NEW_THREAD_AUTOQUERY_TOP_K_KEY,
                     &self.new_thread_autoquery_top_k_buf,
                     &self.selection,
-                    NEW_THREAD_AUTOQUERY_TOP_K_KEY,
                     NumericInputOpts::default().min(0.0).max(20.0).step(1.0),
                 )),
             ]),
             form_item([
                 form_label("min rerank"),
                 form_control(numeric_input(
+                    NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
                     &self.new_thread_autoquery_min_score_buf,
                     &self.selection,
-                    NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
                     NumericInputOpts::default()
                         .min(-100.0)
                         .max(100.0)
@@ -10610,9 +10618,9 @@ impl ChatApp {
             form_item([
                 form_label("query chars"),
                 form_control(numeric_input(
+                    NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
                     &self.new_thread_autoquery_max_query_chars_buf,
                     &self.selection,
-                    NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
                     NumericInputOpts::default()
                         .min(0.0)
                         .max(50_000.0)
@@ -10622,9 +10630,9 @@ impl ChatApp {
             form_item([
                 form_label("snippet chars"),
                 form_control(numeric_input(
+                    NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
                     &self.new_thread_autoquery_snippet_chars_buf,
                     &self.selection,
-                    NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
                     NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
                 )),
             ]),
@@ -10810,9 +10818,9 @@ impl ChatApp {
                     ],
                 ),
                 text_area(
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                     &self.new_thread_tool_surface_named_buf,
                     &self.selection,
-                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                 )
                 .height(Size::Fixed(84.0))
                 .mono(),
@@ -10892,7 +10900,7 @@ impl ChatApp {
             TunableKind::Bool { .. } => {
                 let bool_value = matches!(value, TunableValue::Bool(true));
                 row([
-                    checkbox(bool_value).key(&key),
+                    checkbox(&key, bool_value),
                     text(label.clone()).muted().small(),
                 ])
                 .gap(tokens::SPACE_2)
@@ -11052,7 +11060,7 @@ impl ChatApp {
         // workspace_root row.
         let ws_key = format!("{PICKER_HOST_ENVS_WSROOT_PREFIX}{name}");
         let ws_default_key = format!("{PICKER_HOST_ENVS_DEFAULT_PREFIX}{name}");
-        let ws_input = text_input(&entry.workspace_root_draft, &self.selection, &ws_key);
+        let ws_input = text_input(&ws_key, &entry.workspace_root_draft, &self.selection);
         let mut ws_reset = button("Default").key(ws_default_key).ghost();
         if entry.workspace_root_draft.is_empty() {
             ws_reset = ws_reset.disabled();
@@ -11085,7 +11093,7 @@ impl ChatApp {
         } else {
             let runas_key = format!("{PICKER_HOST_ENVS_RUNAS_PREFIX}{name}");
             let runas_default_key = format!("{PICKER_HOST_ENVS_RUNAS_DEFAULT_PREFIX}{name}");
-            let runas_input = text_input(&entry.runas_draft, &self.selection, &runas_key);
+            let runas_input = text_input(&runas_key, &entry.runas_draft, &self.selection);
             let mut runas_reset = button("Default").key(runas_default_key).ghost();
             if entry.runas_draft.is_empty() {
                 runas_reset = runas_reset.disabled();
@@ -11175,7 +11183,7 @@ impl ChatApp {
                 TunableKind::Bool { .. } => {
                     let bool_value = matches!(current, Some(TunableValue::Bool(true)));
                     row([
-                        checkbox(bool_value).key(&opt_key),
+                        checkbox(&opt_key, bool_value),
                         text(label.clone()).muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -12971,8 +12979,8 @@ impl ChatApp {
         let create_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:create");
         let cancel_key = format!("{NEW_BEHAVIOR_MODAL_KEY}:cancel");
 
-        let behavior_id_input = text_input(&modal.behavior_id, &self.selection, &behavior_id_key);
-        let name_input = text_input(&modal.name, &self.selection, &name_key);
+        let behavior_id_input = text_input(&behavior_id_key, &modal.behavior_id, &self.selection);
+        let name_input = text_input(&name_key, &modal.name, &self.selection);
 
         let pending = modal.pending_correlation.is_some();
         let create_enabled =
@@ -13049,8 +13057,8 @@ impl ChatApp {
         let create_key = format!("{NEW_POD_MODAL_KEY}:create");
         let cancel_key = format!("{NEW_POD_MODAL_KEY}:cancel");
 
-        let pod_id_input = text_input(&modal.pod_id, &self.selection, &pod_id_key);
-        let name_input = text_input(&modal.name, &self.selection, &name_key);
+        let pod_id_input = text_input(&pod_id_key, &modal.pod_id, &self.selection);
+        let name_input = text_input(&name_key, &modal.name, &self.selection);
 
         let backends_empty = self.backends.is_empty();
         let pending = modal.pending_correlation.is_some();
@@ -13288,11 +13296,11 @@ impl ChatApp {
         editor: &BehaviorEditorSheetState,
         cfg: &BehaviorConfig,
     ) -> El {
-        let name_input = text_input(&cfg.name, &self.selection, BEHAVIOR_EDITOR_NAME_KEY);
+        let name_input = text_input(BEHAVIOR_EDITOR_NAME_KEY, &cfg.name, &self.selection);
         let description_input = text_area(
+            BEHAVIOR_EDITOR_DESCRIPTION_KEY,
             cfg.description.as_deref().unwrap_or(""),
             &self.selection,
-            BEHAVIOR_EDITOR_DESCRIPTION_KEY,
         )
         .height(Size::Fixed(80.0));
         let kind_trigger = select_trigger(
@@ -13341,14 +13349,14 @@ impl ChatApp {
             }
             TriggerKindLabel::Cron => {
                 let schedule_input = text_input(
+                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
                     &editor.schedule_buffer,
                     &self.selection,
-                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
                 );
                 let timezone_input = text_input(
+                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
                     &editor.timezone_buffer,
                     &self.selection,
-                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
                 );
                 let overlap_trigger = select_trigger(
                     BEHAVIOR_EDITOR_OVERLAP_KEY,
@@ -13525,9 +13533,9 @@ impl ChatApp {
     /// templated substitution.
     fn render_behavior_editor_prompt_tab(&self, editor: &BehaviorEditorSheetState) -> El {
         let prompt_input = text_area(
+            BEHAVIOR_EDITOR_PROMPT_KEY,
             &editor.working_prompt,
             &self.selection,
-            BEHAVIOR_EDITOR_PROMPT_KEY,
         )
         .height(Size::Fixed(360.0));
         form([form_item([
@@ -13594,9 +13602,9 @@ impl ChatApp {
         let max_tokens_override = cfg.thread.max_tokens.is_some();
         let max_tokens_control: El = if max_tokens_override {
             numeric_input(
+                BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY,
                 &editor.thread_max_tokens_buf,
                 &self.selection,
-                BEHAVIOR_EDITOR_THREAD_MAX_TOKENS_KEY,
                 NumericInputOpts::default()
                     .min(1.0)
                     .max(200_000.0)
@@ -13617,9 +13625,9 @@ impl ChatApp {
         let max_turns_override = cfg.thread.max_turns.is_some();
         let max_turns_control: El = if max_turns_override {
             numeric_input(
+                BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY,
                 &editor.thread_max_turns_buf,
                 &self.selection,
-                BEHAVIOR_EDITOR_THREAD_MAX_TURNS_KEY,
                 NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
             )
         } else {
@@ -14234,9 +14242,9 @@ impl ChatApp {
             RetentionPolicy::ArchiveAfterDays { .. } | RetentionPolicy::DeleteAfterDays { .. }
         ) {
             let days_widget = numeric_input(
+                BEHAVIOR_EDITOR_RETENTION_DAYS_KEY,
                 &editor.retention_days_buf,
                 &self.selection,
-                BEHAVIOR_EDITOR_RETENTION_DAYS_KEY,
                 NumericInputOpts::default().min(1.0).max(3650.0).step(1.0),
             );
             let hint = match cfg.on_completion {
@@ -14308,7 +14316,7 @@ impl ChatApp {
                 let non_conv = name != &conv_path;
                 let body = editor.working_system_prompt.as_deref().unwrap_or("");
                 let body_input =
-                    text_area(body, &self.selection, BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY)
+                    text_area(BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY, body, &self.selection)
                         .height(Size::Fixed(280.0));
                 items.push(form_item([
                     form_label("file"),
@@ -14340,9 +14348,9 @@ impl ChatApp {
             }
             Some(SystemPromptChoice::Text { text: inline_text }) => {
                 let inline_input = text_area(
+                    BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                     inline_text,
                     &self.selection,
-                    BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                 )
                 .height(Size::Fixed(280.0));
                 items.push(form_item([
@@ -14389,9 +14397,9 @@ impl ChatApp {
         // padding so the textarea's focus ring isn't clipped by
         // the scroll's scissor (lint catches the bare-edge case).
         let body = text_area(
+            BEHAVIOR_EDITOR_RAW_TOML_KEY,
             &editor.working_toml,
             &self.selection,
-            BEHAVIOR_EDITOR_RAW_TOML_KEY,
         )
         .mono();
         column([hint, body])
@@ -15757,7 +15765,7 @@ impl ChatApp {
                 PodEditorTab::Allow => self.render_pod_editor_allow_tab(editor),
                 PodEditorTab::Defaults => self.render_pod_editor_defaults_tab(editor),
                 PodEditorTab::RawToml => {
-                    text_area(&editor.working_toml, &self.selection, POD_EDITOR_TOML_KEY).mono()
+                    text_area(POD_EDITOR_TOML_KEY, &editor.working_toml, &self.selection).mono()
                 }
             }
         };
@@ -15816,17 +15824,17 @@ impl ChatApp {
                 .muted();
         };
 
-        let name_input = text_input(&cfg.name, &self.selection, POD_EDITOR_GENERAL_NAME_KEY);
+        let name_input = text_input(POD_EDITOR_GENERAL_NAME_KEY, &cfg.name, &self.selection);
         let description_input = text_area(
+            POD_EDITOR_GENERAL_DESCRIPTION_KEY,
             cfg.description.as_deref().unwrap_or(""),
             &self.selection,
-            POD_EDITOR_GENERAL_DESCRIPTION_KEY,
         )
         .height(Size::Fixed(64.0));
         let max_concurrent_widget = numeric_input(
+            POD_EDITOR_GENERAL_MAX_CONCURRENT_THREADS_KEY,
             &editor.max_concurrent_threads_buf,
             &self.selection,
-            POD_EDITOR_GENERAL_MAX_CONCURRENT_THREADS_KEY,
             NumericInputOpts::default().min(1.0).max(1000.0).step(1.0),
         );
 
@@ -16121,24 +16129,24 @@ impl ChatApp {
         let model_trigger = select_trigger(POD_EDITOR_DEFAULTS_MODEL_KEY, model_label);
 
         let system_prompt_input = text_input(
+            POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
             &cfg.thread_defaults.system_prompt_file,
             &self.selection,
-            POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
         );
 
         let max_tokens_widget = numeric_input(
+            POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY,
             &editor.max_tokens_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_MAX_TOKENS_KEY,
             NumericInputOpts::default()
                 .min(1.0)
                 .max(200_000.0)
                 .step(50.0),
         );
         let max_turns_widget = numeric_input(
+            POD_EDITOR_DEFAULTS_MAX_TURNS_KEY,
             &editor.max_turns_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_MAX_TURNS_KEY,
             NumericInputOpts::default().min(1.0).max(10_000.0).step(1.0),
         );
         let autoquery_widget = self.render_pod_editor_defaults_autoquery(editor, cfg);
@@ -16293,33 +16301,33 @@ impl ChatApp {
             autoquery_source_label(aq.query_source),
         );
         let top_k = numeric_input(
+            POD_EDITOR_DEFAULTS_AUTOQUERY_TOP_K_KEY,
             &editor.autoquery_top_k_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_AUTOQUERY_TOP_K_KEY,
             NumericInputOpts::default().min(0.0).max(20.0).step(1.0),
         );
         let min_score = numeric_input(
+            POD_EDITOR_DEFAULTS_AUTOQUERY_MIN_SCORE_KEY,
             &editor.autoquery_min_score_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_AUTOQUERY_MIN_SCORE_KEY,
             NumericInputOpts::default()
                 .min(-100.0)
                 .max(100.0)
                 .step(0.05),
         );
         let max_query_chars = numeric_input(
+            POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY,
             &editor.autoquery_max_query_chars_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_AUTOQUERY_MAX_QUERY_CHARS_KEY,
             NumericInputOpts::default()
                 .min(0.0)
                 .max(50_000.0)
                 .step(250.0),
         );
         let snippet_chars = numeric_input(
+            POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY,
             &editor.autoquery_snippet_chars_buf,
             &self.selection,
-            POD_EDITOR_DEFAULTS_AUTOQUERY_SNIPPET_CHARS_KEY,
             NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
         );
         let bucket_groups = self.autoquery_bucket_groups(cfg);
@@ -16341,19 +16349,22 @@ impl ChatApp {
 
         column([
             row([
-                checkbox(aq.enabled).key(POD_EDITOR_DEFAULTS_AUTOQUERY_ENABLED_KEY),
+                checkbox(POD_EDITOR_DEFAULTS_AUTOQUERY_ENABLED_KEY, aq.enabled),
                 text("enabled").text_color(tokens::FOREGROUND),
             ])
             .gap(tokens::SPACE_2)
             .align(Align::Center),
             row([
-                checkbox(aq.hot_only).key(POD_EDITOR_DEFAULTS_AUTOQUERY_HOT_ONLY_KEY),
+                checkbox(POD_EDITOR_DEFAULTS_AUTOQUERY_HOT_ONLY_KEY, aq.hot_only),
                 text("hot buckets only").text_color(tokens::FOREGROUND),
             ])
             .gap(tokens::SPACE_2)
             .align(Align::Center),
             row([
-                checkbox(aq.inject_at_terminal).key(POD_EDITOR_DEFAULTS_AUTOQUERY_TERMINAL_KEY),
+                checkbox(
+                    POD_EDITOR_DEFAULTS_AUTOQUERY_TERMINAL_KEY,
+                    aq.inject_at_terminal,
+                ),
                 text("inject at terminal turns").text_color(tokens::FOREGROUND),
             ])
             .gap(tokens::SPACE_2)
@@ -16465,18 +16476,18 @@ impl ChatApp {
             form_item([
                 form_label("name"),
                 form_control(text_input(
+                    HOST_ENV_EDITOR_NAME_KEY,
                     &editor.entry.name,
                     &self.selection,
-                    HOST_ENV_EDITOR_NAME_KEY,
                 )),
                 form_description("Name used by thread bindings and defaults."),
             ]),
             form_item([
                 form_label("provider"),
                 form_control(text_input(
+                    HOST_ENV_EDITOR_PROVIDER_KEY,
                     &editor.entry.provider,
                     &self.selection,
-                    HOST_ENV_EDITOR_PROVIDER_KEY,
                 )),
                 form_description("Daemon name from server `[[auth.daemons]]`."),
             ]),
@@ -16542,7 +16553,7 @@ impl ChatApp {
             .map(|(idx, name)| {
                 let key = format!("{HOST_ENV_EDITOR_RUNAS_PREFIX}{idx}");
                 row([
-                    text_input(name, &self.selection, &key).width(Size::Fill(1.0)),
+                    text_input(&key, name, &self.selection).width(Size::Fill(1.0)),
                     icon_button(crate::icons::ICON_X.clone())
                         .key(format!("{HOST_ENV_EDITOR_RUNAS_DELETE_PREFIX}{idx}"))
                         .ghost(),
@@ -16577,9 +16588,9 @@ impl ChatApp {
             form_item([
                 form_label("default_runas"),
                 form_control(text_input(
+                    HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
                     editor.entry.default_runas.as_deref().unwrap_or(""),
                     &self.selection,
-                    HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
                 )),
                 form_description(
                     "Username seeded into a thread's binding when no explicit \
@@ -16625,7 +16636,7 @@ impl ChatApp {
                 TunableKind::Bool { .. } => {
                     let bool_value = matches!(current, Some(TunableValue::Bool(true)));
                     row([
-                        checkbox(bool_value).key(&opt_key),
+                        checkbox(&opt_key, bool_value),
                         text(label.clone()).muted().small(),
                     ])
                     .gap(tokens::SPACE_2)
@@ -16701,7 +16712,7 @@ impl ChatApp {
                 let path_key = format!("{HOST_ENV_EDITOR_LANDLOCK_PATH_PREFIX}{idx}");
                 let mode_key = format!("{HOST_ENV_EDITOR_LANDLOCK_MODE_PREFIX}{idx}");
                 row([
-                    text_input(&p.path, &self.selection, &path_key).width(Size::Fill(1.0)),
+                    text_input(&path_key, &p.path, &self.selection).width(Size::Fill(1.0)),
                     radio_group(
                         mode_key,
                         &access_mode_wire(p.mode),
@@ -16762,8 +16773,8 @@ impl ChatApp {
                 let mode_key = format!("{HOST_ENV_EDITOR_CONTAINER_MOUNT_MODE_PREFIX}{idx}");
                 column([
                     row([
-                        text_input(&m.host, &self.selection, &host_key).width(Size::Fill(1.0)),
-                        text_input(&m.guest, &self.selection, &guest_key).width(Size::Fill(1.0)),
+                        text_input(&host_key, &m.host, &self.selection).width(Size::Fill(1.0)),
+                        text_input(&guest_key, &m.guest, &self.selection).width(Size::Fill(1.0)),
                         icon_button(crate::icons::ICON_X.clone())
                             .key(format!(
                                 "{HOST_ENV_EDITOR_CONTAINER_MOUNT_DELETE_PREFIX}{idx}"
@@ -16795,7 +16806,7 @@ impl ChatApp {
         let limits_enabled = limits.is_some();
         let mut limit_rows = vec![
             row([
-                checkbox(limits_enabled).key(HOST_ENV_EDITOR_CONTAINER_LIMITS_ENABLED_KEY),
+                checkbox(HOST_ENV_EDITOR_CONTAINER_LIMITS_ENABLED_KEY, limits_enabled),
                 text("set explicit limits").muted().small(),
             ])
             .gap(tokens::SPACE_2)
@@ -16806,9 +16817,9 @@ impl ChatApp {
                 row([
                     text("cpus").width(Size::Fixed(120.0)),
                     text_input(
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_CPUS_KEY,
                         &editor.limits_cpus_buf,
                         &self.selection,
-                        HOST_ENV_EDITOR_CONTAINER_LIMITS_CPUS_KEY,
                     )
                     .width(Size::Fill(1.0)),
                 ])
@@ -16817,9 +16828,9 @@ impl ChatApp {
                 row([
                     text("memory MiB").width(Size::Fixed(120.0)),
                     text_input(
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_MEMORY_KEY,
                         &editor.limits_memory_buf,
                         &self.selection,
-                        HOST_ENV_EDITOR_CONTAINER_LIMITS_MEMORY_KEY,
                     )
                     .width(Size::Fill(1.0)),
                 ])
@@ -16828,9 +16839,9 @@ impl ChatApp {
                 row([
                     text("timeout sec").width(Size::Fixed(120.0)),
                     text_input(
+                        HOST_ENV_EDITOR_CONTAINER_LIMITS_TIMEOUT_KEY,
                         &editor.limits_timeout_buf,
                         &self.selection,
-                        HOST_ENV_EDITOR_CONTAINER_LIMITS_TIMEOUT_KEY,
                     )
                     .width(Size::Fill(1.0)),
                 ])
@@ -16845,15 +16856,15 @@ impl ChatApp {
             .map(|(idx, (k, v))| {
                 row([
                     text_input(
+                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX}{idx}"),
                         k,
                         &self.selection,
-                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX}{idx}"),
                     )
                     .width(Size::Fill(1.0)),
                     text_input(
+                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX}{idx}"),
                         v,
                         &self.selection,
-                        &format!("{HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX}{idx}"),
                     )
                     .width(Size::Fill(1.0)),
                     icon_button(crate::icons::ICON_X.clone())
@@ -16880,9 +16891,9 @@ impl ChatApp {
             form_item([
                 form_label("image"),
                 form_control(text_input(
+                    HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
                     image,
                     &self.selection,
-                    HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
                 )),
             ]),
             form_item([
@@ -16955,9 +16966,9 @@ impl ChatApp {
             .width(Size::Fill(1.0))
         } else {
             let named_input = text_area(
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                 &editor.tool_surface_named_buf,
                 &self.selection,
-                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
             )
             .height(Size::Fixed(96.0))
             .mono();
@@ -17332,9 +17343,9 @@ impl ChatApp {
             .cloned()
             .unwrap_or_default();
         let reason_input = text_input_with(
+            &reason_key,
             &reason_buf,
             &self.selection,
-            &reason_key,
             TextInputOpts::default().placeholder("reject reason (optional)"),
         );
 
@@ -17665,7 +17676,7 @@ impl ChatApp {
         let saving = modal.pending_correlation.is_some() && has_data;
 
         let body: El = if let Some(working) = modal.working.as_ref() {
-            text_area(working, &self.selection, FILE_VIEWER_BODY_KEY)
+            text_area(FILE_VIEWER_BODY_KEY, working, &self.selection)
                 .mono()
                 .width(Size::Fill(1.0))
                 .height(Size::Fill(1.0))
@@ -19199,9 +19210,9 @@ impl ChatApp {
         let saving = sub.pending_correlation.is_some();
 
         let body = text_area(
+            SETTINGS_CODEX_ROTATE_BODY_KEY,
             &sub.contents,
             &self.selection,
-            SETTINGS_CODEX_ROTATE_BODY_KEY,
         )
         .mono()
         .width(Size::Fill(1.0))
@@ -19270,9 +19281,9 @@ impl ChatApp {
         };
 
         let name_input = text_input(
+            SETTINGS_SHARED_MCP_EDITOR_NAME_KEY,
             &sub.name,
             &self.selection,
-            SETTINGS_SHARED_MCP_EDITOR_NAME_KEY,
         )
         .width(Size::Fill(1.0));
         let name_input = if waiting || sub.mode == SharedMcpEditorMode::Edit {
@@ -19281,9 +19292,9 @@ impl ChatApp {
             name_input
         };
         let url_input = text_input(
+            SETTINGS_SHARED_MCP_EDITOR_URL_KEY,
             &sub.url,
             &self.selection,
-            SETTINGS_SHARED_MCP_EDITOR_URL_KEY,
         )
         .width(Size::Fill(1.0));
         let url_input = if waiting {
@@ -19345,9 +19356,9 @@ impl ChatApp {
             SharedMcpAuthChoice::Bearer => {
                 let had_bearer = matches!(sub.auth_kind_on_load, SharedMcpAuthPublic::Bearer);
                 let bearer_input = text_input(
+                    SETTINGS_SHARED_MCP_EDITOR_BEARER_KEY,
                     &sub.bearer,
                     &self.selection,
-                    SETTINGS_SHARED_MCP_EDITOR_BEARER_KEY,
                 )
                 .width(Size::Fill(1.0));
                 let bearer_input = if waiting {
@@ -19369,9 +19380,9 @@ impl ChatApp {
             }
             SharedMcpAuthChoice::Oauth2 => {
                 let scope_input = text_input(
+                    SETTINGS_SHARED_MCP_EDITOR_OAUTH_SCOPE_KEY,
                     &sub.oauth_scope,
                     &self.selection,
-                    SETTINGS_SHARED_MCP_EDITOR_OAUTH_SCOPE_KEY,
                 )
                 .width(Size::Fill(1.0));
                 let scope_input = if waiting {
@@ -19434,9 +19445,9 @@ impl ChatApp {
             .color(tokens::WARNING),
             SharedMcpPrefixChoice::Custom => {
                 let custom_input = text_input(
+                    SETTINGS_SHARED_MCP_EDITOR_PREFIX_CUSTOM_KEY,
                     &sub.prefix_custom,
                     &self.selection,
-                    SETTINGS_SHARED_MCP_EDITOR_PREFIX_CUSTOM_KEY,
                 )
                 .width(Size::Fill(1.0));
                 let custom_input = if waiting {
@@ -19552,9 +19563,9 @@ impl ChatApp {
         let saving = editor.save_correlation.is_some();
 
         let body = text_area(
+            SETTINGS_SERVER_CONFIG_BODY_KEY,
             &editor.working,
             &self.selection,
-            SETTINGS_SERVER_CONFIG_BODY_KEY,
         )
         .mono()
         .width(Size::Fill(1.0))
@@ -19745,7 +19756,7 @@ impl ChatApp {
 
         // ---- id ----
         let id_input =
-            text_input(&cf.id, &self.selection, BUCKETS_CREATE_ID_KEY).width(Size::Fill(1.0));
+            text_input(BUCKETS_CREATE_ID_KEY, &cf.id, &self.selection).width(Size::Fill(1.0));
         let id_input = if saving {
             id_input.disabled()
         } else {
@@ -19765,16 +19776,16 @@ impl ChatApp {
 
         // ---- name / description ----
         let name_input =
-            text_input(&cf.name, &self.selection, BUCKETS_CREATE_NAME_KEY).width(Size::Fill(1.0));
+            text_input(BUCKETS_CREATE_NAME_KEY, &cf.name, &self.selection).width(Size::Fill(1.0));
         let name_input = if saving {
             name_input.disabled()
         } else {
             name_input
         };
         let description_input = text_input(
+            BUCKETS_CREATE_DESCRIPTION_KEY,
             &cf.description,
             &self.selection,
-            BUCKETS_CREATE_DESCRIPTION_KEY,
         )
         .width(Size::Fill(1.0));
         let description_input = if saving {
@@ -19786,9 +19797,9 @@ impl ChatApp {
         // ---- embedder picker (or fallback text input) ----
         let embedder_field: El = if self.embedding_providers.is_empty() {
             let input = text_input(
+                BUCKETS_CREATE_EMBEDDER_INPUT_KEY,
                 &cf.embedder,
                 &self.selection,
-                BUCKETS_CREATE_EMBEDDER_INPUT_KEY,
             )
             .width(Size::Fixed(280.0));
             if saving { input.disabled() } else { input }
@@ -19829,9 +19840,9 @@ impl ChatApp {
         let source_section: El = match cf.source_kind {
             SourceKindChoice::Stored => {
                 let detail = text_input(
+                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
                     &cf.source_detail,
                     &self.selection,
-                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
                 )
                 .width(Size::Fill(1.0));
                 let detail = if saving { detail.disabled() } else { detail };
@@ -19854,9 +19865,9 @@ impl ChatApp {
             }
             SourceKindChoice::Linked => {
                 let detail = text_input(
+                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
                     &cf.source_detail,
                     &self.selection,
-                    BUCKETS_CREATE_SOURCE_DETAIL_KEY,
                 )
                 .width(Size::Fill(1.0));
                 let detail = if saving { detail.disabled() } else { detail };
@@ -19898,16 +19909,16 @@ impl ChatApp {
                 match cf.tracked_driver {
                     TrackedDriverChoice::Wikipedia => {
                         let lang = text_input(
+                            BUCKETS_CREATE_LANGUAGE_KEY,
                             &cf.tracked_language,
                             &self.selection,
-                            BUCKETS_CREATE_LANGUAGE_KEY,
                         )
                         .width(Size::Fixed(180.0));
                         let lang = if saving { lang.disabled() } else { lang };
                         let mirror = text_input(
+                            BUCKETS_CREATE_MIRROR_KEY,
                             &cf.tracked_mirror,
                             &self.selection,
-                            BUCKETS_CREATE_MIRROR_KEY,
                         )
                         .width(Size::Fill(1.0));
                         let mirror = if saving { mirror.disabled() } else { mirror };
@@ -19958,9 +19969,9 @@ impl ChatApp {
 
         // ---- chunk / overlap tokens ----
         let chunk_widget = numeric_input(
+            BUCKETS_CREATE_CHUNK_TOKENS_KEY,
             &cf.chunk_tokens_buf,
             &self.selection,
-            BUCKETS_CREATE_CHUNK_TOKENS_KEY,
             NumericInputOpts::default().min(50.0).max(4096.0).step(10.0),
         )
         .width(Size::Fixed(120.0));
@@ -19970,9 +19981,9 @@ impl ChatApp {
             chunk_widget
         };
         let overlap_widget = numeric_input(
+            BUCKETS_CREATE_OVERLAP_TOKENS_KEY,
             &cf.overlap_tokens_buf,
             &self.selection,
-            BUCKETS_CREATE_OVERLAP_TOKENS_KEY,
             NumericInputOpts::default().min(0.0).max(512.0).step(5.0),
         )
         .width(Size::Fixed(120.0));
@@ -20179,9 +20190,9 @@ impl ChatApp {
             select_trigger(BUCKETS_SEARCH_PICKER_KEY, picker_label).width(Size::Fixed(220.0));
 
         let query_input = text_input(
+            BUCKETS_SEARCH_INPUT_KEY,
             &modal.query_input,
             &self.selection,
-            BUCKETS_SEARCH_INPUT_KEY,
         )
         .width(Size::Fill(1.0));
 
@@ -20198,9 +20209,9 @@ impl ChatApp {
             .width(Size::Fill(1.0));
 
         let top_k_widget = numeric_input(
+            BUCKETS_SEARCH_TOP_K_KEY,
             &modal.top_k_buf,
             &self.selection,
-            BUCKETS_SEARCH_TOP_K_KEY,
             NumericInputOpts::default().min(1.0).max(50.0).step(1.0),
         )
         .width(Size::Fixed(120.0));
@@ -21053,8 +21064,8 @@ impl ChatApp {
     fn render_fork_modal(&self) -> Option<El> {
         let modal = self.fork_modal.as_ref()?;
 
-        let archive_switch = switch(modal.archive_original).key(FORK_MODAL_ARCHIVE_KEY);
-        let reset_switch = switch(modal.reset_capabilities).key(FORK_MODAL_RESET_CAPS_KEY);
+        let archive_switch = switch(FORK_MODAL_ARCHIVE_KEY, modal.archive_original);
+        let reset_switch = switch(FORK_MODAL_RESET_CAPS_KEY, modal.reset_capabilities);
 
         let confirm = button("Fork").key(FORK_MODAL_CONFIRM_KEY).primary();
         let cancel = button("Cancel").key(FORK_MODAL_CANCEL_KEY);
@@ -21269,7 +21280,7 @@ impl ChatApp {
         let attach = icon_button(crate::icons::ICON_PAPERCLIP.clone())
             .key(COMPOSE_ATTACH_KEY)
             .ghost();
-        let editor = text_area(buf, &self.selection, COMPOSE_KEY).height(Size::Fixed(120.0));
+        let editor = text_area(COMPOSE_KEY, buf, &self.selection).height(Size::Fixed(120.0));
 
         // The compose row sits at the bottom of the pane: text_area
         // takes the leftover width, attach + send hug to the right.

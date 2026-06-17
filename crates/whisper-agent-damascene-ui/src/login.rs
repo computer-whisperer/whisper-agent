@@ -105,20 +105,20 @@ impl LoginApp {
 
 impl App for LoginApp {
     fn build(&self, _cx: &BuildCx) -> El {
-        let server_input = text_input(&self.server, &self.selection, KEY_SERVER);
+        let server_input = text_input(KEY_SERVER, &self.server, &self.selection);
         // `password()` lives on `TextInputOpts` (it controls both the
         // visual mask and the copy/cut suppression at apply_event time),
         // so the password field has to go through `text_input_with`.
         let token_input = text_input_with(
+            KEY_TOKEN,
             &self.token,
             &self.selection,
-            KEY_TOKEN,
             TextInputOpts::default().password(),
         );
         let connect = button("Connect").key(KEY_CONNECT).primary();
 
         let remember_row = row([
-            checkbox(self.remember).key(KEY_REMEMBER),
+            checkbox(KEY_REMEMBER, self.remember),
             text("Remember on this device"),
         ])
         .gap(tokens::SPACE_2)
