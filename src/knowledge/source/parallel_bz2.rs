@@ -10,12 +10,20 @@
 //! decompression off-thread *and* parallelizing it across cores frees
 //! that worker to overlap parsing with the next stream's decode.
 //!
-//! [`ParallelMultiBzDecoder`] mmaps the file, scans once for byte-
-//! aligned bz2 stream-start signatures (10-byte magic — false-positive
-//! rate is ~2^-38 over a 24 GB scan), and dispatches each stream's
-//! compressed byte range to a worker pool. A coordinator reorders the
-//! workers' decompressed output and feeds it into a `Read + Send`
-//! consumer that drops in for `MultiBzDecoder` at call sites.
+//! [`ParallelMultiBzDecoder`] scans the file once (a buffered
+//! sequential read) for byte-aligned bz2 stream-start signatures
+//! (10-byte magic — false-positive rate is ~2^-38 over a 24 GB scan),
+//! and dispatches each stream's compressed byte range to a worker pool.
+//! Workers read their range with positioned reads (`pread` via
+//! `FileExt::read_at`) behind a `BufReader` — never `mmap`. The dumps
+//! live on a CephFS (ceph-fuse) mount where mmap page faults are
+//! serviced one 4 KB page at a time over the FUSE link (pathologically
+//! slow — a full-file scan exceeded the build stall watchdog and
+//! stranded planning at source_records=0), whereas large buffered
+//! reads get normal readahead (~170 MB/s on the same mount). A
+//! coordinator reorders the workers' decompressed output and feeds it
+//! into a `Read + Send` consumer that drops in for `MultiBzDecoder` at
+//! call sites.
 //!
 //! Files with no detectable stream-start magic (truncated header,
 //! non-bz2 file with a `.bz2` extension) fall back to a single-threaded
@@ -24,13 +32,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-
-use memmap2::Mmap;
 
 /// Byte-aligned signature at the start of every bz2 stream:
 /// `BZh<digit>` (4 bytes) + the bzip2 first-block magic
@@ -50,6 +57,17 @@ const OUT_CHANNEL_CAPACITY: usize = 2;
 /// reorder slots cap how far ahead workers can run before the
 /// out-of-order tail of the BTreeMap kicks back at them.
 const REORDER_CAPACITY: usize = 4;
+
+/// I/O buffer for the sequential stream-start scan. Large enough that
+/// CephFS readahead engages so the scan runs at streaming speed rather
+/// than dribbling out small reads.
+const SCAN_BUF: usize = 4 * 1024 * 1024;
+
+/// Per-worker (and single-stream fallback) read buffer. Wrapping each
+/// worker's positioned `SectionReader` in a `BufReader` of this size
+/// turns `BzDecoder`'s small pulls into ~1 MB `pread`s so readahead
+/// engages — the same reason the scan is buffered.
+const WORKER_BUF: usize = 1024 * 1024;
 
 /// Drop-in replacement for `bzip2::read::MultiBzDecoder` with parallel
 /// per-stream decompression. Implements `Read + Send` so call sites can
@@ -78,33 +96,41 @@ enum DecompressedChunk {
 }
 
 impl ParallelMultiBzDecoder {
-    /// Open `path`, mmap it, and spawn the decompression pipeline.
-    /// Returns an error only on file open / mmap failure; bz2 decode
-    /// errors surface from `Read::read` once they reach the consumer.
+    /// Open `path`, scan it for stream starts, and spawn the
+    /// decompression pipeline. Returns an error only on file open / scan
+    /// I/O failure; bz2 decode errors surface from `Read::read` once
+    /// they reach the consumer.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
         let metadata = file.metadata()?;
-        if metadata.len() == 0 {
+        let total_len = metadata.len();
+        if total_len == 0 {
             return Ok(Self::eof_only());
         }
-        // SAFETY: the mmap is treated as immutable bytes for the
-        // decoder's lifetime. Concurrent external mutation of the
-        // file would race, but Wikipedia dumps are
-        // download-then-read.
-        let mmap = unsafe { Mmap::map(&file)? };
-        let mmap = Arc::new(mmap);
-        let offsets = scan_stream_offsets(&mmap);
+
+        // Scan for stream starts with a buffered sequential read — the
+        // CephFS-friendly access pattern. (The previous mmap-based scan
+        // page-faulted the whole ~24 GB one 4 KB page at a time over the
+        // FUSE link, which on the bucket data volume ran longer than the
+        // build stall watchdog allows and stranded planning at
+        // source_records=0.)
+        let offsets = scan_stream_offsets(BufReader::with_capacity(SCAN_BUF, &file))?;
+
+        // Shared across workers for positioned reads; `read_at` carries
+        // its own offset, so disjoint ranges read concurrently with no
+        // shared cursor.
+        let file = Arc::new(file);
 
         if offsets.is_empty() {
             // No bz2 magic anywhere — fall back to a single-stream
             // decode of the whole file. Real bz2 always starts with
             // the magic at offset 0; this branch covers truncated
             // headers and `.bz2` files that aren't actually bzip2.
-            return Ok(Self::single_stream(mmap, 0, metadata.len() as usize));
+            return Ok(Self::single_stream(file, 0, total_len as usize));
         }
 
-        let total_len = mmap.len();
+        let total_len = total_len as usize;
         let ranges: Vec<(usize, usize)> = offsets
             .iter()
             .enumerate()
@@ -128,10 +154,10 @@ impl ParallelMultiBzDecoder {
 
         let mut threads = Vec::with_capacity(n_workers + 1);
         for _ in 0..n_workers {
-            let mmap = Arc::clone(&mmap);
+            let file = Arc::clone(&file);
             let job_rx = Arc::clone(&job_rx);
             let res_tx = res_tx.clone();
-            threads.push(thread::spawn(move || worker_loop(mmap, job_rx, res_tx)));
+            threads.push(thread::spawn(move || worker_loop(file, job_rx, res_tx)));
         }
         // Original `res_tx` must be dropped so `res_rx` sees closure
         // once every worker clone has exited.
@@ -169,21 +195,37 @@ impl ParallelMultiBzDecoder {
         }
     }
 
-    fn single_stream(mmap: Arc<Mmap>, start: usize, end: usize) -> Self {
+    fn single_stream(file: Arc<File>, start: usize, end: usize) -> Self {
         let (out_tx, out_rx) = mpsc::sync_channel::<DecompressedChunk>(OUT_CHANNEL_CAPACITY);
         let handle = thread::spawn(move || {
-            let slice = &mmap[start..end];
-            let mut decoded = Vec::new();
-            match bzip2::read::BzDecoder::new(slice).read_to_end(&mut decoded) {
-                Ok(_) => {
-                    let _ = out_tx.send(DecompressedChunk::Bytes(decoded));
-                    let _ = out_tx.send(DecompressedChunk::Eof);
-                }
-                Err(e) => {
-                    let _ = out_tx.send(DecompressedChunk::Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("bz2 decode (single-stream fallback): {e}"),
-                    )));
+            // Stream-decode the section so a large (or whole-file) range
+            // doesn't materialize compressed *and* decompressed in RAM
+            // at once; emit decoded output in bounded chunks.
+            let section = SectionReader::new(file, start as u64, (end - start) as u64);
+            let mut dec =
+                bzip2::read::BzDecoder::new(BufReader::with_capacity(WORKER_BUF, section));
+            let mut chunk = vec![0u8; WORKER_BUF];
+            loop {
+                match dec.read(&mut chunk) {
+                    Ok(0) => {
+                        let _ = out_tx.send(DecompressedChunk::Eof);
+                        return;
+                    }
+                    Ok(n) => {
+                        if out_tx
+                            .send(DecompressedChunk::Bytes(chunk[..n].to_vec()))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(DecompressedChunk::Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("bz2 decode (single-stream fallback): {e}"),
+                        )));
+                        return;
+                    }
                 }
             }
         });
@@ -208,7 +250,7 @@ fn worker_count(n_streams: usize) -> usize {
 }
 
 fn worker_loop(
-    mmap: Arc<Mmap>,
+    file: Arc<File>,
     job_rx: Arc<Mutex<Receiver<(usize, usize, usize)>>>,
     res_tx: SyncSender<(usize, io::Result<Vec<u8>>)>,
 ) {
@@ -224,9 +266,13 @@ fn worker_loop(
             Ok(j) => j,
             Err(_) => return,
         };
-        let slice = &mmap[start..end];
+        // Positioned + buffered read of this stream's compressed range,
+        // then decode. `BufReader` coalesces `BzDecoder`'s small pulls
+        // into ~1 MB `pread`s so CephFS readahead engages (vs the old
+        // mmap, which faulted 4 KB at a time over FUSE).
+        let section = SectionReader::new(Arc::clone(&file), start as u64, (end - start) as u64);
         let mut decoded = Vec::new();
-        let result = bzip2::read::BzDecoder::new(slice)
+        let result = bzip2::read::BzDecoder::new(BufReader::with_capacity(WORKER_BUF, section))
             .read_to_end(&mut decoded)
             .map(|_| decoded)
             .map_err(|e| {
@@ -354,36 +400,96 @@ impl Drop for ParallelMultiBzDecoder {
     }
 }
 
-/// Find every byte-aligned bz2 stream-start in `data`. See
-/// [`STREAM_MAGIC_LEN`] for why a 10-byte byte-aligned signature is
-/// reliable on real-world compressed streams.
-fn scan_stream_offsets(data: &[u8]) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    if data.len() < STREAM_MAGIC_LEN {
-        return offsets;
-    }
-    let limit = data.len() - (STREAM_MAGIC_LEN - 1);
-    let mut i = 0;
-    while i < limit {
-        if data[i] == b'B'
-            && data[i + 1] == b'Z'
-            && data[i + 2] == b'h'
-            && data[i + 3].is_ascii_digit()
-            && data[i + 3] != b'0'
-            && data[i + 4] == 0x31
-            && data[i + 5] == 0x41
-            && data[i + 6] == 0x59
-            && data[i + 7] == 0x26
-            && data[i + 8] == 0x53
-            && data[i + 9] == 0x59
-        {
-            offsets.push(i);
-            i += STREAM_MAGIC_LEN;
-        } else {
-            i += 1;
+/// A `Read` over a fixed `[offset, offset + len)` window of a file using
+/// positioned reads (`pread` via [`FileExt::read_at`]). Multiple workers
+/// read disjoint ranges of the same `Arc<File>` concurrently with no
+/// shared seek cursor. Wrap in `BufReader` so a consumer's small reads
+/// coalesce into large preads (readahead-friendly on FUSE).
+struct SectionReader {
+    file: Arc<File>,
+    offset: u64,
+    remaining: u64,
+}
+
+impl SectionReader {
+    fn new(file: Arc<File>, offset: u64, len: u64) -> Self {
+        Self {
+            file,
+            offset,
+            remaining: len,
         }
     }
-    offsets
+}
+
+impl Read for SectionReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = (buf.len() as u64).min(self.remaining) as usize;
+        let n = self.file.read_at(&mut buf[..want], self.offset)?;
+        self.offset += n as u64;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Find every byte-aligned bz2 stream-start in the input behind
+/// `reader`, scanning sequentially. See [`STREAM_MAGIC_LEN`] for why a
+/// 10-byte byte-aligned signature is reliable on real-world compressed
+/// streams. Reads the whole input once, carrying the last
+/// `STREAM_MAGIC_LEN - 1` undecided bytes across each read boundary so a
+/// signature straddling a boundary is still found.
+fn scan_stream_offsets(mut reader: impl Read) -> io::Result<Vec<usize>> {
+    let mut offsets = Vec::new();
+    let carry = STREAM_MAGIC_LEN - 1;
+    // Sliding window: `base` is the absolute file offset of `window[0]`.
+    let mut window: Vec<u8> = Vec::with_capacity(SCAN_BUF + carry);
+    let mut base: usize = 0;
+    let mut chunk = vec![0u8; SCAN_BUF];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        window.extend_from_slice(&chunk[..n]);
+        if window.len() <= carry {
+            // Not enough yet to test a full signature; accumulate more.
+            continue;
+        }
+        let limit = window.len() - carry;
+        let mut i = 0;
+        while i < limit {
+            if is_stream_magic(&window[i..]) {
+                offsets.push(base + i);
+                i += STREAM_MAGIC_LEN;
+            } else {
+                i += 1;
+            }
+        }
+        // Everything before `i` is decided; retain the rest (at most a
+        // partial signature) so the next read can complete it.
+        window.drain(..i);
+        base += i;
+    }
+    Ok(offsets)
+}
+
+/// Byte-aligned bz2 stream-start test on the front of `w`. Returns false
+/// if `w` is shorter than [`STREAM_MAGIC_LEN`].
+fn is_stream_magic(w: &[u8]) -> bool {
+    w.len() >= STREAM_MAGIC_LEN
+        && w[0] == b'B'
+        && w[1] == b'Z'
+        && w[2] == b'h'
+        && w[3].is_ascii_digit()
+        && w[3] != b'0'
+        && w[4] == 0x31
+        && w[5] == 0x41
+        && w[6] == 0x59
+        && w[7] == 0x26
+        && w[8] == 0x53
+        && w[9] == 0x59
 }
 
 #[cfg(test)]
@@ -420,14 +526,14 @@ mod tests {
         combined.extend_from_slice(&s1);
         combined.extend_from_slice(&s2);
 
-        let offsets = scan_stream_offsets(&combined);
+        let offsets = scan_stream_offsets(combined.as_slice()).unwrap();
         assert_eq!(offsets, vec![0, s1.len()]);
     }
 
     #[test]
     fn scanner_returns_empty_for_non_bz2() {
         let data = b"this is some text without bzip2 magic anywhere in it.";
-        assert!(scan_stream_offsets(data).is_empty());
+        assert!(scan_stream_offsets(&data[..]).unwrap().is_empty());
     }
 
     #[test]
@@ -437,8 +543,47 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(b"BZh\x00\x31\x41\x59\x26\x53\x59"); // 0 isn't 1..=9
         data.extend_from_slice(&encode_stream(b"hello"));
-        let offsets = scan_stream_offsets(&data);
+        let offsets = scan_stream_offsets(data.as_slice()).unwrap();
         assert_eq!(offsets, vec![10]);
+    }
+
+    /// A `Read` that hands out at most `chunk` bytes per call, to force
+    /// the scanner's carry-across-read-boundary path (the real file
+    /// reads in 4 MB chunks, but small reads exercise the seam where a
+    /// magic straddles two reads).
+    struct DripReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+    impl Read for DripReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn scanner_finds_magic_straddling_read_boundary() {
+        let s1 = encode_stream(b"first stream payload, padded out a bit");
+        let s2 = encode_stream(b"second stream payload");
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&s1);
+        combined.extend_from_slice(&s2);
+        // Drip 3 bytes per read so the second stream's 10-byte magic is
+        // split across several reads — the carry logic must still find
+        // it at the same absolute offset as a single-shot scan.
+        for chunk in [1usize, 3, 7] {
+            let reader = DripReader {
+                data: &combined,
+                pos: 0,
+                chunk,
+            };
+            let offsets = scan_stream_offsets(reader).unwrap();
+            assert_eq!(offsets, vec![0, s1.len()], "chunk size {chunk}");
+        }
     }
 
     #[test]
