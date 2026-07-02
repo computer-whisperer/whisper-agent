@@ -1230,29 +1230,103 @@ impl DiskBucket {
                 );
                 Some(Arc::new(dense))
             } else {
-                tracing::info!(
-                    slot = %slot_id,
-                    chunks = chunks_done,
-                    dump_snapshot = ?dump_snapshot,
-                    "resume_slot: dense.snapshot lags BatchEmbedded checkpoint; rebuilding HNSW from vectors.bin",
-                );
-                // Surface the rebuild as BuildingDense so the UI shows
-                // "building HNSW" instead of leaving the phase tag at
-                // Indexing for the duration of the rebuild (often
-                // many hours at wiki scale). Reset back to Indexing
-                // below before run_after_planning takes over.
+                // dense.snapshot (n) lags the durable BatchEmbedded
+                // checkpoint (chunks_done). Load the existing dump and
+                // insert only the [n..chunks_done) tail rather than
+                // rebuilding all chunks_done vectors from scratch. A
+                // full rebuild at wiki scale is a multi-day,
+                // uninterruptible op that the 30-min stall watchdog
+                // can't survive (it fired mid-rebuild on the wikipedia_3
+                // wedge, then the finished index was dropped unsaved);
+                // extending the dump turns that into a ~1% tail append.
+                // Fall back to a from-zero rebuild only when there's no
+                // usable dump to extend.
+                //
+                // Surface as BuildingDense so the UI shows "building
+                // HNSW" instead of leaving the phase at Indexing for the
+                // duration; reset to Indexing below before
+                // run_after_planning takes over.
                 if let Some(obs) = observer {
                     obs.on_phase(BuildPhase::BuildingDense);
-                    obs.on_dense_rebuild_progress(0, chunks_done);
                 }
                 let resume_dense_quant = super::dense::DenseQuant::from_vector_quant(
                     self.config.defaults.quantization.into(),
                 );
-                let dense = DenseIndex::empty(
-                    resume_dense_quant,
-                    HnswParams::default(),
-                    ((planned_count as usize).saturating_mul(8)).max(1024),
-                );
+                let cap = ((planned_count as usize).saturating_mul(8)).max(1024);
+                // The dump's HNSW point count equals dump_snapshot, so
+                // load it with a by_position table truncated to those
+                // points (the count-match check in the loader is
+                // otherwise fatal). Any load failure falls back to a
+                // from-zero rebuild.
+                let (dense, start_position): (DenseIndex, u64) = match dump_snapshot {
+                    Some(n) if n > 0 && n < chunks_done => {
+                        let by_position = resumed_chunk_ids[..n as usize].to_vec();
+                        let slot_path_for_load = slot_path.clone();
+                        let q = resume_dense_quant;
+                        // Hold the flushing flag over the dump read: it's
+                        // a bounded streaming load (no per-record ticks)
+                        // that can run minutes at wiki scale.
+                        let loaded = {
+                            let _flush = FlushGuard::begin(observer);
+                            tokio::task::spawn_blocking(move || {
+                                DenseIndex::load_from_with_positions(
+                                    &slot_path_for_load,
+                                    by_position,
+                                    q,
+                                )
+                            })
+                            .await
+                            .map_err(|e| {
+                                BucketError::Other(format!("spawn_blocking dump load: {e}"))
+                            })?
+                        };
+                        match loaded {
+                            Ok(d) => {
+                                tracing::info!(
+                                    slot = %slot_id,
+                                    loaded = n,
+                                    tail = chunks_done - n,
+                                    "resume_slot: loaded HNSW dump; appending tail from vectors.bin",
+                                );
+                                (d, n)
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    slot = %slot_id,
+                                    dump_snapshot = ?dump_snapshot,
+                                    error = %e,
+                                    "resume_slot: HNSW dump load failed; rebuilding from vectors.bin",
+                                );
+                                (
+                                    DenseIndex::empty(
+                                        resume_dense_quant,
+                                        HnswParams::default(),
+                                        cap,
+                                    ),
+                                    0,
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::info!(
+                            slot = %slot_id,
+                            chunks = chunks_done,
+                            dump_snapshot = ?dump_snapshot,
+                            "resume_slot: no usable HNSW dump; rebuilding from vectors.bin",
+                        );
+                        (
+                            DenseIndex::empty(resume_dense_quant, HnswParams::default(), cap),
+                            0,
+                        )
+                    }
+                };
+                // Seed the gauge (and the watchdog marker) at the tail's
+                // baseline so progress counts up from start_position,
+                // not 0.
+                if let Some(obs) = observer {
+                    obs.on_dense_rebuild_progress(start_position, chunks_done);
+                }
                 let bin_path_for_thread = vectors_bin.clone();
                 let dim = embedder_snapshot.dimension as usize;
                 let vec_quant: super::vectors::VectorQuant =
@@ -1260,25 +1334,36 @@ impl DiskBucket {
                 let stride = vec_quant.record_stride(dim);
                 let chunk_ids = resumed_chunk_ids.clone();
                 let slot_id_for_thread = slot_id.to_string();
-                let log_step = chunk_ids.len().max(20).div_ceil(20);
+                let tail_len = (chunks_done - start_position) as usize;
+                let log_step = tail_len.max(20).div_ceil(20) as u64;
                 // Shared with the spawn_blocking loop so the async
                 // poller below can read insert progress without
                 // touching the observer from inside the blocking
                 // closure (the observer is `&dyn` and can't be moved
                 // across that boundary).
-                let inserted_atomic = Arc::new(AtomicU64::new(0));
+                let inserted_atomic = Arc::new(AtomicU64::new(start_position));
                 let inserted_for_thread = inserted_atomic.clone();
                 let join =
                     tokio::task::spawn_blocking(move || -> Result<DenseIndex, BucketError> {
-                        let total = chunk_ids.len();
+                        use std::io::{BufReader, Read, Seek, SeekFrom};
+                        // 8 MiB read window: gives ceph-fuse readahead
+                        // over the contiguous tail instead of a
+                        // per-vector seek+read (the pathological small
+                        // random-IO pattern that froze the watchdog
+                        // marker for >30 min on the wikipedia_3 rebuild).
+                        const RESUME_VECTOR_READ_BUF: usize = 8 * 1024 * 1024;
                         let mut bin =
                             std::fs::File::open(&bin_path_for_thread).map_err(BucketError::Io)?;
-                        use std::io::{Read, Seek, SeekFrom};
 
-                        // Int8 backend: first-pass calibration over up
-                        // to 256 sample vectors before inserting any.
-                        // Mirrors `DenseIndex::build`'s sampling logic.
-                        if resume_dense_quant == super::dense::DenseQuant::Int8 {
+                        // Int8 backend, fresh rebuild only: first-pass
+                        // calibration over up to 256 sample vectors
+                        // before inserting any (mirrors
+                        // `DenseIndex::build`). A loaded dump already
+                        // carries its scale from the sidecar, so tail
+                        // appends must reuse it — never recalibrate.
+                        if start_position == 0
+                            && resume_dense_quant == super::dense::DenseQuant::Int8
+                        {
                             let sample_n = chunk_ids.len().min(256);
                             let mut samples: Vec<Vec<f32>> = Vec::with_capacity(sample_n);
                             for position in 0..sample_n {
@@ -1296,21 +1381,26 @@ impl DiskBucket {
                             dense.set_int8_scale(scale)?;
                         }
 
-                        for (position, chunk_id) in chunk_ids.iter().enumerate() {
-                            let byte_offset =
-                                super::vectors::HEADER_SIZE + position as u64 * stride as u64;
-                            bin.seek(SeekFrom::Start(byte_offset))
-                                .map_err(BucketError::Io)?;
-                            let mut bytes = vec![0u8; stride];
-                            bin.read_exact(&mut bytes).map_err(BucketError::Io)?;
+                        // Tail positions [start_position..chunks_done)
+                        // are contiguous — seek once, then stream them
+                        // sequentially through a large BufReader.
+                        let start_offset =
+                            super::vectors::HEADER_SIZE + start_position * stride as u64;
+                        bin.seek(SeekFrom::Start(start_offset))
+                            .map_err(BucketError::Io)?;
+                        let mut reader = BufReader::with_capacity(RESUME_VECTOR_READ_BUF, bin);
+                        let mut bytes = vec![0u8; stride];
+                        for position in start_position..chunks_done {
+                            reader.read_exact(&mut bytes).map_err(BucketError::Io)?;
                             let v = super::vectors::dequantize_record(&bytes, vec_quant, dim);
-                            dense.insert(*chunk_id, position as u64, &v);
-                            inserted_for_thread.store((position + 1) as u64, Ordering::Relaxed);
-                            if (position + 1).is_multiple_of(log_step) {
+                            dense.insert(chunk_ids[position as usize], position, &v);
+                            let done = position + 1;
+                            inserted_for_thread.store(done, Ordering::Relaxed);
+                            if (done - start_position).is_multiple_of(log_step) {
                                 tracing::info!(
                                     slot = %slot_id_for_thread,
-                                    inserted = position + 1,
-                                    of = total,
+                                    inserted = done,
+                                    of = chunks_done,
                                     "resume_slot: HNSW rebuild progress",
                                 );
                             }
@@ -1321,7 +1411,7 @@ impl DiskBucket {
                 let mut tick = tokio::time::interval(Duration::from_millis(500));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the immediate first tick — we already pushed a
-                // (0, chunks_done) reading above.
+                // (start_position, chunks_done) reading above.
                 tick.tick().await;
                 let join_result = loop {
                     tokio::select! {

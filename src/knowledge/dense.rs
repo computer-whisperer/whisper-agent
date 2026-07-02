@@ -1022,6 +1022,64 @@ mod tests {
     }
 
     #[test]
+    fn load_dump_then_append_tail_matches_full_build() {
+        // Mirrors the resume tail-append path: when dense.snapshot lags
+        // the durable chunk count, resume_slot loads the dump and
+        // inserts only the [snapshot..total) tail on top instead of
+        // rebuilding all `total` vectors from zero. Verify a dump loaded
+        // with a truncated by_position accepts tail inserts and ends up
+        // equivalent to a full build.
+        let n = 20usize;
+        let split = 12usize;
+        let tmp = build_test_vectors(8, n);
+        let vectors = open_reader(&tmp);
+
+        let mut pairs: Vec<(u64, ChunkId)> = vectors
+            .iter_chunk_positions()
+            .map(|(id, pos)| (pos, id))
+            .collect();
+        pairs.sort_by_key(|(pos, _)| *pos);
+        let by_position: Vec<ChunkId> = pairs.into_iter().map(|(_, id)| id).collect();
+
+        // Reference: a full build over all `n`.
+        let full = DenseIndex::build(&vectors, HnswParams::default()).unwrap();
+
+        // Partial index over the first `split`, dumped so the sidecar
+        // reports snapshot == split (< n).
+        let partial = DenseIndex::empty(DenseQuant::F32, HnswParams::default(), n);
+        for pos in 0..split {
+            let v = vectors.read_at_position(pos as u64).unwrap();
+            partial.insert(by_position[pos], pos as u64, &v);
+        }
+        partial.dump_to(tmp.path()).unwrap();
+        assert_eq!(read_dump_snapshot(tmp.path()).unwrap(), Some(split as u64));
+
+        // Resume: load the dump with a by_position truncated to the
+        // dumped points (the count-match check would otherwise reject
+        // the full-length list), then append the tail.
+        let resumed = DenseIndex::load_from_with_positions(
+            tmp.path(),
+            by_position[..split].to_vec(),
+            DenseQuant::F32,
+        )
+        .unwrap();
+        assert_eq!(resumed.len(), split);
+        for pos in split..n {
+            let v = vectors.read_at_position(pos as u64).unwrap();
+            resumed.insert(by_position[pos], pos as u64, &v);
+        }
+        assert_eq!(resumed.len(), full.len());
+
+        // Each appended tail vector is findable as its own nearest
+        // neighbour — i.e. it really made it into the graph.
+        for pos in split..n {
+            let v = vectors.read_at_position(pos as u64).unwrap();
+            let hit = resumed.search(&v, 1);
+            assert_eq!(hit[0].0, by_position[pos], "tail vec at pos {pos} not found");
+        }
+    }
+
+    #[test]
     fn load_from_with_positions_rejects_count_mismatch() {
         let tmp = build_test_vectors(8, 10);
         let vectors = open_reader(&tmp);
