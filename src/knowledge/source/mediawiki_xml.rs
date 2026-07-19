@@ -94,11 +94,12 @@ impl SourceAdapter for MediaWikiXml {
 /// over the compression flavor.
 fn open_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, SourceError> {
     if is_bz2(path) {
-        // ParallelMultiBzDecoder mmaps `path` itself, scans for stream
+        // ParallelMultiBzDecoder streams/preads `path`, scans for stream
         // starts once, and dispatches per-stream decompression across
-        // worker threads. Falls back to a single-stream decode if no
-        // bz2 magic is found. On a single-stream `.xml.bz2` file the
-        // worker pool degrades to one worker handling the one stream.
+        // worker threads without mapping the whole archive. Falls back
+        // to a single-stream decode if no bz2 magic is found. On a
+        // single-stream `.xml.bz2` file the worker pool degrades to one
+        // worker handling the one stream.
         let decoder = ParallelMultiBzDecoder::open(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => SourceError::NotFound(path.display().to_string()),
             _ => SourceError::Io {

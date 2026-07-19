@@ -36,7 +36,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 # server's whisper-agent.toml). One `[[publish_credential]]` table
 # entry per credential file the daemon manages.
 toml = "1"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # Direct rustls dep so `main` can call `crypto::ring::default_provider()
 # .install_default()` before any TLS work. rustls 0.23 panics on the
 # first TLS use unless one provider is explicitly the process-wide
@@ -73,7 +73,7 @@ tempfile = "3"
 # axum server, mount /v1/host_env_link, dial it from the daemon library.
 # Same versions the in-tree host_env_link server-side tests use, so
 # both sides exercise the same wire types.
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 http = "1"
 # Used by the credential publisher tests to mint JWTs with a desired
 # `exp` claim. The auth crate consumes the same encoding.

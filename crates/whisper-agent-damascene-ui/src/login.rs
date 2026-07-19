@@ -168,7 +168,7 @@ impl App for LoginApp {
     fn on_event(&mut self, event: UiEvent, _cx: &EventCx) {
         // Server URL field.
         if event.target_key() == Some(KEY_SERVER) {
-            text_input::apply_event(&mut self.server, &mut self.selection, KEY_SERVER, &event);
+            text_input::apply_event(&mut self.server, &mut self.selection, &event, KEY_SERVER);
             return;
         }
         // Token field. Mirrors the build-side `password()` opt so
@@ -178,8 +178,8 @@ impl App for LoginApp {
             text_input::apply_event_with(
                 &mut self.token,
                 &mut self.selection,
-                KEY_TOKEN,
                 &event,
+                KEY_TOKEN,
                 &TextInputOpts::default().password(),
             );
             return;

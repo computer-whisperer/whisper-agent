@@ -1,144 +1,144 @@
-root kind=Group rect=(0,0,1600,900) size=(Hug,Hug) source=src/app.rs:4613
-  root.group.0 kind=Group rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:4614
-    root.group.0.group.0 kind=Group rect=(0,0,320,900) size=(Fixed(320.0),Fill(1.0)) surface_role=panel fill=card source=src/app.rs:8583
-      root.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8517
-        root.group.0.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8517
-          root.group.0.group.0.group.0.group.0.icon.0 kind=icon rect=(16,16,48,48) size=(Fixed(48.0),Fixed(48.0)) icon=custom:f2a11981 text_color=foreground source=src/app.rs:8490
-          root.group.0.group.0.group.0.group.0.text.1 kind=Text rect=(72,28,112,24) size=(Fill(1.0),Hug) text="whisper-agent" overflow=Ellipsis text_role=title text_color=foreground source=src/app.rs:8494
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:new-pod] kind=icon_button rect=(192,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:8498
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files] kind=icon_button rect=(232,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=folder text_color=muted-foreground source=src/app.rs:8505
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings] kind=icon_button rect=(272,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8511
-      root.group.0.group.0.scroll[sidebar-content] kind=Scroll rect=(16,80,288,712) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:8571
-        root.group.0.group.0.scroll[sidebar-content].tabs_list.0 kind=tabs_list rect=(18,80,284,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:8984
-          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] kind=tab_trigger rect=(22,84,136,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="default" text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:8984
-          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] kind=tab_trigger rect=(162,84,136,32) size=(Fill(1.0),Fixed(32.0)) text="scratch" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:8984
-        root.group.0.group.0.scroll[sidebar-content].group.1 kind=Group rect=(18,136,284,152) size=(Fill(1.0),Hug) source=src/app.rs:9079
-          root.group.0.group.0.scroll[sidebar-content].group.1.group.0 kind=Group rect=(18,136,284,40) size=(Fill(1.0),Hug) source=src/app.rs:9023
-            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 kind=Text rect=(26,146,236,20) size=(Fill(1.0),Hug) text="Threads (2)" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9024
-            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread] kind=icon_button rect=(262,140,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:9025
-          root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1 kind=item_group rect=(18,180,284,108) size=(Fill(1.0),Hug) source=src/app.rs:9060
-            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] kind=item rect=(18,180,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 kind=item_rail rect=(18,180,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1 kind=Group rect=(18,180,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0 kind=Group rect=(30,188,260,36) size=(Fill(1.0),Hug) source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 kind=Text rect=(30,188,260,20) size=(Fill(1.0),Hug) text="first conversation" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 kind=Text rect=(30,208,260,16) size=(Fill(1.0),Hug) text="idle · 8d" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9111
-            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2] kind=item rect=(18,236,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 kind=item_rail rect=(18,236,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1 kind=Group rect=(18,236,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0 kind=Group rect=(30,244,260,36) size=(Fill(1.0),Hug) source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 kind=Text rect=(30,244,260,20) size=(Fill(1.0),Hug) text="t-2" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 kind=Text rect=(30,264,260,16) size=(Fill(1.0),Hug) text="working · 8d" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9111
-      root.group.0.group.0.group.2 kind=Group rect=(16,808,288,76) size=(Fill(1.0),Hug) source=src/app.rs:8637
-        root.group.0.group.0.group.2.group.0 kind=Group rect=(24,820,272,32) size=(Fill(1.0),Hug) source=src/app.rs:8630
-          root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets] kind=icon_button rect=(224,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:9d4ab453 text_color=muted-foreground source=src/app.rs:8600
-          root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings] kind=icon_button rect=(264,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8604
-        root.group.0.group.0.group.2.group.1 kind=Group rect=(24,860,272,20) size=(Fill(1.0),Hug) source=src/app.rs:8690
-          root.group.0.group.0.group.2.group.1.group.0 kind=Group rect=(24,863,14,14) size=(Fixed(14.0),Fixed(14.0)) source=src/app.rs:8675
+root kind=Group rect=(0,0,1600,900) size=(Hug,Hug) source=src/app.rs:4650
+  root.group.0 kind=Group rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:4651
+    root.group.0.group.0 kind=Group rect=(0,0,320,900) size=(Fixed(320.0),Fill(1.0)) surface_role=panel fill=card source=src/app.rs:8796
+      root.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8729
+        root.group.0.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8729
+          root.group.0.group.0.group.0.group.0.icon.0 kind=icon rect=(16,16,48,48) size=(Fixed(48.0),Fixed(48.0)) icon=custom:f2a11981 text_color=foreground source=src/app.rs:8702
+          root.group.0.group.0.group.0.group.0.text.1 kind=Text rect=(72,28,112,24) size=(Fill(1.0),Hug) text="whisper-agent" overflow=Ellipsis text_role=title text_color=foreground source=src/app.rs:8706
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:new-pod] kind=icon_button rect=(192,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:8710
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files] kind=icon_button rect=(232,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=folder text_color=muted-foreground source=src/app.rs:8717
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings] kind=icon_button rect=(272,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8723
+      root.group.0.group.0.scroll[sidebar-content] kind=Scroll rect=(16,80,288,712) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:8783
+        root.group.0.group.0.scroll[sidebar-content].tabs_list.0 kind=tabs_list rect=(18,80,272,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:9197
+          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] kind=tab_trigger rect=(22,84,130,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="default" overflow=Ellipsis text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:9197
+          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] kind=tab_trigger rect=(156,84,130,32) size=(Fill(1.0),Fixed(32.0)) text="scratch" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:9197
+        root.group.0.group.0.scroll[sidebar-content].group.1 kind=Group rect=(18,136,272,152) size=(Fill(1.0),Hug) source=src/app.rs:9292
+          root.group.0.group.0.scroll[sidebar-content].group.1.group.0 kind=Group rect=(18,136,272,40) size=(Fill(1.0),Hug) source=src/app.rs:9236
+            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 kind=Text rect=(26,146,224,20) size=(Fill(1.0),Hug) text="Threads (2)" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9237
+            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread] kind=icon_button rect=(250,140,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:9238
+          root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1 kind=item_group rect=(18,180,272,108) size=(Fill(1.0),Hug) source=src/app.rs:9273
+            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] kind=item rect=(20,180,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 kind=item_rail rect=(20,180,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1 kind=Group rect=(20,180,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0 kind=Group rect=(32,188,244,36) size=(Fill(1.0),Hug) source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 kind=Text rect=(32,188,244,20) size=(Fill(1.0),Hug) text="first conversation" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 kind=Text rect=(32,208,244,16) size=(Fill(1.0),Hug) text="idle · 2mo" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9324
+            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2] kind=item rect=(20,236,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 kind=item_rail rect=(20,236,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1 kind=Group rect=(20,236,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0 kind=Group rect=(32,244,244,36) size=(Fill(1.0),Hug) source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 kind=Text rect=(32,244,244,20) size=(Fill(1.0),Hug) text="t-2" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 kind=Text rect=(32,264,244,16) size=(Fill(1.0),Hug) text="working · 2mo" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9324
+      root.group.0.group.0.group.2 kind=Group rect=(16,808,288,76) size=(Fill(1.0),Hug) source=src/app.rs:8850
+        root.group.0.group.0.group.2.group.0 kind=Group rect=(24,820,272,32) size=(Fill(1.0),Hug) source=src/app.rs:8843
+          root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets] kind=icon_button rect=(224,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:9d4ab453 text_color=muted-foreground source=src/app.rs:8813
+          root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings] kind=icon_button rect=(264,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8817
+        root.group.0.group.0.group.2.group.1 kind=Group rect=(24,860,272,20) size=(Fill(1.0),Hug) source=src/app.rs:8903
+          root.group.0.group.0.group.2.group.1.group.0 kind=Group rect=(24,863,14,14) size=(Fixed(14.0),Fixed(14.0)) source=src/app.rs:8888
             root.group.0.group.0.group.2.group.1.group.0.status-dot.0 kind=status-dot rect=(27,866,8,8) size=(Fixed(8.0),Fixed(8.0)) fill=success
-          root.group.0.group.0.group.2.group.1.text.1 kind=Text rect=(46,860,192,20) size=(Fill(1.0),Hug) text="connected" text_color=muted-foreground source=src/app.rs:8692
-          root.group.0.group.0.group.2.group.1.text.2 kind=Text rect=(246,860,50,20) size=(Hug,Hug) text="v0.3.20" text_color=muted-foreground source=src/app.rs:8687
-    root.group.0.group[sidebar:resize] kind=Group rect=(320,0,8,900) size=(Fixed(8.0),Fill(1.0)) source=src/app.rs:4616
-      root.group.0.group[sidebar:resize].resize-handle-hairline.0 kind=resize-handle-hairline rect=(323,0,2,900) size=(Fixed(2.0),Fill(1.0)) fill=border
-    root.group.0.group.2 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9169
-      root.group.0.group.2.group.0 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9898
-        root.group.0.group.2.group.0.group.0 kind=Group rect=(474,24,980,568) size=(Fixed(980.0),Hug) source=src/app.rs:9898
-          root.group.0.group.2.group.0.group.0.card.0 kind=Card rect=(474,24,980,568) size=(Fixed(980.0),Hug) surface_role=panel fill=card source=src/app.rs:9870
-            root.group.0.group.2.group.0.group.0.card.0.group.0 kind=Group rect=(474,24,980,92) size=(Fill(1.0),Hug) source=src/app.rs:9871
-              root.group.0.group.2.group.0.group.0.card.0.group.0.heading.0 kind=Heading rect=(498,48,932,16) size=(Hug,Hug) text="Start a new conversation" text_role=title text_color=foreground source=src/app.rs:9872
-              root.group.0.group.2.group.0.group.0.card.0.group.0.text.1 kind=Text rect=(498,72,932,20) size=(Fill(1.0),Hug) text="Pick the conversation's main runtime tar…" wrap=Wrap text_color=muted-foreground source=src/app.rs:9873
-            root.group.0.group.2.group.0.group.0.card.0.group.1 kind=Group rect=(474,116,980,420) size=(Fill(1.0),Hug) source=src/app.rs:9878
-              root.group.0.group.2.group.0.group.0.card.0.group.1.group.0 kind=Group rect=(498,116,932,396) size=(Fill(1.0),Hug) source=src/app.rs:9878
-                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0 kind=Group rect=(500,116,928,88) size=(Fill(1.0),Hug) source=src/app.rs:9854
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0 kind=Group rect=(500,116,456,88) size=(Fill(1.0),Hug) source=src/app.rs:9855
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.0 kind=Text rect=(500,116,456,20) size=(Fill(1.0),Hug) text="Backend" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9856
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1 kind=form_control rect=(500,144,456,32) size=(Fill(1.0),Hug) source=src/app.rs:9857
-                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend] kind=select_trigger rect=(500,144,456,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted text_color=foreground source=src/app.rs:9822
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].text.0 kind=Text rect=(510,150,414,20) size=(Fill(1.0),Hug) text="loading pod default…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9822
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].icon.1 kind=icon rect=(930,152,16,16) size=(Fixed(16.0),Fixed(16.0)) icon=chevron-down text_color=muted-foreground source=src/app.rs:9822
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.2 kind=Text rect=(500,184,456,20) size=(Fill(1.0),Hug) text="4 backends configured" wrap=Wrap text_color=muted-foreground source=src/app.rs:9858
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1 kind=Group rect=(972,116,456,88) size=(Fill(1.0),Hug) source=src/app.rs:9860
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.0 kind=Text rect=(972,116,456,20) size=(Fill(1.0),Hug) text="Model" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9861
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1 kind=form_control rect=(972,144,456,32) size=(Fill(1.0),Hug) source=src/app.rs:9862
-                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model] kind=select_trigger rect=(972,144,456,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted text_color=foreground source=src/app.rs:9823
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].text.0 kind=Text rect=(982,150,414,20) size=(Fill(1.0),Hug) text="loading pod default…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9823
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].icon.1 kind=icon rect=(1402,152,16,16) size=(Fixed(16.0),Fixed(16.0)) icon=chevron-down text_color=muted-foreground source=src/app.rs:9823
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.2 kind=Text rect=(972,184,456,20) size=(Fill(1.0),Hug) text="loading pod default…" wrap=Wrap text_color=muted-foreground source=src/app.rs:9863
-                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1 kind=Group rect=(500,216,928,116) size=(Fill(1.0),Hug) source=src/app.rs:10805
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.0 kind=Text rect=(500,216,928,20) size=(Fill(1.0),Hug) text="Host envs" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10806
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1 kind=form_control rect=(500,244,928,60) size=(Fill(1.0),Hug) source=src/app.rs:10807
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0 kind=Group rect=(500,244,928,60) size=(Hug,Hug) source=src/app.rs:10803
-                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode] kind=toggle_group rect=(500,244,928,32) size=(Hug,Hug) source=src/app.rs:6033
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:inherit] kind=toggle rect=(500,244,64,32) size=(Hug,Fixed(32.0)) surface_role=current text="Inherit" text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:6033
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:custom] kind=toggle rect=(568,244,72,32) size=(Hug,Fixed(32.0)) text="Custom" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:6033
-                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:none] kind=toggle rect=(643,244,56,32) size=(Hug,Fixed(32.0)) text="None" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:6033
-                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.text.1 kind=Text rect=(500,284,928,20) size=(Fill(1.0),Hug) text="Inherits the pod default host envs; fetc…" wrap=Wrap text_color=muted-foreground source=src/app.rs:10787
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.2 kind=Text rect=(500,312,928,20) size=(Fill(1.0),Hug) text="fetching pod config…" wrap=Wrap text_color=muted-foreground source=src/app.rs:10808
-                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2 kind=Group rect=(500,344,928,168) size=(Fill(1.0),Hug) source=src/app.rs:9881
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.text.0 kind=Text rect=(500,344,928,20) size=(Fill(1.0),Hug) text="Message" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9881
-                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1 kind=form_control rect=(500,372,928,140) size=(Fill(1.0),Hug) source=src/app.rs:9881
-                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose] kind=text_area rect=(500,372,928,140) size=(Fill(1.0),Fixed(140.0)) surface_role=input fill=muted source=src/app.rs:9826
-                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0 kind=Scroll rect=(512,380,904,124) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:9826
+          root.group.0.group.0.group.2.group.1.text.1 kind=Text rect=(46,860,193,20) size=(Fill(1.0),Hug) text="connected" text_color=muted-foreground source=src/app.rs:8905
+          root.group.0.group.0.group.2.group.1.text.2 kind=Text rect=(247,860,49,20) size=(Hug,Hug) text="v0.3.30" text_color=muted-foreground source=src/app.rs:8900
+    root.group.0.resize-handle[sidebar:resize] kind=resize-handle rect=(320,0,8,900) size=(Fixed(8.0),Fill(1.0)) source=src/app.rs:4656
+      root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0 kind=resize-handle-hairline rect=(323,0,2,900) size=(Fixed(2.0),Fill(1.0)) fill=border
+    root.group.0.group.2 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9382
+      root.group.0.group.2.group.0 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:10111
+        root.group.0.group.2.group.0.group.0 kind=Group rect=(474,24,980,568) size=(Fixed(980.0),Hug) source=src/app.rs:10111
+          root.group.0.group.2.group.0.group.0.card.0 kind=Card rect=(474,24,980,568) size=(Fixed(980.0),Hug) surface_role=panel fill=card source=src/app.rs:10083
+            root.group.0.group.2.group.0.group.0.card.0.group.0 kind=Group rect=(474,24,980,92) size=(Fill(1.0),Hug) source=src/app.rs:10084
+              root.group.0.group.2.group.0.group.0.card.0.group.0.heading.0 kind=Heading rect=(498,48,932,16) size=(Hug,Hug) text="Start a new conversation" text_role=title text_color=foreground source=src/app.rs:10085
+              root.group.0.group.2.group.0.group.0.card.0.group.0.text.1 kind=Text rect=(498,72,932,20) size=(Fill(1.0),Hug) text="Pick the conversation's main runtime tar…" wrap=Wrap text_color=muted-foreground source=src/app.rs:10086
+            root.group.0.group.2.group.0.group.0.card.0.group.1 kind=Group rect=(474,116,980,420) size=(Fill(1.0),Hug) source=src/app.rs:10091
+              root.group.0.group.2.group.0.group.0.card.0.group.1.group.0 kind=Group rect=(498,116,932,396) size=(Fill(1.0),Hug) source=src/app.rs:10091
+                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0 kind=Group rect=(500,116,928,88) size=(Fill(1.0),Hug) source=src/app.rs:10067
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0 kind=Group rect=(500,116,456,88) size=(Fill(1.0),Hug) source=src/app.rs:10068
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.0 kind=Text rect=(500,116,456,20) size=(Fill(1.0),Hug) text="Backend" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10069
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1 kind=form_control rect=(500,144,456,32) size=(Fill(1.0),Hug) source=src/app.rs:10070
+                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend] kind=select_trigger rect=(500,144,456,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted text_color=foreground source=src/app.rs:10035
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].text.0 kind=Text rect=(510,150,414,20) size=(Fill(1.0),Hug) text="loading pod default…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10035
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].icon.1 kind=icon rect=(930,152,16,16) size=(Fixed(16.0),Fixed(16.0)) icon=chevron-down text_color=muted-foreground source=src/app.rs:10035
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.2 kind=Text rect=(500,184,456,20) size=(Fill(1.0),Hug) text="4 backends configured" wrap=Wrap text_color=muted-foreground source=src/app.rs:10071
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1 kind=Group rect=(972,116,456,88) size=(Fill(1.0),Hug) source=src/app.rs:10073
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.0 kind=Text rect=(972,116,456,20) size=(Fill(1.0),Hug) text="Model" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10074
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1 kind=form_control rect=(972,144,456,32) size=(Fill(1.0),Hug) source=src/app.rs:10075
+                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model] kind=select_trigger rect=(972,144,456,32) size=(Fill(1.0),Fixed(32.0)) surface_role=input fill=muted text_color=foreground source=src/app.rs:10036
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].text.0 kind=Text rect=(982,150,414,20) size=(Fill(1.0),Hug) text="loading pod default…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10036
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].icon.1 kind=icon rect=(1402,152,16,16) size=(Fixed(16.0),Fixed(16.0)) icon=chevron-down text_color=muted-foreground source=src/app.rs:10036
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.2 kind=Text rect=(972,184,456,20) size=(Fill(1.0),Hug) text="loading pod default…" wrap=Wrap text_color=muted-foreground source=src/app.rs:10076
+                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1 kind=Group rect=(500,216,928,116) size=(Fill(1.0),Hug) source=src/app.rs:11048
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.0 kind=Text rect=(500,216,928,20) size=(Fill(1.0),Hug) text="Host envs" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:11049
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1 kind=form_control rect=(500,244,928,60) size=(Fill(1.0),Hug) source=src/app.rs:11050
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0 kind=Group rect=(500,244,928,60) size=(Hug,Hug) source=src/app.rs:11046
+                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0 kind=toggle_group rect=(500,244,928,32) size=(Hug,Hug) source=src/app.rs:6121
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:inherit] kind=toggle rect=(500,244,64,32) size=(Hug,Fixed(32.0)) surface_role=current text="Inherit" text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:6121
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:custom] kind=toggle rect=(568,244,72,32) size=(Hug,Fixed(32.0)) text="Custom" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:6121
+                        root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:none] kind=toggle rect=(643,244,56,32) size=(Hug,Fixed(32.0)) text="None" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:6121
+                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.text.1 kind=Text rect=(500,284,928,20) size=(Fill(1.0),Hug) text="Inherits the pod default host envs; fetc…" wrap=Wrap text_color=muted-foreground source=src/app.rs:11030
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.2 kind=Text rect=(500,312,928,20) size=(Fill(1.0),Hug) text="fetching pod config…" wrap=Wrap text_color=muted-foreground source=src/app.rs:11051
+                root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2 kind=Group rect=(500,344,928,168) size=(Fill(1.0),Hug) source=src/app.rs:10094
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.text.0 kind=Text rect=(500,344,928,20) size=(Fill(1.0),Hug) text="Message" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:10094
+                  root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1 kind=form_control rect=(500,372,928,140) size=(Fill(1.0),Hug) source=src/app.rs:10094
+                    root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose] kind=text_area rect=(500,372,928,140) size=(Fill(1.0),Fixed(140.0)) surface_role=input fill=muted source=src/app.rs:10039
+                      root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0 kind=Scroll rect=(512,380,904,124) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:10039
                         root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0.text_area_content.0 kind=text_area_content rect=(512,380,904,20) size=(Fill(1.0),Hug)
-                          root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0.text_area_content.0.text.0 kind=Text rect=(512,380,904,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:9826
-            root.group.0.group.2.group.0.group.0.card.0.group.2 kind=Group rect=(474,536,980,56) size=(Fill(1.0),Hug) source=src/app.rs:9883
-              root.group.0.group.2.group.0.group.0.card.0.group.2.group.0 kind=Group rect=(498,536,932,32) size=(Fill(1.0),Hug) source=src/app.rs:9846
-                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[new-thread:overrides:open] kind=button rect=(498,536,125,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Edit overrides…" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:9843
-                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.spacer.1 kind=Spacer rect=(631,552,738,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9846
-                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send] kind=button rect=(1377,536,53,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Start" text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:9829
-  root.overlay.1 kind=Overlay rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) clip=true source=src/app.rs:18081
-    root.overlay.1.scrim[settings:dismiss] kind=Scrim rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) fill=overlay-scrim source=src/app.rs:18082
-    root.overlay.1.modal.1 kind=Modal rect=(440,130,720,640) size=(Fixed(720.0),Fixed(640.0)) surface_role=popover clip=true fill=popover source=src/app.rs:18083
-      root.overlay.1.modal.1.group.0 kind=Group rect=(456,146,688,60) size=(Fill(1.0),Hug) source=src/app.rs:18067
-        root.overlay.1.modal.1.group.0.heading.0 kind=Heading rect=(456,146,688,16) size=(Hug,Hug) text="Server settings" text_role=title text_color=foreground source=src/app.rs:18068
-        root.overlay.1.modal.1.group.0.text.1 kind=Text rect=(456,166,688,40) size=(Fill(1.0),Hug) text="LLM backends, host-env daemons, Shared M…" wrap=Wrap text_color=muted-foreground source=src/app.rs:18069
-      root.overlay.1.modal.1.tabs_list.1 kind=tabs_list rect=(456,222,688,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:18034
-        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:backends] kind=tab_trigger rect=(460,226,167,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="LLM backends" text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:18034
-        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:host-env] kind=tab_trigger rect=(631,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Host env" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18034
-        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:shared-mcp] kind=tab_trigger rect=(802,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Shared MCP" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18034
-        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:server-config] kind=tab_trigger rect=(973,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Server config" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18034
-      root.overlay.1.modal.1.group.2 kind=Group rect=(456,278,688,428) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:18182
-        root.overlay.1.modal.1.group.2.scroll.0 kind=Scroll rect=(456,278,688,428) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:18177
-          root.overlay.1.modal.1.group.2.scroll.0.card.0 kind=Card rect=(456,278,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18170
-            root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0 kind=Group rect=(472,294,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18139
-              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0.text.0 kind=Text rect=(472,294,588,20) size=(Fill(1.0),Hug) text="anthropic-prod" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18140
-              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0.text.1 kind=Text rect=(1068,296,60,16) size=(Hug,Hug) text="· anthropic" text_role=caption text_color=muted-foreground source=src/app.rs:18145
-            root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1 kind=Group rect=(472,318,656,16) size=(Hug,Hug) source=src/app.rs:18136
-              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1.text.0 kind=Text rect=(472,318,143,16) size=(Hug,Hug) text="default: claude-opus-4-7" text_role=caption text_color=muted-foreground source=src/app.rs:18126
-              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1.text.1 kind=Text rect=(627,318,74,16) size=(Hug,Hug) text="auth: api_key" text_role=caption text_color=muted-foreground source=src/app.rs:18129
-          root.overlay.1.modal.1.group.2.scroll.0.card.1 kind=Card rect=(456,358,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18170
-            root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0 kind=Group rect=(472,374,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18139
-              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0.text.0 kind=Text rect=(472,374,573,20) size=(Fill(1.0),Hug) text="openai-team" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18140
-              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0.text.1 kind=Text rect=(1053,376,75,16) size=(Hug,Hug) text="· openai_chat" text_role=caption text_color=muted-foreground source=src/app.rs:18145
-            root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1 kind=Group rect=(472,398,656,16) size=(Hug,Hug) source=src/app.rs:18136
-              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1.text.0 kind=Text rect=(472,398,77,16) size=(Hug,Hug) text="default: gpt-5" text_role=caption text_color=muted-foreground source=src/app.rs:18126
-              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1.text.1 kind=Text rect=(561,398,74,16) size=(Hug,Hug) text="auth: api_key" text_role=caption text_color=muted-foreground source=src/app.rs:18129
-          root.overlay.1.modal.1.group.2.scroll.0.card.2 kind=Card rect=(456,438,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18170
-            root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0 kind=Group rect=(472,454,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18139
-              root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0.text.0 kind=Text rect=(472,454,573,20) size=(Fill(1.0),Hug) text="local-llama" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18140
-              root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0.text.1 kind=Text rect=(1053,456,75,16) size=(Hug,Hug) text="· openai_chat" text_role=caption text_color=muted-foreground source=src/app.rs:18145
-            root.overlay.1.modal.1.group.2.scroll.0.card.2.text.1 kind=Text rect=(472,478,656,16) size=(Hug,Hug) text="(no default model / auth mode declared)" text_role=caption text_color=muted-foreground source=src/app.rs:18132
-          root.overlay.1.modal.1.group.2.scroll.0.card.3 kind=Card rect=(456,518,688,108) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18170
-            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0 kind=Group rect=(472,534,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18139
-              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0.text.0 kind=Text rect=(472,534,523,20) size=(Fill(1.0),Hug) text="codex" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18140
-              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0.text.1 kind=Text rect=(1003,536,125,16) size=(Hug,Hug) text="· chatgpt_subscription" text_role=caption text_color=muted-foreground source=src/app.rs:18145
-            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1 kind=Group rect=(472,558,656,16) size=(Hug,Hug) source=src/app.rs:18136
-              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1.text.0 kind=Text rect=(472,558,118,16) size=(Hug,Hug) text="default: gpt-5-codex" text_role=caption text_color=muted-foreground source=src/app.rs:18126
-              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1.text.1 kind=Text rect=(602,558,84,16) size=(Hug,Hug) text="auth: auth.json" text_role=caption text_color=muted-foreground source=src/app.rs:18129
-            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.2 kind=Group rect=(472,578,656,32) size=(Hug,Hug) source=src/app.rs:18157
-              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.2.button[settings:codex-rotate:open:codex] kind=button rect=(474,578,141,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Rotate credentials" text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:18157
-      root.overlay.1.modal.1.group.3 kind=Group rect=(456,722,688,32) size=(Fill(1.0),Hug) source=src/app.rs:18078
-        root.overlay.1.modal.1.group.3.button[settings:close] kind=button rect=(1086,722,58,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Close" text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:18064
-  root.overlay.2 kind=Overlay rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) clip=true source=src/app.rs:18558
-    root.overlay.2.scrim[settings:codex-rotate:dismiss] kind=Scrim rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) fill=overlay-scrim source=src/app.rs:18559
-    root.overlay.2.modal.1 kind=Modal rect=(520,240,560,420) size=(Fixed(560.0),Fixed(420.0)) surface_role=popover clip=true fill=popover source=src/app.rs:18560
-      root.overlay.2.modal.1.group.0 kind=Group rect=(536,256,528,100) size=(Fill(1.0),Hug) source=src/app.rs:18535
-        root.overlay.2.modal.1.group.0.heading.0 kind=Heading rect=(536,256,528,16) size=(Hug,Hug) text="Rotate Codex credentials — codex" text_role=title text_color=foreground source=src/app.rs:18536
-        root.overlay.2.modal.1.group.0.text.1 kind=Text rect=(536,276,528,80) size=(Fill(1.0),Hug) text="Paste the full contents of a working ~/.…" wrap=Wrap text_color=muted-foreground source=src/app.rs:18537
-      root.overlay.2.modal.1.text_area[settings:codex-rotate:body] kind=text_area rect=(536,372,528,224) size=(Fill(1.0),Fill(1.0)) surface_role=input fill=muted source=src/app.rs:18514
-        root.overlay.2.modal.1.text_area[settings:codex-rotate:body].scroll.0 kind=Scroll rect=(548,380,504,208) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:18514
+                          root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0.text_area_content.0.text.0 kind=Text rect=(512,380,904,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:10039
+            root.group.0.group.2.group.0.group.0.card.0.group.2 kind=Group rect=(474,536,980,56) size=(Fill(1.0),Hug) source=src/app.rs:10096
+              root.group.0.group.2.group.0.group.0.card.0.group.2.group.0 kind=Group rect=(498,536,932,32) size=(Fill(1.0),Hug) source=src/app.rs:10059
+                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[new-thread:overrides:open] kind=button rect=(498,536,125,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Edit overrides…" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:10056
+                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.spacer.1 kind=Spacer rect=(631,552,738,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:10059
+                root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send] kind=button rect=(1377,536,53,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Start" overflow=Ellipsis text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:10042
+  root.overlay.1 kind=Overlay rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) clip=true source=src/app.rs:18781
+    root.overlay.1.scrim[settings:dismiss] kind=Scrim rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) fill=overlay-scrim source=src/app.rs:18782
+    root.overlay.1.modal.1 kind=Modal rect=(440,130,720,640) size=(Fixed(720.0),Fixed(640.0)) surface_role=popover clip=true fill=popover source=src/app.rs:18783
+      root.overlay.1.modal.1.group.0 kind=Group rect=(456,146,688,60) size=(Fill(1.0),Hug) source=src/app.rs:18767
+        root.overlay.1.modal.1.group.0.heading.0 kind=Heading rect=(456,146,688,16) size=(Hug,Hug) text="Server settings" text_role=title text_color=foreground source=src/app.rs:18768
+        root.overlay.1.modal.1.group.0.text.1 kind=Text rect=(456,166,688,40) size=(Fill(1.0),Hug) text="LLM backends, host-env daemons, Shared M…" wrap=Wrap text_color=muted-foreground source=src/app.rs:18769
+      root.overlay.1.modal.1.tabs_list.1 kind=tabs_list rect=(456,222,688,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:18734
+        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:backends] kind=tab_trigger rect=(460,226,167,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="LLM backends" overflow=Ellipsis text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:18734
+        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:host-env] kind=tab_trigger rect=(631,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Host env" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18734
+        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:shared-mcp] kind=tab_trigger rect=(802,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Shared MCP" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18734
+        root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:server-config] kind=tab_trigger rect=(973,226,167,32) size=(Fill(1.0),Fixed(32.0)) text="Server config" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:18734
+      root.overlay.1.modal.1.group.2 kind=Group rect=(456,278,688,428) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:18882
+        root.overlay.1.modal.1.group.2.scroll.0 kind=Scroll rect=(456,278,688,428) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:18877
+          root.overlay.1.modal.1.group.2.scroll.0.card.0 kind=Card rect=(456,278,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18870
+            root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0 kind=Group rect=(472,294,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18839
+              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0.text.0 kind=Text rect=(472,294,588,20) size=(Fill(1.0),Hug) text="anthropic-prod" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18840
+              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.0.text.1 kind=Text rect=(1068,296,60,16) size=(Hug,Hug) text="· anthropic" text_role=caption text_color=muted-foreground source=src/app.rs:18845
+            root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1 kind=Group rect=(472,318,656,16) size=(Hug,Hug) source=src/app.rs:18836
+              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1.text.0 kind=Text rect=(472,318,143,16) size=(Hug,Hug) text="default: claude-opus-4-7" text_role=caption text_color=muted-foreground source=src/app.rs:18826
+              root.overlay.1.modal.1.group.2.scroll.0.card.0.group.1.text.1 kind=Text rect=(627,318,74,16) size=(Hug,Hug) text="auth: api_key" text_role=caption text_color=muted-foreground source=src/app.rs:18829
+          root.overlay.1.modal.1.group.2.scroll.0.card.1 kind=Card rect=(456,358,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18870
+            root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0 kind=Group rect=(472,374,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18839
+              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0.text.0 kind=Text rect=(472,374,573,20) size=(Fill(1.0),Hug) text="openai-team" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18840
+              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.0.text.1 kind=Text rect=(1053,376,75,16) size=(Hug,Hug) text="· openai_chat" text_role=caption text_color=muted-foreground source=src/app.rs:18845
+            root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1 kind=Group rect=(472,398,656,16) size=(Hug,Hug) source=src/app.rs:18836
+              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1.text.0 kind=Text rect=(472,398,77,16) size=(Hug,Hug) text="default: gpt-5" text_role=caption text_color=muted-foreground source=src/app.rs:18826
+              root.overlay.1.modal.1.group.2.scroll.0.card.1.group.1.text.1 kind=Text rect=(561,398,74,16) size=(Hug,Hug) text="auth: api_key" text_role=caption text_color=muted-foreground source=src/app.rs:18829
+          root.overlay.1.modal.1.group.2.scroll.0.card.2 kind=Card rect=(456,438,688,72) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18870
+            root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0 kind=Group rect=(472,454,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18839
+              root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0.text.0 kind=Text rect=(472,454,573,20) size=(Fill(1.0),Hug) text="local-llama" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18840
+              root.overlay.1.modal.1.group.2.scroll.0.card.2.group.0.text.1 kind=Text rect=(1053,456,75,16) size=(Hug,Hug) text="· openai_chat" text_role=caption text_color=muted-foreground source=src/app.rs:18845
+            root.overlay.1.modal.1.group.2.scroll.0.card.2.text.1 kind=Text rect=(472,478,656,16) size=(Hug,Hug) text="(no default model / auth mode declared)" text_role=caption text_color=muted-foreground source=src/app.rs:18832
+          root.overlay.1.modal.1.group.2.scroll.0.card.3 kind=Card rect=(456,518,688,108) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:18870
+            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0 kind=Group rect=(472,534,656,20) size=(Fill(1.0),Hug) source=src/app.rs:18839
+              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0.text.0 kind=Text rect=(472,534,523,20) size=(Fill(1.0),Hug) text="codex" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:18840
+              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.0.text.1 kind=Text rect=(1003,536,125,16) size=(Hug,Hug) text="· chatgpt_subscription" text_role=caption text_color=muted-foreground source=src/app.rs:18845
+            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1 kind=Group rect=(472,558,656,16) size=(Hug,Hug) source=src/app.rs:18836
+              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1.text.0 kind=Text rect=(472,558,118,16) size=(Hug,Hug) text="default: gpt-5-codex" text_role=caption text_color=muted-foreground source=src/app.rs:18826
+              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.1.text.1 kind=Text rect=(602,558,84,16) size=(Hug,Hug) text="auth: auth.json" text_role=caption text_color=muted-foreground source=src/app.rs:18829
+            root.overlay.1.modal.1.group.2.scroll.0.card.3.group.2 kind=Group rect=(472,578,656,32) size=(Hug,Hug) source=src/app.rs:18857
+              root.overlay.1.modal.1.group.2.scroll.0.card.3.group.2.button[settings:codex-rotate:open:codex] kind=button rect=(474,578,141,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Rotate credentials" overflow=Ellipsis text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:18857
+      root.overlay.1.modal.1.group.3 kind=Group rect=(456,722,688,32) size=(Fill(1.0),Hug) source=src/app.rs:18778
+        root.overlay.1.modal.1.group.3.button[settings:close] kind=button rect=(1086,722,58,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Close" overflow=Ellipsis text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:18764
+  root.overlay.2 kind=Overlay rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) clip=true source=src/app.rs:19263
+    root.overlay.2.scrim[settings:codex-rotate:dismiss] kind=Scrim rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) fill=overlay-scrim source=src/app.rs:19264
+    root.overlay.2.modal.1 kind=Modal rect=(520,240,560,420) size=(Fixed(560.0),Fixed(420.0)) surface_role=popover clip=true fill=popover source=src/app.rs:19265
+      root.overlay.2.modal.1.group.0 kind=Group rect=(536,256,528,100) size=(Fill(1.0),Hug) source=src/app.rs:19240
+        root.overlay.2.modal.1.group.0.heading.0 kind=Heading rect=(536,256,528,16) size=(Hug,Hug) text="Rotate Codex credentials — codex" text_role=title text_color=foreground source=src/app.rs:19241
+        root.overlay.2.modal.1.group.0.text.1 kind=Text rect=(536,276,528,80) size=(Fill(1.0),Hug) text="Paste the full contents of a working ~/.…" wrap=Wrap text_color=muted-foreground source=src/app.rs:19242
+      root.overlay.2.modal.1.text_area[settings:codex-rotate:body] kind=text_area rect=(536,372,528,224) size=(Fill(1.0),Fill(1.0)) surface_role=input fill=muted source=src/app.rs:19219
+        root.overlay.2.modal.1.text_area[settings:codex-rotate:body].scroll.0 kind=Scroll rect=(548,380,504,208) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:19219
           root.overlay.2.modal.1.text_area[settings:codex-rotate:body].scroll.0.text_area_content.0 kind=text_area_content rect=(548,380,504,20) size=(Fill(1.0),Hug)
-            root.overlay.2.modal.1.text_area[settings:codex-rotate:body].scroll.0.text_area_content.0.text.0 kind=Text rect=(548,380,504,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:18514
-      root.overlay.2.modal.1.group.2 kind=Group rect=(536,612,528,32) size=(Fill(1.0),Hug) source=src/app.rs:18556
-        root.overlay.2.modal.1.group.2.button[settings:codex-rotate:cancel] kind=button rect=(936,612,66,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Cancel" text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:18529
-        root.overlay.2.modal.1.group.2.button[settings:codex-rotate:save] kind=button rect=(1011,612,53,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Save" text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:18523
+            root.overlay.2.modal.1.text_area[settings:codex-rotate:body].scroll.0.text_area_content.0.text.0 kind=Text rect=(548,380,504,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:19219
+      root.overlay.2.modal.1.group.2 kind=Group rect=(536,612,528,32) size=(Fill(1.0),Hug) source=src/app.rs:19261
+        root.overlay.2.modal.1.group.2.button[settings:codex-rotate:cancel] kind=button rect=(936,612,66,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Cancel" overflow=Ellipsis text_role=label text_align=Center fill=secondary text_color=secondary-foreground source=src/app.rs:19234
+        root.overlay.2.modal.1.group.2.button[settings:codex-rotate:save] kind=button rect=(1011,612,53,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Save" overflow=Ellipsis text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:19228

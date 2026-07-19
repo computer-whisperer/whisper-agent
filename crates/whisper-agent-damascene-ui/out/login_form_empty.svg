@@ -1,22 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
 <defs>
-  <filter id="shadow-sm" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+  <filter id="shadow-xs" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.05"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-sm" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-md" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
     <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
     <feOffset dx="0" dy="2"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.20"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
-  <filter id="shadow-md" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
-    <feOffset dx="0" dy="6"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-  <filter id="shadow-lg" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
-    <feOffset dx="0" dy="12"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  <filter id="shadow-lg" x="-60%" y="-60%" width="220%" height="260%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="7.5"/>
+    <feOffset dx="0" dy="10"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
 </defs>
 <rect width="100%" height="100%" fill="#09090b"/>
@@ -24,14 +39,14 @@
 <text data-node="root.card.0.group.0.heading.0" data-shader="stock::text" x="604.00" y="61.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">whisper-agent</text>
 <text data-node="root.card.0.group.0.text.1" data-shader="stock::text" x="604.00" y="87.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Sign in to a whisper-agent server</text>
 <text data-node="root.card.0.group.1.group.0.group.0.text.0" data-shader="stock::text" x="606.00" y="131.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Server URL</text>
-<rect data-node="root.card.0.group.1.group.0.group.0.form_control.1.text_input[login:server]" data-shader="stock::rounded_rect" x="606.00" y="144.00" width="388.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.card.0.group.1.group.0.group.0.form_control.1.text_input[login:server]" data-shader="stock::rounded_rect" x="606.00" y="144.00" width="388.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.card.0.group.1.group.0.group.0.text.2" data-shader="stock::text" x="606.00" y="199.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">e.g. https://host:port — http://127.0.0.1:8080 for loopback</text>
 <text data-node="root.card.0.group.1.group.0.group.1.text.0" data-shader="stock::text" x="606.00" y="231.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Client token</text>
-<rect data-node="root.card.0.group.1.group.0.group.1.form_control.1.text_input[login:token]" data-shader="stock::rounded_rect" x="606.00" y="244.00" width="388.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.card.0.group.1.group.0.group.1.form_control.1.text_input[login:token]" data-shader="stock::rounded_rect" x="606.00" y="244.00" width="388.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.card.0.group.1.group.0.group.1.text.2" data-shader="stock::text" x="606.00" y="299.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">blank is OK for loopback servers</text>
 <rect data-node="root.card.0.group.1.group.0.group.2.form_control.0.group.0.checkbox[login:remember]" data-shader="stock::rounded_rect" x="606.00" y="318.00" width="16.00" height="16.00" rx="4.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" />
 <svg data-node="root.card.0.group.1.group.0.group.2.form_control.0.group.0.checkbox[login:remember].icon.0" data-icon="check" x="608.00" y="320.00" width="12.00" height="12.00" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="5.00" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
 <text data-node="root.card.0.group.1.group.0.group.2.form_control.0.group.0.text.1" data-shader="stock::text" x="630.00" y="331.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">Remember on this device</text>
-<rect data-node="root.card.0.group.2.group.0.button[login:connect]" data-shader="stock::rounded_rect" x="918.65" y="360.00" width="77.35" height="32.00" rx="6.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.card.0.group.2.group.0.button[login:connect]" data-shader="stock::rounded_rect" x="918.65" y="360.00" width="77.35" height="32.00" rx="6.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" filter="url(#shadow-xs)" />
 <text data-node="root.card.0.group.2.group.0.button[login:connect]" data-shader="stock::text" x="957.33" y="381.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#ffffff" text-anchor="middle">Connect</text>
 </svg>

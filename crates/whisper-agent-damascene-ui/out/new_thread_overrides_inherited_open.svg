@@ -1,22 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
 <defs>
-  <filter id="shadow-sm" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+  <filter id="shadow-xs" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.05"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-sm" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-md" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
     <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
     <feOffset dx="0" dy="2"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.20"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
-  <filter id="shadow-md" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
-    <feOffset dx="0" dy="6"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-  <filter id="shadow-lg" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
-    <feOffset dx="0" dy="12"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  <filter id="shadow-lg" x="-60%" y="-60%" width="220%" height="260%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="7.5"/>
+    <feOffset dx="0" dy="10"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
 </defs>
 <rect width="100%" height="100%" fill="#09090b"/>
@@ -48,22 +63,22 @@
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files]" data-icon="folder" x="241.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings]" data-icon="settings" x="281.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <clipPath id="clip-6"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-6)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="284.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="272.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
 </g>
 <clipPath id="clip-7"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-7)">
-<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 154.00 A 4.00 4.00 0 0 1 158.00 88.00 V 112.00 A 4.00 4.00 0 0 1 154.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 148.00 A 4.00 4.00 0 0 1 152.00 88.00 V 112.00 A 4.00 4.00 0 0 1 148.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-8"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-8)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="90.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="87.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
 </g>
 <clipPath id="clip-9"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-9)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="230.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="221.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
 </g>
 <clipPath id="clip-10"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-10)">
 <text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0" data-shader="stock::text" x="26.00" y="162.37" font-family="Inter Variable" font-size="12.00" font-weight="600" fill="#b0b4ba" text-anchor="start">Threads (0)</text>
 </g>
 <clipPath id="clip-11"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-11)">
-<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="271.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="259.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
 </g>
 <clipPath id="clip-12"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-12)">
 <svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.1.group.0.icon.0" data-icon="custom" x="26.00" y="190.00" width="16.00" height="16.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
@@ -85,35 +100,35 @@
 <svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings]" data-icon="settings" x="273.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <rect data-node="root.group.0.group.0.group.2.group.1.group.0.status-dot.0" data-shader="stock::rounded_rect" x="27.00" y="866.00" width="8.00" height="8.00" rx="4.00" fill="#30a46c" />
 <text data-node="root.group.0.group.0.group.2.group.1.text.1" data-shader="stock::text" x="46.00" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">connected</text>
-<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.26" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.20</text>
-<rect data-node="root.group.0.group[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
+<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.53" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.30</text>
+<rect data-node="root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
 <rect data-node="root.group.0.group.2.group.0.group.0.card.0" data-shader="stock::rounded_rect" x="474.00" y="24.00" width="980.00" height="568.00" rx="12.00" fill="#18191b" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.0.heading.0" data-shader="stock::text" x="498.00" y="61.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">Start a new conversation</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.0.text.1" data-shader="stock::text" x="498.00" y="87.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Pick the conversation's main runtime target. Empty pickers fall through to the active pod's defaults.</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.0" data-shader="stock::text" x="500.00" y="131.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Backend</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="500.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="500.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].text.0" data-shader="stock::text" x="510.00" y="165.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">anthropic-prod</text>
 <svg data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].icon.1" data-icon="chevron-down" x="930.00" y="152.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.2" data-shader="stock::text" x="500.00" y="199.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">using pod default</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.0" data-shader="stock::text" x="972.00" y="131.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Model</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="972.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="972.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].text.0" data-shader="stock::text" x="982.00" y="165.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">claude-opus-4-7</text>
 <svg data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].icon.1" data-icon="chevron-down" x="1402.00" y="152.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.2" data-shader="stock::text" x="972.00" y="199.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">using pod default</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.0" data-shader="stock::text" x="500.00" y="231.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Host envs</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="500.00" y="244.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::text" x="531.77" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:custom]" data-shader="stock::text" x="603.42" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Custom</text>
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:none]" data-shader="stock::text" x="671.14" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">None</text>
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="500.00" y="244.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::text" x="531.77" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:custom]" data-shader="stock::text" x="603.42" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Custom</text>
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:none]" data-shader="stock::text" x="671.14" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">None</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.text.1" data-shader="stock::text" x="500.00" y="299.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Inherits: main</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.2" data-shader="stock::text" x="500.00" y="327.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">2 envs allowed by the active pod</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.text.0" data-shader="stock::text" x="500.00" y="359.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Message</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose]" data-shader="stock::rounded_rect" x="500.00" y="372.00" width="928.00" height="140.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose]" data-shader="stock::rounded_rect" x="500.00" y="372.00" width="928.00" height="140.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <clipPath id="clip-44"><rect x="512.00" y="380.00" width="904.00" height="124.00"/></clipPath><g clip-path="url(#clip-44)">
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="512.00" y="390.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start"></text>
 </g>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[new-thread:overrides:open]" data-shader="stock::text" x="560.56" y="557.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Edit overrides…</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::rounded_rect" x="1377.09" y="536.00" width="52.91" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::rounded_rect" x="1377.09" y="536.00" width="52.91" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-xs)" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::text" x="1403.55" y="557.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="rgba(255,255,255,0.502)" text-anchor="middle">Start</text>
 <clipPath id="clip-48"><rect x="0.00" y="0.00" width="1600.00" height="900.00"/></clipPath><g clip-path="url(#clip-48)">
 <rect data-node="root.overlay.1.scrim[new-thread:overrides:close]" data-shader="stock::rounded_rect" x="0.00" y="0.00" width="1600.00" height="900.00" rx="0.00" fill="rgba(0,0,0,0.800)" />
@@ -137,13 +152,13 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.text.0" data-shader="stock::text" x="260.00" y="213.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">backend</text>
 </g>
 <clipPath id="clip-55"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-55)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="260.00" y="226.00" width="520.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="260.00" y="226.00" width="514.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-56"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-56)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.form_control.1.select_trigger[picker:backend].text.0" data-shader="stock::text" x="270.00" y="247.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">anthropic-prod</text>
 </g>
 <clipPath id="clip-57"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-57)">
-<svg data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.form_control.1.select_trigger[picker:backend].icon.1" data-icon="chevron-down" x="754.00" y="234.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+<svg data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.form_control.1.select_trigger[picker:backend].icon.1" data-icon="chevron-down" x="748.00" y="234.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 </g>
 <clipPath id="clip-58"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-58)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.0.text.2" data-shader="stock::text" x="260.00" y="281.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">using pod default</text>
@@ -152,13 +167,13 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.text.0" data-shader="stock::text" x="260.00" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">model</text>
 </g>
 <clipPath id="clip-60"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-60)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="260.00" y="326.00" width="520.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="260.00" y="326.00" width="514.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-61"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-61)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.form_control.1.select_trigger[picker:model].text.0" data-shader="stock::text" x="270.00" y="347.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">claude-opus-4-7</text>
 </g>
 <clipPath id="clip-62"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-62)">
-<svg data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.form_control.1.select_trigger[picker:model].icon.1" data-icon="chevron-down" x="754.00" y="334.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+<svg data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.form_control.1.select_trigger[picker:model].icon.1" data-icon="chevron-down" x="748.00" y="334.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 </g>
 <clipPath id="clip-63"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-63)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="260.00" y="381.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">using pod default</text>
@@ -167,16 +182,16 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.text.0" data-shader="stock::text" x="260.00" y="413.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">system prompt</text>
 </g>
 <clipPath id="clip-65"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-65)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group[new-thread:overrides:system-prompt:mode].toggle[new-thread:overrides:system-prompt:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="260.00" y="426.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group.0.toggle[new-thread:overrides:system-prompt:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="260.00" y="426.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-66"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-66)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group[new-thread:overrides:system-prompt:mode].toggle[new-thread:overrides:system-prompt:mode:toggle:inherit]" data-shader="stock::text" x="291.77" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group.0.toggle[new-thread:overrides:system-prompt:mode:toggle:inherit]" data-shader="stock::text" x="291.77" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
 </g>
 <clipPath id="clip-67"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-67)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group[new-thread:overrides:system-prompt:mode].toggle[new-thread:overrides:system-prompt:mode:toggle:file]" data-shader="stock::text" x="362.73" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Pod file</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group.0.toggle[new-thread:overrides:system-prompt:mode:toggle:file]" data-shader="stock::text" x="362.73" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Pod file</text>
 </g>
 <clipPath id="clip-68"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-68)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group[new-thread:overrides:system-prompt:mode].toggle[new-thread:overrides:system-prompt:mode:toggle:text]" data-shader="stock::text" x="444.43" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Inline text</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.form_control.1.toggle_group.0.toggle[new-thread:overrides:system-prompt:mode:toggle:text]" data-shader="stock::text" x="444.43" y="447.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Inline text</text>
 </g>
 <clipPath id="clip-69"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-69)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.2.text.2" data-shader="stock::text" x="260.00" y="481.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Inherit the pod prompt, read a different pod file, or seed inline text.</text>
@@ -188,10 +203,10 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.form_control.1.group.0.text.0" data-shader="stock::text" x="260.00" y="547.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Inherits pod default: 16384</text>
 </g>
 <clipPath id="clip-72"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-72)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.form_control.1.group.0.button[new-thread:overrides:max-tokens:override]" data-shader="stock::rounded_rect" x="701.74" y="526.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.form_control.1.group.0.button[new-thread:overrides:max-tokens:override]" data-shader="stock::rounded_rect" x="695.74" y="526.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-73"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-73)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.form_control.1.group.0.button[new-thread:overrides:max-tokens:override]" data-shader="stock::text" x="740.87" y="547.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.form_control.1.group.0.button[new-thread:overrides:max-tokens:override]" data-shader="stock::text" x="734.87" y="547.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-74"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-74)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.3.text.2" data-shader="stock::text" x="260.00" y="581.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Per-response output cap for this thread.</text>
@@ -203,10 +218,10 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.form_control.1.group.0.text.0" data-shader="stock::text" x="260.00" y="647.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Inherits pod default: 30</text>
 </g>
 <clipPath id="clip-77"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-77)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.form_control.1.group.0.button[new-thread:overrides:max-turns:override]" data-shader="stock::rounded_rect" x="701.74" y="626.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.form_control.1.group.0.button[new-thread:overrides:max-turns:override]" data-shader="stock::rounded_rect" x="695.74" y="626.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-78"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-78)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.form_control.1.group.0.button[new-thread:overrides:max-turns:override]" data-shader="stock::text" x="740.87" y="647.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.form_control.1.group.0.button[new-thread:overrides:max-turns:override]" data-shader="stock::text" x="734.87" y="647.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-79"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-79)">
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.0.group.2.group.4.text.2" data-shader="stock::text" x="260.00" y="681.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Per-cycle assistant-turn cap for this thread.</text>
@@ -219,88 +234,88 @@
 <text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.1.text.1" data-shader="stock::text" x="258.00" y="769.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">creation.</text>
 </g>
 <clipPath id="clip-82"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-82)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.2.group.2.group.0.form_control.1.group.0.toggle_group[picker:mcp-hosts:mode].toggle[picker:mcp-hosts:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="260.00" y="906.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.2.group.2.group.0.form_control.1.group.0.toggle_group.0.toggle[picker:mcp-hosts:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="260.00" y="906.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-83"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-83)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.3.group.2.button[new-thread:overrides:compaction:override]" data-shader="stock::rounded_rect" x="703.74" y="1070.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.0.group.3.group.2.button[new-thread:overrides:compaction:override]" data-shader="stock::rounded_rect" x="697.74" y="1070.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-84"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-84)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.0" data-shader="stock::text" x="806.00" y="157.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Knowledge Access</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.0" data-shader="stock::text" x="800.00" y="157.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Knowledge Access</text>
 </g>
 <clipPath id="clip-85"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-85)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.1" data-shader="stock::text" x="806.00" y="185.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override which in-scope knowledge buckets manual tools and autoquery may</text>
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.1" data-shader="stock::text" x="806.00" y="205.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">reach.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.1" data-shader="stock::text" x="800.00" y="185.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override which in-scope knowledge buckets manual tools and autoquery may</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.text.1" data-shader="stock::text" x="800.00" y="205.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">reach.</text>
 </g>
 <clipPath id="clip-86"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-86)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.text.0" data-shader="stock::text" x="806.00" y="239.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using all pod-visible knowledge buckets.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.text.0" data-shader="stock::text" x="800.00" y="239.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using all pod-visible knowledge buckets.</text>
 </g>
 <clipPath id="clip-87"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-87)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.button[new-thread:overrides:knowledge-buckets:override]" data-shader="stock::rounded_rect" x="1251.74" y="218.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.button[new-thread:overrides:knowledge-buckets:override]" data-shader="stock::rounded_rect" x="1239.74" y="218.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-88"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-88)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.button[new-thread:overrides:knowledge-buckets:override]" data-shader="stock::text" x="1290.87" y="239.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.0.group.2.button[new-thread:overrides:knowledge-buckets:override]" data-shader="stock::text" x="1278.87" y="239.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-89"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-89)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.0" data-shader="stock::text" x="806.00" y="285.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Knowledge Autoquery</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.0" data-shader="stock::text" x="800.00" y="285.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Knowledge Autoquery</text>
 </g>
 <clipPath id="clip-90"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-90)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.1" data-shader="stock::text" x="806.00" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Per-thread automatic retrieval targets inside the selected pod's in-scope</text>
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.1" data-shader="stock::text" x="806.00" y="333.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">buckets.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.1" data-shader="stock::text" x="800.00" y="313.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Per-thread automatic retrieval targets inside the selected pod's in-scope</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.text.1" data-shader="stock::text" x="800.00" y="333.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">buckets.</text>
 </g>
 <clipPath id="clip-91"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-91)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.text.0" data-shader="stock::text" x="806.00" y="367.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod autoquery defaults.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.text.0" data-shader="stock::text" x="800.00" y="367.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod autoquery defaults.</text>
 </g>
 <clipPath id="clip-92"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-92)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.button[new-thread:overrides:autoquery:override]" data-shader="stock::rounded_rect" x="1251.74" y="346.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.button[new-thread:overrides:autoquery:override]" data-shader="stock::rounded_rect" x="1239.74" y="346.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-93"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-93)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.button[new-thread:overrides:autoquery:override]" data-shader="stock::text" x="1290.87" y="367.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.1.group.2.button[new-thread:overrides:autoquery:override]" data-shader="stock::text" x="1278.87" y="367.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-94"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-94)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.0" data-shader="stock::text" x="806.00" y="413.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Builtin Tools</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.0" data-shader="stock::text" x="800.00" y="413.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Builtin Tools</text>
 </g>
 <clipPath id="clip-95"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-95)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.1" data-shader="stock::text" x="806.00" y="441.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Narrow availability for internal builtins that are otherwise inherited from the</text>
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.1" data-shader="stock::text" x="806.00" y="461.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">pod.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.1" data-shader="stock::text" x="800.00" y="441.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Narrow availability for internal builtins that are otherwise inherited from the</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.text.1" data-shader="stock::text" x="800.00" y="461.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">pod.</text>
 </g>
 <clipPath id="clip-96"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-96)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.text.0" data-shader="stock::text" x="806.00" y="495.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod tool availability.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.text.0" data-shader="stock::text" x="800.00" y="495.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod tool availability.</text>
 </g>
 <clipPath id="clip-97"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-97)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.button[new-thread:overrides:tools:override]" data-shader="stock::rounded_rect" x="1251.74" y="474.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.button[new-thread:overrides:tools:override]" data-shader="stock::rounded_rect" x="1239.74" y="474.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-98"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-98)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.button[new-thread:overrides:tools:override]" data-shader="stock::text" x="1290.87" y="495.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.2.group.2.button[new-thread:overrides:tools:override]" data-shader="stock::text" x="1278.87" y="495.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-99"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-99)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.text.0" data-shader="stock::text" x="806.00" y="541.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Capability Caps</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.text.0" data-shader="stock::text" x="800.00" y="541.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Capability Caps</text>
 </g>
 <clipPath id="clip-100"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-100)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.text.1" data-shader="stock::text" x="806.00" y="569.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override the thread's starting typed caps, bounded by the pod allow ceiling.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.text.1" data-shader="stock::text" x="800.00" y="569.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override the thread's starting typed caps, bounded by the pod allow ceiling.</text>
 </g>
 <clipPath id="clip-101"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-101)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.text.0" data-shader="stock::text" x="806.00" y="603.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod starting caps.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.text.0" data-shader="stock::text" x="800.00" y="603.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod starting caps.</text>
 </g>
 <clipPath id="clip-102"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-102)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.button[new-thread:overrides:caps:override]" data-shader="stock::rounded_rect" x="1251.74" y="582.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.button[new-thread:overrides:caps:override]" data-shader="stock::rounded_rect" x="1239.74" y="582.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-103"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-103)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.button[new-thread:overrides:caps:override]" data-shader="stock::text" x="1290.87" y="603.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.3.group.2.button[new-thread:overrides:caps:override]" data-shader="stock::text" x="1278.87" y="603.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-104"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-104)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.text.0" data-shader="stock::text" x="806.00" y="649.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Tool Surface</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.text.0" data-shader="stock::text" x="800.00" y="649.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">Tool Surface</text>
 </g>
 <clipPath id="clip-105"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-105)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.text.1" data-shader="stock::text" x="806.00" y="677.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override how this thread presents and discovers tools.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.text.1" data-shader="stock::text" x="800.00" y="677.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Override how this thread presents and discovers tools.</text>
 </g>
 <clipPath id="clip-106"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-106)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.text.0" data-shader="stock::text" x="806.00" y="711.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod tool surface.</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.text.0" data-shader="stock::text" x="800.00" y="711.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Using pod tool surface.</text>
 </g>
 <clipPath id="clip-107"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-107)">
-<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.button[new-thread:overrides:tool-surface:override]" data-shader="stock::rounded_rect" x="1251.74" y="690.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.button[new-thread:overrides:tool-surface:override]" data-shader="stock::rounded_rect" x="1239.74" y="690.00" width="78.26" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-108"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-108)">
-<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.button[new-thread:overrides:tool-surface:override]" data-shader="stock::text" x="1290.87" y="711.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
+<text data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].group.0.group.0.group.1.group.4.group.2.button[new-thread:overrides:tool-surface:override]" data-shader="stock::text" x="1278.87" y="711.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Override</text>
 </g>
 <clipPath id="clip-109"><rect x="256.00" y="142.00" width="1088.00" height="624.00"/></clipPath><g clip-path="url(#clip-109)">
 <rect data-node="root.overlay.1.modal.1.scroll[new-thread:overrides:scroll].scrollbar-thumb" data-shader="stock::rounded_rect" x="1336.00" y="142.00" width="6.00" height="405.60" rx="3.00" fill="rgba(105,110,119,0.471)" />
@@ -309,7 +324,7 @@
 <text data-node="root.overlay.1.modal.1.group.2.button[new-thread:overrides:reset]" data-shader="stock::text" x="1251.71" y="803.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Reset</text>
 </g>
 <clipPath id="clip-111"><rect x="240.00" y="70.00" width="1120.00" height="760.00"/></clipPath><g clip-path="url(#clip-111)">
-<rect data-node="root.overlay.1.modal.1.group.2.button[new-thread:overrides:close]" data-shader="stock::rounded_rect" x="1288.52" y="782.00" width="55.48" height="32.00" rx="6.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.group.2.button[new-thread:overrides:close]" data-shader="stock::rounded_rect" x="1288.52" y="782.00" width="55.48" height="32.00" rx="6.00" fill="#0090ff" stroke="#0090ff" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-112"><rect x="240.00" y="70.00" width="1120.00" height="760.00"/></clipPath><g clip-path="url(#clip-112)">
 <text data-node="root.overlay.1.modal.1.group.2.button[new-thread:overrides:close]" data-shader="stock::text" x="1316.26" y="803.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#ffffff" text-anchor="middle">Done</text>

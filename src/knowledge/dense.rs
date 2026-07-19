@@ -1075,7 +1075,10 @@ mod tests {
         for pos in split..n {
             let v = vectors.read_at_position(pos as u64).unwrap();
             let hit = resumed.search(&v, 1);
-            assert_eq!(hit[0].0, by_position[pos], "tail vec at pos {pos} not found");
+            assert_eq!(
+                hit[0].0, by_position[pos],
+                "tail vec at pos {pos} not found"
+            );
         }
     }
 

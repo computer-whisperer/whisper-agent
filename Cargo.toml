@@ -40,7 +40,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 
 # Time
 chrono-tz = "0.10"
-cron = "0.16"
+cron = "0.17"
 
 # Misc utilities
 url = "2"
@@ -101,7 +101,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 # without an explicit pick. Our `install_default()` settles it on ring
 # at startup — avoids dragging the aws-lc-sys NASM build into our chain.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 # `rust-embed` bakes the webui pkg/ + assets/ trees into the release
 # binary. In debug builds (default features) it reads from disk, so
 # `cargo run` in this repo still picks up live edits to assets and
@@ -138,7 +138,7 @@ tantivy = "0.26"
 # dumps are far too large to parse with a DOM-style API. quick-xml
 # exposes pull-style events that let us walk a 22 GB enwiki dump
 # page-by-page while holding only one page in memory.
-quick-xml = "0.39"
+quick-xml = "0.41"
 # bz2 decompression for the MediaWiki adapter — wikipedia ships its
 # dumps as `.xml.bz2`. The C-backed `bzip2` crate gives a streaming
 # `Read` impl over the compressed file; we wrap it in `BufReader`
@@ -164,7 +164,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["onig", "
 # bucket's chunker is set to `tokenizer = "auto"` and resolves to a
 # model id via the embedder. Sync API is fine — resolution happens
 # once at slot-build start, not on the hot path.
-hf-hub = { version = "0.5", default-features = false, features = ["rustls-tls", "ureq"] }
+hf-hub = { version = "1", default-features = false, features = ["blocking", "rustls-tls"] }
 # memmap2 for the slot's chunks.bin / vectors.bin readers. Replaces a
 # `Mutex<File>` + seek+read per fetch — concurrent queries no longer
 # serialize on a single file handle, and a slot's working set lives
@@ -185,7 +185,7 @@ uuid = { version = "1", features = ["v4"] }
 # cache miss rate the SSE transport leaves on the table. `native-roots`
 # uses the OS trust store — chatgpt.com's cert chain validates fine
 # under it.
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 # `half` for f16 quantization in vectors.bin and the f16-backed HNSW
 # index. Already in the lock file transitively (hnsw_rs / tantivy pull
@@ -206,7 +206,7 @@ ahash = "0.8"
 # transitive via `axum`'s ws feature; pinning explicitly here so the
 # test code can use `connect_async` against an axum-mounted endpoint
 # bound to a real loopback port.
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.30"
 # `http` types — explicit dep so tests can build `http::Request`s with
 # Authorization headers for `connect_async`. Already transitive via
 # axum.

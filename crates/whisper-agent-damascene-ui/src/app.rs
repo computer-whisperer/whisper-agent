@@ -33,11 +33,8 @@
 //! key, every visual is a function of state read in
 //! [`ChatApp::build`].
 //!
-//! Surfaces still to land (full inventory in
-//! `docs/design_damascene_ui.md` § "Migration gaps from egui webui"):
-//! Codex auth rotate + Shared MCP CRUD sub-slices of the server
-//! settings modal, +New bucket create form sub-slice of the
-//! knowledge-buckets modal.
+//! Remaining accepted gaps are tracked in
+//! `docs/design_damascene_ui.md` § "Migration gaps from egui webui".
 //!
 //! Dispatch model: a single `dispatch_wire` walks `ServerToClient`
 //! variants — only the ones the current stage cares about have arms;
@@ -4653,7 +4650,11 @@ impl App for ChatApp {
         overlays(
             row([
                 sidebar_el,
-                resize_handle(SIDEBAR_RESIZE_KEY, Axis::Row),
+                // The handle already owns an 8 px visible/input strip. Extend
+                // its target into the sidebar gutter only: expanding toward
+                // the chat would make the sibling targets overlap at the seam.
+                resize_handle(SIDEBAR_RESIZE_KEY, Axis::Row)
+                    .hit_overflow(Sides::left(tokens::HIT_OVERFLOW)),
                 self.content(cx),
             ])
             .width(Size::Fill(1.0))
@@ -4835,7 +4836,7 @@ impl App for ChatApp {
                 && let Some(buf) = modal.working.as_mut()
                 && !modal.readonly
             {
-                text_area::apply_event(buf, &mut self.selection, FILE_VIEWER_BODY_KEY, &event);
+                text_area::apply_event(buf, &mut self.selection, &event, FILE_VIEWER_BODY_KEY);
                 modal.error = None;
             }
             return;
@@ -4902,8 +4903,8 @@ impl App for ChatApp {
                     text_area::apply_event(
                         &mut editor.working,
                         &mut self.selection,
-                        SETTINGS_SERVER_CONFIG_BODY_KEY,
                         &event,
+                        SETTINGS_SERVER_CONFIG_BODY_KEY,
                     );
                     editor.save_summary = None;
                     editor.error = None;
@@ -4949,8 +4950,8 @@ impl App for ChatApp {
                     text_area::apply_event(
                         &mut sub.contents,
                         &mut self.selection,
-                        SETTINGS_CODEX_ROTATE_BODY_KEY,
                         &event,
+                        SETTINGS_CODEX_ROTATE_BODY_KEY,
                     );
                     sub.error = None;
                 }
@@ -5105,7 +5106,7 @@ impl App for ChatApp {
         {
             let key_owned = sudo_reject_reason_key(fn_id);
             let draft = self.sudo_reject_drafts.entry(fn_id).or_default();
-            text_input::apply_event(draft, &mut self.selection, &key_owned, &event);
+            text_input::apply_event(draft, &mut self.selection, &event, &key_owned);
             return;
         }
 
@@ -5202,7 +5203,7 @@ impl App for ChatApp {
                 // so the submit Enter never reaches the buffer.
                 if event.kind == UiEventKind::KeyDown
                     && let Some(kp) = event.key_press.as_ref()
-                    && matches!(kp.key, UiKey::Enter)
+                    && kp.logical.named() == Some(NamedKey::Enter)
                     && !kp.modifiers.shift
                     && !kp.modifiers.ctrl
                     && !kp.modifiers.alt
@@ -5215,8 +5216,8 @@ impl App for ChatApp {
                     text_input::apply_event(
                         &mut modal.query_input,
                         &mut self.selection,
-                        BUCKETS_SEARCH_INPUT_KEY,
                         &event,
+                        BUCKETS_SEARCH_INPUT_KEY,
                     );
                 }
                 return;
@@ -5538,7 +5539,7 @@ impl App for ChatApp {
             // submit Enter never reaches the buffer.
             if event.kind == UiEventKind::KeyDown
                 && let Some(kp) = event.key_press.as_ref()
-                && matches!(kp.key, UiKey::Enter)
+                && kp.logical.named() == Some(NamedKey::Enter)
                 && !kp.modifiers.shift
                 && !kp.modifiers.ctrl
                 && !kp.modifiers.alt
@@ -5573,15 +5574,15 @@ impl App for ChatApp {
             let (changed, new_text) = if let Some(tid) = selected.as_ref() {
                 let buf = self.drafts.entry(tid.clone()).or_default();
                 let before = buf.clone();
-                text_area::apply_event(buf, &mut self.selection, COMPOSE_KEY, &event);
+                text_area::apply_event(buf, &mut self.selection, &event, COMPOSE_KEY);
                 (*buf != before, buf.clone())
             } else {
                 let before = self.compose_input.clone();
                 text_area::apply_event(
                     &mut self.compose_input,
                     &mut self.selection,
-                    COMPOSE_KEY,
                     &event,
+                    COMPOSE_KEY,
                 );
                 (self.compose_input != before, self.compose_input.clone())
             };
@@ -5781,7 +5782,7 @@ impl App for ChatApp {
         {
             let key = format!("{PICKER_HOST_ENVS_RUNAS_PREFIX}{name}");
             if let Some(entry) = self.picker_host_envs.iter_mut().find(|e| e.name == name) {
-                text_input::apply_event(&mut entry.runas_draft, &mut self.selection, &key, &event);
+                text_input::apply_event(&mut entry.runas_draft, &mut self.selection, &event, &key);
             }
             return;
         }
@@ -5799,8 +5800,8 @@ impl App for ChatApp {
                 text_input::apply_event(
                     &mut entry.workspace_root_draft,
                     &mut self.selection,
-                    &key,
                     &event,
+                    &key,
                 );
             }
             return;
@@ -7973,8 +7974,8 @@ impl ChatApp {
             text_input::apply_event(
                 &mut self.new_thread_system_prompt_file_buf,
                 &mut self.selection,
-                NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
                 event,
+                NEW_THREAD_SYSTEM_PROMPT_FILE_KEY,
             );
             self.new_thread_system_prompt = Some(SystemPromptChoice::File {
                 name: self.new_thread_system_prompt_file_buf.clone(),
@@ -7985,8 +7986,8 @@ impl ChatApp {
             text_area::apply_event(
                 &mut self.new_thread_system_prompt_text_buf,
                 &mut self.selection,
-                NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
                 event,
+                NEW_THREAD_SYSTEM_PROMPT_TEXT_KEY,
             );
             self.new_thread_system_prompt = Some(SystemPromptChoice::Text {
                 text: self.new_thread_system_prompt_text_buf.clone(),
@@ -8013,8 +8014,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
                     event,
+                    NEW_THREAD_COMPACTION_PROMPT_FILE_KEY,
                 );
                 compaction.prompt_file = Some(buf);
                 return true;
@@ -8024,8 +8025,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
                     event,
+                    NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY,
                 );
                 compaction.summary_regex = Some(buf);
                 return true;
@@ -8061,8 +8062,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
                     event,
+                    NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
                 );
                 compaction.continuation_template = Some(buf);
                 return true;
@@ -8095,7 +8096,7 @@ impl ChatApp {
                 return true;
             }
             let mut source_pick = autoquery.query_source;
-            if toggle::apply_event_single(
+            if radio::apply_event(
                 &mut source_pick,
                 event,
                 NEW_THREAD_AUTOQUERY_SOURCE_KEY,
@@ -8266,8 +8267,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut self.new_thread_tool_surface_named_buf,
                     &mut self.selection,
-                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                     event,
+                    NEW_THREAD_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                 );
                 surface.core_tools = CoreTools::Named(parse_core_tools_named(
                     &self.new_thread_tool_surface_named_buf,
@@ -8781,6 +8782,7 @@ impl ChatApp {
         // row as clipped.
         let body = scroll(body_entries)
             .key("sidebar-content")
+            .scrollbar_gutter()
             .gap(tokens::SPACE_4)
             .padding(Sides {
                 left: tokens::RING_WIDTH,
@@ -10316,7 +10318,8 @@ impl ChatApp {
             button("Done").key(NEW_THREAD_OVERRIDES_CLOSE_KEY).primary(),
         ]);
         let scroll_body = scroll([scroll_gutter_column([body], tokens::SPACE_4)])
-            .key("new-thread:overrides:scroll");
+            .key("new-thread:overrides:scroll")
+            .scrollbar_gutter();
         let panel = dialog_content([header, scroll_body, footer])
             .block_pointer()
             .width(Size::Fixed(1120.0))
@@ -10569,7 +10572,11 @@ impl ChatApp {
             ]),
             form_item([
                 form_label("query source"),
-                form_control(toggle_group(
+                // Five prose-length choices do not fit reliably in a
+                // horizontal toggle strip at the modal's narrowest column.
+                // A radio column preserves one-of-many semantics and keeps
+                // every focus ring inside the scroll viewport.
+                form_control(radio_group(
                     NEW_THREAD_AUTOQUERY_SOURCE_KEY,
                     &autoquery_source_label(
                         autoquery
@@ -11644,7 +11651,7 @@ impl ChatApp {
         // input in the app.
         if event.target_key() == Some(pod_id_key.as_str()) {
             if let Some(modal) = self.new_pod_modal.as_mut() {
-                text_input::apply_event(&mut modal.pod_id, &mut self.selection, &pod_id_key, event);
+                text_input::apply_event(&mut modal.pod_id, &mut self.selection, event, &pod_id_key);
                 // Edits clear stale errors so the form doesn't keep
                 // showing a previous validation message after the
                 // user starts fixing it.
@@ -11654,7 +11661,7 @@ impl ChatApp {
         }
         if event.target_key() == Some(name_key.as_str()) {
             if let Some(modal) = self.new_pod_modal.as_mut() {
-                text_input::apply_event(&mut modal.name, &mut self.selection, &name_key, event);
+                text_input::apply_event(&mut modal.name, &mut self.selection, event, &name_key);
                 modal.error = None;
             }
             return true;
@@ -11770,8 +11777,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut modal.behavior_id,
                     &mut self.selection,
-                    &behavior_id_key,
                     event,
+                    &behavior_id_key,
                 );
                 modal.error = None;
             }
@@ -11779,7 +11786,7 @@ impl ChatApp {
         }
         if event.target_key() == Some(name_key.as_str()) {
             if let Some(modal) = self.new_behavior_modal.as_mut() {
-                text_input::apply_event(&mut modal.name, &mut self.selection, &name_key, event);
+                text_input::apply_event(&mut modal.name, &mut self.selection, event, &name_key);
                 modal.error = None;
             }
             return true;
@@ -11993,8 +12000,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut cfg.name,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_NAME_KEY,
                     event,
+                    BEHAVIOR_EDITOR_NAME_KEY,
                 );
                 editor.error = None;
             }
@@ -12013,8 +12020,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_DESCRIPTION_KEY,
                     event,
+                    BEHAVIOR_EDITOR_DESCRIPTION_KEY,
                 );
                 cfg.description = if buf.trim().is_empty() {
                     None
@@ -12030,8 +12037,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut editor.schedule_buffer,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
                     event,
+                    BEHAVIOR_EDITOR_SCHEDULE_KEY,
                 );
                 editor.error = None;
             }
@@ -12042,8 +12049,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut editor.timezone_buffer,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
                     event,
+                    BEHAVIOR_EDITOR_TIMEZONE_KEY,
                 );
                 editor.error = None;
             }
@@ -12054,8 +12061,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut editor.working_prompt,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_PROMPT_KEY,
                     event,
+                    BEHAVIOR_EDITOR_PROMPT_KEY,
                 );
                 editor.error = None;
             }
@@ -12465,16 +12472,16 @@ impl ChatApp {
                         text_area::apply_event(
                             buf,
                             &mut self.selection,
-                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                             event,
+                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                         );
                     }
                     Some(SystemPromptChoice::Text { text }) => {
                         text_area::apply_event(
                             text,
                             &mut self.selection,
-                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                             event,
+                            BEHAVIOR_EDITOR_SYSTEM_PROMPT_KEY,
                         );
                     }
                     None => {}
@@ -12494,8 +12501,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut editor.working_toml,
                     &mut self.selection,
-                    BEHAVIOR_EDITOR_RAW_TOML_KEY,
                     event,
+                    BEHAVIOR_EDITOR_RAW_TOML_KEY,
                 );
                 if editor.working_toml != before {
                     editor.raw_dirty = true;
@@ -14514,8 +14521,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut cfg.name,
                     &mut self.selection,
-                    POD_EDITOR_GENERAL_NAME_KEY,
                     event,
+                    POD_EDITOR_GENERAL_NAME_KEY,
                 );
                 editor.error = None;
             }
@@ -14529,8 +14536,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut buf,
                     &mut self.selection,
-                    POD_EDITOR_GENERAL_DESCRIPTION_KEY,
                     event,
+                    POD_EDITOR_GENERAL_DESCRIPTION_KEY,
                 );
                 cfg.description = if buf.trim().is_empty() {
                     None
@@ -14633,8 +14640,8 @@ impl ChatApp {
                 text_input::apply_event(
                     &mut cfg.thread_defaults.system_prompt_file,
                     &mut self.selection,
-                    POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
                     event,
+                    POD_EDITOR_DEFAULTS_SYSTEM_PROMPT_FILE_KEY,
                 );
                 editor.error = None;
             }
@@ -14847,8 +14854,8 @@ impl ChatApp {
             text_area::apply_event(
                 &mut editor.tool_surface_named_buf,
                 &mut self.selection,
-                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
                 event,
+                POD_EDITOR_DEFAULTS_TOOL_SURFACE_CORE_TOOLS_NAMED_KEY,
             );
             if let Some(cfg) = editor.working_config.as_mut() {
                 cfg.thread_defaults.tool_surface.core_tools =
@@ -14909,8 +14916,8 @@ impl ChatApp {
                 text_area::apply_event(
                     &mut editor.working_toml,
                     &mut self.selection,
-                    POD_EDITOR_TOML_KEY,
                     event,
+                    POD_EDITOR_TOML_KEY,
                 );
                 if editor.working_toml != before {
                     editor.raw_dirty = true;
@@ -14969,8 +14976,8 @@ impl ChatApp {
             text_input::apply_event(
                 &mut sub.entry.name,
                 &mut self.selection,
-                HOST_ENV_EDITOR_NAME_KEY,
                 event,
+                HOST_ENV_EDITOR_NAME_KEY,
             );
             sub.error = None;
             return true;
@@ -14979,8 +14986,8 @@ impl ChatApp {
             text_input::apply_event(
                 &mut sub.entry.provider,
                 &mut self.selection,
-                HOST_ENV_EDITOR_PROVIDER_KEY,
                 event,
+                HOST_ENV_EDITOR_PROVIDER_KEY,
             );
             sub.error = None;
             return true;
@@ -15034,7 +15041,7 @@ impl ChatApp {
         for (idx, name) in sub.entry.allow_runas.iter_mut().enumerate() {
             let key = format!("{HOST_ENV_EDITOR_RUNAS_PREFIX}{idx}");
             if event.target_key() == Some(key.as_str()) {
-                text_input::apply_event(name, &mut self.selection, &key, event);
+                text_input::apply_event(name, &mut self.selection, event, &key);
                 sub.error = None;
                 return true;
             }
@@ -15046,8 +15053,8 @@ impl ChatApp {
             text_input::apply_event(
                 &mut buf,
                 &mut self.selection,
-                HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
                 event,
+                HOST_ENV_EDITOR_DEFAULT_RUNAS_KEY,
             );
             sub.entry.default_runas = if buf.is_empty() { None } else { Some(buf) };
             sub.error = None;
@@ -15093,8 +15100,8 @@ impl ChatApp {
                         text_input::apply_event(
                             &mut path.path,
                             &mut self.selection,
-                            &path_key,
                             event,
+                            &path_key,
                         );
                         sub.error = None;
                         return true;
@@ -15123,8 +15130,8 @@ impl ChatApp {
                     text_input::apply_event(
                         image,
                         &mut self.selection,
-                        HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
                         event,
+                        HOST_ENV_EDITOR_CONTAINER_IMAGE_KEY,
                     );
                     sub.error = None;
                     return true;
@@ -15244,8 +15251,8 @@ impl ChatApp {
                         text_input::apply_event(
                             &mut mount.host,
                             &mut self.selection,
-                            &host_key,
                             event,
+                            &host_key,
                         );
                         sub.error = None;
                         return true;
@@ -15255,8 +15262,8 @@ impl ChatApp {
                         text_input::apply_event(
                             &mut mount.guest,
                             &mut self.selection,
-                            &guest_key,
                             event,
+                            &guest_key,
                         );
                         sub.error = None;
                         return true;
@@ -15281,7 +15288,7 @@ impl ChatApp {
                     let key_key = format!("{HOST_ENV_EDITOR_CONTAINER_ENV_KEY_PREFIX}{idx}");
                     if event.target_key() == Some(key_key.as_str()) {
                         let mut key_buf = old_key.clone();
-                        text_input::apply_event(&mut key_buf, &mut self.selection, &key_key, event);
+                        text_input::apply_event(&mut key_buf, &mut self.selection, event, &key_key);
                         if key_buf != old_key
                             && !env.contains_key(&key_buf)
                             && let Some(value) = env.remove(&old_key)
@@ -15294,7 +15301,7 @@ impl ChatApp {
                     let value_key = format!("{HOST_ENV_EDITOR_CONTAINER_ENV_VALUE_PREFIX}{idx}");
                     if event.target_key() == Some(value_key.as_str()) {
                         if let Some(value) = env.get_mut(&old_key) {
-                            text_input::apply_event(value, &mut self.selection, &value_key, event);
+                            text_input::apply_event(value, &mut self.selection, event, &value_key);
                         }
                         sub.error = None;
                         return true;
@@ -15316,7 +15323,7 @@ impl ChatApp {
         if event.target_key() != Some(key) {
             return false;
         }
-        text_input::apply_event(buffer, selection, key, event);
+        text_input::apply_event(buffer, selection, event, key);
         let trimmed = buffer.trim();
         if trimmed.is_empty() {
             set(None);
@@ -15367,7 +15374,7 @@ impl ChatApp {
             for (idx, host) in hosts.iter_mut().enumerate() {
                 let host_key = host_env_network_host_key(salt, idx);
                 if event.target_key() == Some(host_key.as_str()) {
-                    text_input::apply_event(host, selection, &host_key, event);
+                    text_input::apply_event(host, selection, event, &host_key);
                     return true;
                 }
             }
@@ -18044,7 +18051,7 @@ impl ChatApp {
                     _ => None,
                 };
                 if let Some(buf) = touched {
-                    text_input::apply_event(buf, &mut self.selection, key, event);
+                    text_input::apply_event(buf, &mut self.selection, event, key);
                     cf.error = None;
                     handled = true;
                 }
@@ -18552,7 +18559,7 @@ impl ChatApp {
                     _ => None,
                 };
                 if let Some(buf) = touched {
-                    text_input::apply_event(buf, &mut self.selection, key, event);
+                    text_input::apply_event(buf, &mut self.selection, event, key);
                     sub.error = None;
                     handled = true;
                 }

@@ -1,22 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
 <defs>
-  <filter id="shadow-sm" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+  <filter id="shadow-xs" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.05"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-sm" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-md" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
     <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
     <feOffset dx="0" dy="2"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.20"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
-  <filter id="shadow-md" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
-    <feOffset dx="0" dy="6"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-  <filter id="shadow-lg" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
-    <feOffset dx="0" dy="12"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  <filter id="shadow-lg" x="-60%" y="-60%" width="220%" height="260%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="7.5"/>
+    <feOffset dx="0" dy="10"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
 </defs>
 <rect width="100%" height="100%" fill="#09090b"/>
@@ -48,43 +63,43 @@
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files]" data-icon="folder" x="241.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings]" data-icon="settings" x="281.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <clipPath id="clip-6"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-6)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="284.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="272.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
 </g>
 <clipPath id="clip-7"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-7)">
-<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 154.00 A 4.00 4.00 0 0 1 158.00 88.00 V 112.00 A 4.00 4.00 0 0 1 154.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 148.00 A 4.00 4.00 0 0 1 152.00 88.00 V 112.00 A 4.00 4.00 0 0 1 148.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-8"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-8)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="90.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="87.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
 </g>
 <clipPath id="clip-9"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-9)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="230.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="221.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
 </g>
 <clipPath id="clip-10"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-10)">
 <text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0" data-shader="stock::text" x="26.00" y="162.37" font-family="Inter Variable" font-size="12.00" font-weight="600" fill="#b0b4ba" text-anchor="start">Threads (2)</text>
 </g>
 <clipPath id="clip-11"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-11)">
-<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="271.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="259.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
 </g>
 <clipPath id="clip-12"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-12)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1]" data-shader="stock::rounded_rect" x="18.00" y="180.00" width="284.00" height="52.00" rx="8.00" fill="rgba(13,40,71,0.094)" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1]" data-shader="stock::rounded_rect" x="20.00" y="180.00" width="268.00" height="52.00" rx="8.00" fill="rgba(13,40,71,0.094)" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-13"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-13)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="180.00" width="3.00" height="52.00" rx="1.50" fill="#0090ff" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0" data-shader="stock::rounded_rect" x="20.00" y="180.00" width="3.00" height="52.00" rx="1.50" fill="#0090ff" />
 </g>
 <clipPath id="clip-14"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-14)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="203.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0" data-shader="stock::text" x="32.00" y="203.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
 </g>
 <clipPath id="clip-15"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-15)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="220.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">idle · 8d</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1" data-shader="stock::text" x="32.00" y="220.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">idle · 2mo</text>
 </g>
 <clipPath id="clip-16"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-16)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="236.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0" data-shader="stock::rounded_rect" x="20.00" y="236.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
 </g>
 <clipPath id="clip-17"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-17)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="259.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">t-2</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0" data-shader="stock::text" x="32.00" y="259.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">t-2</text>
 </g>
 <clipPath id="clip-18"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-18)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="276.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">working · 8d</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1" data-shader="stock::text" x="32.00" y="276.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">working · 2mo</text>
 </g>
 <rect data-node="root.group.0.group.0.group.2" data-shader="stock::rounded_rect" x="16.00" y="808.00" width="288.00" height="76.00" rx="0.00" fill="none" stroke="#363a3f" stroke-width="1.00" />
 <svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets]" data-icon="custom" x="233.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
@@ -95,118 +110,128 @@
 <svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings]" data-icon="settings" x="273.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <rect data-node="root.group.0.group.0.group.2.group.1.group.0.status-dot.0" data-shader="stock::rounded_rect" x="27.00" y="866.00" width="8.00" height="8.00" rx="4.00" fill="#30a46c" />
 <text data-node="root.group.0.group.0.group.2.group.1.text.1" data-shader="stock::text" x="46.00" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">connected</text>
-<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.26" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.20</text>
-<rect data-node="root.group.0.group[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
+<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.53" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.30</text>
+<rect data-node="root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
 <rect data-node="root.group.0.group.2.group.0.group.0" data-shader="stock::rounded_rect" x="328.00" y="0.00" width="1272.00" height="84.00" rx="0.00" fill="none" stroke="#363a3f" stroke-width="1.00" />
 <text data-node="root.group.0.group.2.group.0.group.0.group.0.heading.0" data-shader="stock::text" x="344.00" y="37.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::rounded_rect" x="1509.49" y="22.00" width="34.51" height="20.00" rx="10.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
-<text data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::text" x="1526.74" y="36.37" font-family="Inter Variable" font-size="12.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">idle</text>
+<rect data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::rounded_rect" x="1507.49" y="22.00" width="36.51" height="20.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.group.0.group.0.badge.2" data-shader="stock::text" x="1525.74" y="36.37" font-family="Inter Variable" font-size="12.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">idle</text>
 <svg data-node="root.group.0.group.2.group.0.group.0.group.0.icon_button[chat:inspector-toggle]" data-icon="info" x="1561.00" y="25.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7h.01"/></svg>
 <text data-node="root.group.0.group.2.group.0.group.0.group.1.text.0" data-shader="stock::text" x="344.00" y="64.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">t-1</text>
 <clipPath id="clip-32"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-32)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="-52.00" width="3.00" height="464.00" rx="0.00" fill="#ffc53d" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="-84.00" width="3.00" height="480.00" rx="0.00" fill="#ffc53d" />
 </g>
 <clipPath id="clip-33"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-33)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group[tool:accordion:2]" data-shader="stock::rounded_rect" x="351.00" y="-44.00" width="1227.00" height="40.00" rx="4.00" fill="#18191b" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group[tool:accordion:2]" data-shader="stock::rounded_rect" x="351.00" y="-76.00" width="1227.00" height="40.00" rx="4.00" fill="#18191b" />
 </g>
 <clipPath id="clip-34"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-34)">
-<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group[tool:accordion:2].icon.1" data-icon="chevron-down" x="1552.00" y="-31.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group[tool:accordion:2].icon.1" data-icon="chevron-down" x="1552.00" y="-63.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 </g>
 <clipPath id="clip-35"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-35)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1" data-shader="stock::rounded_rect" x="359.00" y="20.00" width="1211.00" height="296.00" rx="8.00" fill="#212225" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1" data-shader="stock::rounded_rect" x="359.00" y="-12.00" width="1211.00" height="296.00" rx="8.00" fill="#212225" />
 </g>
 <clipPath id="clip-36"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-36)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:2]" data-shader="stock::text" x="371.00" y="81.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> }</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:4]" data-shader="stock::text" x="371.00" y="91.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> impl Cache {</text>
 </g>
 <clipPath id="clip-37"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-37)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:3]" data-shader="stock::text" x="371.00" y="101.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> </text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:5]" data-shader="stock::text" x="371.00" y="111.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">     pub fn new() -&gt; Self {</text>
 </g>
 <clipPath id="clip-38"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-38)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:4]" data-shader="stock::text" x="371.00" y="121.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> impl Cache {</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:6]" data-shader="stock::text" x="371.00" y="131.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">         Self { inner: HashMap::new() }</text>
 </g>
 <clipPath id="clip-39"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-39)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:5]" data-shader="stock::text" x="371.00" y="141.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">     pub fn new() -&gt; Self {</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:7]" data-shader="stock::text" x="371.00" y="151.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">     }</text>
 </g>
 <clipPath id="clip-40"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-40)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:6]" data-shader="stock::text" x="371.00" y="161.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">         Self { inner: HashMap::new() }</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:8]" data-shader="stock::text" x="371.00" y="171.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+</text>
 </g>
 <clipPath id="clip-41"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-41)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:7]" data-shader="stock::text" x="371.00" y="181.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">     }</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:9]" data-shader="stock::text" x="371.00" y="191.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    /// Total number of entries currently held.</text>
 </g>
 <clipPath id="clip-42"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-42)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:8]" data-shader="stock::text" x="371.00" y="201.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:10]" data-shader="stock::text" x="371.00" y="211.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    pub fn total_count(&amp;self) -&gt; usize {</text>
 </g>
 <clipPath id="clip-43"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-43)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:9]" data-shader="stock::text" x="371.00" y="221.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    /// Total number of entries currently held.</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:11]" data-shader="stock::text" x="371.00" y="231.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+        self.inner.len()</text>
 </g>
 <clipPath id="clip-44"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-44)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:10]" data-shader="stock::text" x="371.00" y="241.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    pub fn total_count(&amp;self) -&gt; usize {</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:12]" data-shader="stock::text" x="371.00" y="251.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    }</text>
 </g>
 <clipPath id="clip-45"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-45)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:11]" data-shader="stock::text" x="371.00" y="261.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+        self.inner.len()</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:13]" data-shader="stock::text" x="371.00" y="271.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> }</text>
 </g>
 <clipPath id="clip-46"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-46)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:12]" data-shader="stock::text" x="371.00" y="281.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+    }</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.text.0" data-shader="stock::text" x="359.00" y="312.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">result</text>
 </g>
 <clipPath id="clip-47"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-47)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.1.text[chat:text:2:diff:13]" data-shader="stock::text" x="371.00" y="301.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start"> }</text>
+<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.2.icon_button[chat:text-lightbox:2:result]" data-icon="custom" x="403.75" y="301.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M15.000 3.000 L21.000 3.000 L21.000 9.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M9.000 21.000 L3.000 21.000 L3.000 15.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M21.000 3.000 L14.000 10.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M3.000 21.000 L10.000 14.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+</svg>
 </g>
 <clipPath id="clip-48"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-48)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.text.2" data-shader="stock::text" x="359.00" y="336.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">result</text>
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.3" data-shader="stock::rounded_rect" x="359.00" y="332.00" width="1211.00" height="44.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-49"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-49)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.3" data-shader="stock::rounded_rect" x="359.00" y="348.00" width="1211.00" height="44.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.3.text[chat:text:2:result]" data-shader="stock::text" x="371.00" y="359.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">edited src/cache.rs (1 substitution applied)</text>
 </g>
 <clipPath id="clip-50"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-50)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group.1.group.1.group.3.text[chat:text:2:result]" data-shader="stock::text" x="371.00" y="373.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">edited src/cache.rs (1 substitution applied)</text>
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="404.00" width="3.00" height="280.00" rx="0.00" fill="#ffc53d" />
 </g>
 <clipPath id="clip-51"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-51)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.log_gutter.0" data-shader="stock::rounded_rect" x="336.00" y="420.00" width="3.00" height="264.00" rx="0.00" fill="#ffc53d" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3]" data-shader="stock::rounded_rect" x="351.00" y="412.00" width="1227.00" height="40.00" rx="4.00" fill="#18191b" />
 </g>
 <clipPath id="clip-52"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-52)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3]" data-shader="stock::rounded_rect" x="351.00" y="428.00" width="1227.00" height="40.00" rx="4.00" fill="#18191b" />
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3].text.0" data-shader="stock::text" x="363.00" y="437.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">✓ write_file [src/cache.md] · wrote src/cache.md (4 lines)</text>
 </g>
 <clipPath id="clip-53"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-53)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3].text.0" data-shader="stock::text" x="363.00" y="453.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">✓ write_file [src/cache.md] · wrote src/cache.md (4 lines)</text>
+<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3].icon.1" data-icon="chevron-down" x="1552.00" y="425.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 </g>
 <clipPath id="clip-54"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-54)">
-<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group[tool:accordion:3].icon.1" data-icon="chevron-down" x="1552.00" y="441.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.text[chat:text:3:diff-path]" data-shader="stock::text" x="359.00" y="464.37" font-family="Inter Variable" font-size="12.00" font-weight="700" fill="#b0b4ba" text-anchor="start">(new) src/cache.md</text>
 </g>
 <clipPath id="clip-55"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-55)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.text[chat:text:3:diff-path]" data-shader="stock::text" x="359.00" y="480.37" font-family="Inter Variable" font-size="12.00" font-weight="700" fill="#b0b4ba" text-anchor="start">(new) src/cache.md</text>
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1" data-shader="stock::rounded_rect" x="359.00" y="476.00" width="1211.00" height="96.00" rx="8.00" fill="#212225" />
 </g>
 <clipPath id="clip-56"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-56)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1" data-shader="stock::rounded_rect" x="359.00" y="492.00" width="1211.00" height="96.00" rx="8.00" fill="#212225" />
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:0]" data-shader="stock::text" x="371.00" y="499.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+# Cache</text>
 </g>
 <clipPath id="clip-57"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-57)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:0]" data-shader="stock::text" x="371.00" y="513.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+# Cache</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:1]" data-shader="stock::text" x="371.00" y="519.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+</text>
 </g>
 <clipPath id="clip-58"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-58)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:1]" data-shader="stock::text" x="371.00" y="533.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:2]" data-shader="stock::text" x="371.00" y="539.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+In-memory key/value store; entries expire when the</text>
 </g>
 <clipPath id="clip-59"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-59)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:2]" data-shader="stock::text" x="371.00" y="553.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+In-memory key/value store; entries expire when the</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:3]" data-shader="stock::text" x="371.00" y="559.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+pod's `cache_ttl` setting elapses.</text>
 </g>
 <clipPath id="clip-60"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-60)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.1.text[chat:text:3:diff:3]" data-shader="stock::text" x="371.00" y="573.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#96dcaa" text-anchor="start">+pod's `cache_ttl` setting elapses.</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.2.text.0" data-shader="stock::text" x="359.00" y="600.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">result</text>
 </g>
 <clipPath id="clip-61"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-61)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.text.2" data-shader="stock::text" x="359.00" y="608.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">result</text>
+<svg data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.2.icon_button[chat:text-lightbox:3:result]" data-icon="custom" x="403.75" y="589.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+<path d="M15.000 3.000 L21.000 3.000 L21.000 9.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M9.000 21.000 L3.000 21.000 L3.000 15.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M21.000 3.000 L14.000 10.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+<path d="M3.000 21.000 L10.000 14.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
+</svg>
 </g>
 <clipPath id="clip-62"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-62)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.3" data-shader="stock::rounded_rect" x="359.00" y="620.00" width="1211.00" height="44.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.3" data-shader="stock::rounded_rect" x="359.00" y="620.00" width="1211.00" height="44.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-63"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-63)">
-<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.3.text[chat:text:3:result]" data-shader="stock::text" x="371.00" y="645.02" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">wrote src/cache.md (4 lines)</text>
+<text data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.group.1.group.3.text[chat:text:3:result]" data-shader="stock::text" x="371.00" y="647.04" font-family="JetBrains Mono" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">wrote src/cache.md (4 lines)</text>
 </g>
 <clipPath id="clip-64"><rect x="328.00" y="84.00" width="1272.00" height="608.00"/></clipPath><g clip-path="url(#clip-64)">
-<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].scrollbar-thumb" data-shader="stock::rounded_rect" x="1592.00" y="325.27" width="6.00" height="366.73" rx="3.00" fill="rgba(105,110,119,0.471)" />
+<rect data-node="root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].scrollbar-thumb" data-shader="stock::rounded_rect" x="1592.00" y="336.55" width="6.00" height="355.45" rx="3.00" fill="rgba(105,110,119,0.471)" />
 </g>
 <rect data-node="root.group.0.group.2.group.0.group.2" data-shader="stock::rounded_rect" x="328.00" y="692.00" width="1272.00" height="208.00" rx="0.00" fill="#18191b" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
 <text data-node="root.group.0.group.2.group.0.group.2.group.0.button[thread-action:cancel]" data-shader="stock::text" x="1386.92" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Cancel</text>
 <text data-node="root.group.0.group.2.group.0.group.2.group.0.button[thread-action:archive]" data-shader="stock::text" x="1463.70" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Archive</text>
 <text data-node="root.group.0.group.2.group.0.group.2.group.0.button[thread-action:compact]" data-shader="stock::text" x="1547.63" y="725.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Compact</text>
-<rect data-node="root.group.0.group.2.group.0.group.2.group.1.text_area[compose]" data-shader="stock::rounded_rect" x="340.00" y="744.00" width="1137.31" height="120.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.2.group.1.text_area[compose]" data-shader="stock::rounded_rect" x="340.00" y="744.00" width="1137.31" height="120.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <clipPath id="clip-70"><rect x="352.00" y="752.00" width="1113.31" height="104.00"/></clipPath><g clip-path="url(#clip-70)">
 <text data-node="root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="352.00" y="762.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start"></text>
 </g>
@@ -214,7 +239,7 @@
 <path d="M13.234 20.252 L21.000 12.300" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
 <path d="M16.000 6.000 L7.586 14.586 C6.805 15.367 6.805 16.633 7.586 17.414 C8.367 18.195 9.633 18.195 10.414 17.414 L18.828 8.828 C20.390 7.266 20.390 4.734 18.828 3.172 C17.266 1.610 14.734 1.610 13.172 3.172 L4.757 11.757 C2.414 14.100 2.414 17.900 4.757 20.243 C7.100 22.586 10.900 22.586 13.243 20.243" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>
 </svg>
-<rect data-node="root.group.0.group.2.group.0.group.2.group.1.button[send]" data-shader="stock::rounded_rect" x="1533.31" y="832.00" width="54.69" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.group.0.group.2.group.0.group.2.group.1.button[send]" data-shader="stock::rounded_rect" x="1533.31" y="832.00" width="54.69" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-xs)" />
 <text data-node="root.group.0.group.2.group.0.group.2.group.1.button[send]" data-shader="stock::text" x="1560.66" y="853.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="rgba(255,255,255,0.502)" text-anchor="middle">Send</text>
 <svg data-node="root.group.0.group.2.group.0.group.2.group.2.group.1.icon.0" data-icon="custom" x="1404.50" y="873.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
 <path d="M9.000 10.000 L4.000 15.000 L9.000 20.000" fill="none" stroke="#b0b4ba" stroke-width="2.00"/>

@@ -1,99 +1,99 @@
-root kind=Group rect=(0,0,1600,900) size=(Hug,Hug) source=src/app.rs:4613
-  root.group.0 kind=Group rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:4614
-    root.group.0.group.0 kind=Group rect=(0,0,320,900) size=(Fixed(320.0),Fill(1.0)) surface_role=panel fill=card source=src/app.rs:8583
-      root.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8517
-        root.group.0.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8517
-          root.group.0.group.0.group.0.group.0.icon.0 kind=icon rect=(16,16,48,48) size=(Fixed(48.0),Fixed(48.0)) icon=custom:f2a11981 text_color=foreground source=src/app.rs:8490
-          root.group.0.group.0.group.0.group.0.text.1 kind=Text rect=(72,28,112,24) size=(Fill(1.0),Hug) text="whisper-agent" overflow=Ellipsis text_role=title text_color=foreground source=src/app.rs:8494
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:new-pod] kind=icon_button rect=(192,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:8498
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files] kind=icon_button rect=(232,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=folder text_color=muted-foreground source=src/app.rs:8505
-          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings] kind=icon_button rect=(272,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8511
-      root.group.0.group.0.scroll[sidebar-content] kind=Scroll rect=(16,80,288,712) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:8571
-        root.group.0.group.0.scroll[sidebar-content].tabs_list.0 kind=tabs_list rect=(18,80,284,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:8984
-          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] kind=tab_trigger rect=(22,84,136,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="default" text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:8984
-          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] kind=tab_trigger rect=(162,84,136,32) size=(Fill(1.0),Fixed(32.0)) text="scratch" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:8984
-        root.group.0.group.0.scroll[sidebar-content].group.1 kind=Group rect=(18,136,284,152) size=(Fill(1.0),Hug) source=src/app.rs:9079
-          root.group.0.group.0.scroll[sidebar-content].group.1.group.0 kind=Group rect=(18,136,284,40) size=(Fill(1.0),Hug) source=src/app.rs:9023
-            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 kind=Text rect=(26,146,236,20) size=(Fill(1.0),Hug) text="Threads (2)" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9024
-            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread] kind=icon_button rect=(262,140,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:9025
-          root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1 kind=item_group rect=(18,180,284,108) size=(Fill(1.0),Hug) source=src/app.rs:9060
-            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] kind=item rect=(18,180,284,52) size=(Fill(1.0),Hug) surface_role=current fill=accent text_color=foreground source=src/app.rs:9112
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 kind=item_rail rect=(18,180,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1 kind=Group rect=(18,180,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0 kind=Group rect=(30,188,260,36) size=(Fill(1.0),Hug) source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 kind=Text rect=(30,188,260,20) size=(Fill(1.0),Hug) text="first conversation" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 kind=Text rect=(30,208,260,16) size=(Fill(1.0),Hug) text="idle · 8d" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9111
-            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2] kind=item rect=(18,236,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 kind=item_rail rect=(18,236,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
-              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1 kind=Group rect=(18,236,284,52) size=(Fill(1.0),Hug) source=src/app.rs:9112
-                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0 kind=Group rect=(30,244,260,36) size=(Fill(1.0),Hug) source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 kind=Text rect=(30,244,260,20) size=(Fill(1.0),Hug) text="t-2" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9111
-                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 kind=Text rect=(30,264,260,16) size=(Fill(1.0),Hug) text="working · 8d" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9111
-      root.group.0.group.0.group.2 kind=Group rect=(16,808,288,76) size=(Fill(1.0),Hug) source=src/app.rs:8637
-        root.group.0.group.0.group.2.group.0 kind=Group rect=(24,820,272,32) size=(Fill(1.0),Hug) source=src/app.rs:8630
-          root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets] kind=icon_button rect=(224,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:9d4ab453 text_color=muted-foreground source=src/app.rs:8600
-          root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings] kind=icon_button rect=(264,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8604
-        root.group.0.group.0.group.2.group.1 kind=Group rect=(24,860,272,20) size=(Fill(1.0),Hug) source=src/app.rs:8690
-          root.group.0.group.0.group.2.group.1.group.0 kind=Group rect=(24,863,14,14) size=(Fixed(14.0),Fixed(14.0)) source=src/app.rs:8675
+root kind=Group rect=(0,0,1600,900) size=(Hug,Hug) source=src/app.rs:4650
+  root.group.0 kind=Group rect=(0,0,1600,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:4651
+    root.group.0.group.0 kind=Group rect=(0,0,320,900) size=(Fixed(320.0),Fill(1.0)) surface_role=panel fill=card source=src/app.rs:8796
+      root.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8729
+        root.group.0.group.0.group.0.group.0 kind=Group rect=(16,16,288,48) size=(Fill(1.0),Hug) source=src/app.rs:8729
+          root.group.0.group.0.group.0.group.0.icon.0 kind=icon rect=(16,16,48,48) size=(Fixed(48.0),Fixed(48.0)) icon=custom:f2a11981 text_color=foreground source=src/app.rs:8702
+          root.group.0.group.0.group.0.group.0.text.1 kind=Text rect=(72,28,112,24) size=(Fill(1.0),Hug) text="whisper-agent" overflow=Ellipsis text_role=title text_color=foreground source=src/app.rs:8706
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:new-pod] kind=icon_button rect=(192,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:8710
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files] kind=icon_button rect=(232,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=folder text_color=muted-foreground source=src/app.rs:8717
+          root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings] kind=icon_button rect=(272,24,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8723
+      root.group.0.group.0.scroll[sidebar-content] kind=Scroll rect=(16,80,288,712) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:8783
+        root.group.0.group.0.scroll[sidebar-content].tabs_list.0 kind=tabs_list rect=(18,80,272,40) size=(Fill(1.0),Hug) fill=muted source=src/app.rs:9197
+          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] kind=tab_trigger rect=(22,84,130,32) size=(Fill(1.0),Fixed(32.0)) surface_role=current text="default" overflow=Ellipsis text_role=label text_align=Center fill=accent text_color=accent-foreground source=src/app.rs:9197
+          root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] kind=tab_trigger rect=(156,84,130,32) size=(Fill(1.0),Fixed(32.0)) text="scratch" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:9197
+        root.group.0.group.0.scroll[sidebar-content].group.1 kind=Group rect=(18,136,272,152) size=(Fill(1.0),Hug) source=src/app.rs:9292
+          root.group.0.group.0.scroll[sidebar-content].group.1.group.0 kind=Group rect=(18,136,272,40) size=(Fill(1.0),Hug) source=src/app.rs:9236
+            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 kind=Text rect=(26,146,224,20) size=(Fill(1.0),Hug) text="Threads (2)" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9237
+            root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread] kind=icon_button rect=(250,140,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=plus text_color=muted-foreground source=src/app.rs:9238
+          root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1 kind=item_group rect=(18,180,272,108) size=(Fill(1.0),Hug) source=src/app.rs:9273
+            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] kind=item rect=(20,180,268,52) size=(Fill(1.0),Hug) surface_role=current fill=accent text_color=foreground source=src/app.rs:9325
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 kind=item_rail rect=(20,180,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1 kind=Group rect=(20,180,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0 kind=Group rect=(32,188,244,36) size=(Fill(1.0),Hug) source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 kind=Text rect=(32,188,244,20) size=(Fill(1.0),Hug) text="first conversation" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 kind=Text rect=(32,208,244,16) size=(Fill(1.0),Hug) text="idle · 2mo" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9324
+            root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2] kind=item rect=(20,236,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 kind=item_rail rect=(20,236,3,52) size=(Fixed(3.0),Fill(1.0)) fill=primary
+              root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1 kind=Group rect=(20,236,268,52) size=(Fill(1.0),Hug) source=src/app.rs:9325
+                root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0 kind=Group rect=(32,244,244,36) size=(Fill(1.0),Hug) source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 kind=Text rect=(32,244,244,20) size=(Fill(1.0),Hug) text="t-2" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:9324
+                  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 kind=Text rect=(32,264,244,16) size=(Fill(1.0),Hug) text="working · 2mo" overflow=Ellipsis text_role=caption text_color=muted-foreground source=src/app.rs:9324
+      root.group.0.group.0.group.2 kind=Group rect=(16,808,288,76) size=(Fill(1.0),Hug) source=src/app.rs:8850
+        root.group.0.group.0.group.2.group.0 kind=Group rect=(24,820,272,32) size=(Fill(1.0),Hug) source=src/app.rs:8843
+          root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets] kind=icon_button rect=(224,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:9d4ab453 text_color=muted-foreground source=src/app.rs:8813
+          root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings] kind=icon_button rect=(264,820,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=settings text_color=muted-foreground source=src/app.rs:8817
+        root.group.0.group.0.group.2.group.1 kind=Group rect=(24,860,272,20) size=(Fill(1.0),Hug) source=src/app.rs:8903
+          root.group.0.group.0.group.2.group.1.group.0 kind=Group rect=(24,863,14,14) size=(Fixed(14.0),Fixed(14.0)) source=src/app.rs:8888
             root.group.0.group.0.group.2.group.1.group.0.status-dot.0 kind=status-dot rect=(27,866,8,8) size=(Fixed(8.0),Fixed(8.0)) fill=success
-          root.group.0.group.0.group.2.group.1.text.1 kind=Text rect=(46,860,192,20) size=(Fill(1.0),Hug) text="connected" text_color=muted-foreground source=src/app.rs:8692
-          root.group.0.group.0.group.2.group.1.text.2 kind=Text rect=(246,860,50,20) size=(Hug,Hug) text="v0.3.20" text_color=muted-foreground source=src/app.rs:8687
-    root.group.0.group[sidebar:resize] kind=Group rect=(320,0,8,900) size=(Fixed(8.0),Fill(1.0)) source=src/app.rs:4616
-      root.group.0.group[sidebar:resize].resize-handle-hairline.0 kind=resize-handle-hairline rect=(323,0,2,900) size=(Fixed(2.0),Fill(1.0)) fill=border
-    root.group.0.group.2 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9169
-      root.group.0.group.2.group.0 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9788
-        root.group.0.group.2.group.0.group.0 kind=Group rect=(328,0,1272,84) size=(Fill(1.0),Hug) source=src/app.rs:9702
-          root.group.0.group.2.group.0.group.0.group.0 kind=Group rect=(344,16,1240,32) size=(Fill(1.0),Hug) source=src/app.rs:9679
-            root.group.0.group.2.group.0.group.0.group.0.heading.0 kind=Heading rect=(344,24,136,16) size=(Hug,Hug) text="first conversation" text_role=title text_color=foreground source=src/app.rs:9624
-            root.group.0.group.2.group.0.group.0.group.0.spacer.1 kind=Spacer rect=(488,32,1013,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9624
-            root.group.0.group.2.group.0.group.0.group.0.badge.2 kind=Badge rect=(1509,22,35,20) size=(Hug,Fixed(20.0)) text="idle" text_role=caption text_align=Center fill=muted text_color=muted-foreground source=src/app.rs:20845
-            root.group.0.group.2.group.0.group.0.group.0.icon_button[chat:inspector-toggle] kind=icon_button rect=(1552,16,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=info text_color=muted-foreground source=src/app.rs:9647
-          root.group.0.group.2.group.0.group.0.group.1 kind=Group rect=(344,52,1240,16) size=(Fill(1.0),Hug) source=src/app.rs:9680
-            root.group.0.group.2.group.0.group.0.group.1.text.0 kind=Text rect=(344,52,1240,16) size=(Fill(1.0),Hug) text="t-1" text_color=muted-foreground source=src/app.rs:9658
-        root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1] kind=VirtualList rect=(328,84,1272,608) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:9740
-          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0 kind=Group rect=(328,84,1272,72) size=(Fill(1.0),Hug) source=src/app.rs:9751
-            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0 kind=Group rect=(336,92,1250,56) size=(Fill(1.0),Hug) source=src/app.rs:22227
+          root.group.0.group.0.group.2.group.1.text.1 kind=Text rect=(46,860,193,20) size=(Fill(1.0),Hug) text="connected" text_color=muted-foreground source=src/app.rs:8905
+          root.group.0.group.0.group.2.group.1.text.2 kind=Text rect=(247,860,49,20) size=(Hug,Hug) text="v0.3.30" text_color=muted-foreground source=src/app.rs:8900
+    root.group.0.resize-handle[sidebar:resize] kind=resize-handle rect=(320,0,8,900) size=(Fixed(8.0),Fill(1.0)) source=src/app.rs:4656
+      root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0 kind=resize-handle-hairline rect=(323,0,2,900) size=(Fixed(2.0),Fill(1.0)) fill=border
+    root.group.0.group.2 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9382
+      root.group.0.group.2.group.0 kind=Group rect=(328,0,1272,900) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:10001
+        root.group.0.group.2.group.0.group.0 kind=Group rect=(328,0,1272,84) size=(Fill(1.0),Hug) source=src/app.rs:9915
+          root.group.0.group.2.group.0.group.0.group.0 kind=Group rect=(344,16,1240,32) size=(Fill(1.0),Hug) source=src/app.rs:9892
+            root.group.0.group.2.group.0.group.0.group.0.heading.0 kind=Heading rect=(344,24,129,16) size=(Hug,Hug) text="first conversation" text_role=title text_color=foreground source=src/app.rs:9837
+            root.group.0.group.2.group.0.group.0.group.0.spacer.1 kind=Spacer rect=(481,32,1019,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:9837
+            root.group.0.group.2.group.0.group.0.group.0.badge.2 kind=Badge rect=(1507,22,37,20) size=(Hug,Fixed(20.0)) text="idle" text_role=caption text_align=Center fill=muted text_color=muted-foreground source=src/app.rs:21550
+            root.group.0.group.2.group.0.group.0.group.0.icon_button[chat:inspector-toggle] kind=icon_button rect=(1552,16,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=info text_color=muted-foreground source=src/app.rs:9860
+          root.group.0.group.2.group.0.group.0.group.1 kind=Group rect=(344,52,1240,16) size=(Fill(1.0),Hug) source=src/app.rs:9893
+            root.group.0.group.2.group.0.group.0.group.1.text.0 kind=Text rect=(344,52,1240,16) size=(Fill(1.0),Hug) text="t-1" text_color=muted-foreground source=src/app.rs:9871
+        root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1] kind=VirtualList rect=(328,84,1272,608) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:9953
+          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0 kind=Group rect=(328,84,1272,72) size=(Fill(1.0),Hug) source=src/app.rs:9964
+            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0 kind=Group rect=(336,92,1250,56) size=(Fill(1.0),Hug) source=src/app.rs:23093
               root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.log_gutter.0 kind=log_gutter rect=(336,92,3,56) size=(Fixed(3.0),Fill(1.0)) fill=muted-foreground
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1 kind=Group rect=(339,92,1247,56) size=(Fill(1.0),Hug) source=src/app.rs:21219
-                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0] kind=Group rect=(351,100,1227,40) size=(Fill(1.0),Fixed(40.0)) fill=card source=src/app.rs:21219
-                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0].text.0 kind=Text rect=(363,110,1181,20) size=(Fill(1.0),Hug) text="SYSTEM · You are Mavis, a coding agent e…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:21219
-                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0].icon.1 kind=icon rect=(1552,113,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=chevron-right text_color=muted-foreground source=src/app.rs:21219
-          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1 kind=Group rect=(328,156,1272,64) size=(Fill(1.0),Hug) source=src/app.rs:9751
-            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0 kind=Group rect=(336,156,1250,56) size=(Fill(1.0),Hug) source=src/app.rs:22227
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1 kind=Group rect=(339,92,1247,56) size=(Fill(1.0),Hug) source=src/app.rs:21924
+                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0] kind=Group rect=(351,100,1227,40) size=(Fill(1.0),Fixed(40.0)) fill=card source=src/app.rs:21924
+                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0].text.0 kind=Text rect=(363,110,1181,20) size=(Fill(1.0),Hug) text="SYSTEM · You are Mavis, a coding agent e…" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:21924
+                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.group.1.group[setup-prompt:accordion:0].icon.1 kind=icon rect=(1552,113,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=chevron-right text_color=muted-foreground source=src/app.rs:21924
+          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1 kind=Group rect=(328,156,1272,64) size=(Fill(1.0),Hug) source=src/app.rs:9964
+            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0 kind=Group rect=(336,156,1250,56) size=(Fill(1.0),Hug) source=src/app.rs:23093
               root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.log_gutter.0 kind=log_gutter rect=(336,156,3,56) size=(Fixed(3.0),Fill(1.0)) fill=muted-foreground
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1 kind=Group rect=(339,156,1247,56) size=(Fill(1.0),Hug) source=src/app.rs:21264
-                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1] kind=Group rect=(351,164,1227,40) size=(Fill(1.0),Fixed(40.0)) fill=card source=src/app.rs:21264
-                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1].text.0 kind=Text rect=(363,174,1181,20) size=(Fill(1.0),Hug) text="TOOLS · 5 tools" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:21264
-                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1].icon.1 kind=icon rect=(1552,177,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=chevron-right text_color=muted-foreground source=src/app.rs:21264
-          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2 kind=Group rect=(328,220,1272,44) size=(Fill(1.0),Hug) source=src/app.rs:9751
-            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0 kind=Group rect=(336,220,1250,36) size=(Fill(1.0),Hug) fill=info source=src/app.rs:22227
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1 kind=Group rect=(339,156,1247,56) size=(Fill(1.0),Hug) source=src/app.rs:21969
+                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1] kind=Group rect=(351,164,1227,40) size=(Fill(1.0),Fixed(40.0)) fill=card source=src/app.rs:21969
+                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1].text.0 kind=Text rect=(363,174,1181,20) size=(Fill(1.0),Hug) text="TOOLS · 5 tools" overflow=Ellipsis text_role=label text_color=foreground source=src/app.rs:21969
+                  root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.1.group.0.group.1.group[setup-tools:accordion:1].icon.1 kind=icon rect=(1552,177,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=chevron-right text_color=muted-foreground source=src/app.rs:21969
+          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2 kind=Group rect=(328,220,1272,44) size=(Fill(1.0),Hug) source=src/app.rs:9964
+            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0 kind=Group rect=(336,220,1250,36) size=(Fill(1.0),Hug) fill=info source=src/app.rs:23093
               root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.log_gutter.0 kind=log_gutter rect=(336,220,3,36) size=(Fixed(3.0),Fill(1.0)) fill=info
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group[chat:user-row:2] kind=Group rect=(339,220,1247,36) size=(Fill(1.0),Hug) source=src/app.rs:21171
-                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group[chat:user-row:2].text[chat:text:2:user] kind=Text rect=(351,228,1227,20) size=(Fill(1.0),Hug) text="Quick sanity check — do you see the syst…" wrap=Wrap text_color=foreground source=src/app.rs:22159
-          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3 kind=Group rect=(328,264,1272,44) size=(Fill(1.0),Hug) source=src/app.rs:9751
-            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0 kind=Group rect=(336,264,1250,36) size=(Fill(1.0),Hug) source=src/app.rs:22227
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group[chat:user-row:2] kind=Group rect=(339,220,1247,36) size=(Fill(1.0),Hug) source=src/app.rs:21876
+                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.2.group.0.group[chat:user-row:2].text[chat:text:2:user] kind=Text rect=(351,228,1227,20) size=(Fill(1.0),Hug) text="Quick sanity check — do you see the syst…" wrap=Wrap text_color=foreground source=src/app.rs:22997
+          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3 kind=Group rect=(328,264,1272,44) size=(Fill(1.0),Hug) source=src/app.rs:9964
+            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0 kind=Group rect=(336,264,1250,36) size=(Fill(1.0),Hug) source=src/app.rs:23093
               root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.log_gutter.0 kind=log_gutter rect=(336,264,3,36) size=(Fixed(3.0),Fill(1.0)) fill=success
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1 kind=Group rect=(339,264,1247,36) size=(Fill(1.0),Hug) source=src/transformer.rs:1062
-                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.text[chat:text:3:assistant:md:p:0..159] kind=Text rect=(351,272,1227,20) size=(Fill(1.0),Hug) text="Yes — it's the Mavis prompt that scopes …" wrap=Wrap text_color=foreground source=src/transformer.rs:1302
-          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4 kind=Group rect=(328,308,1272,24) size=(Fill(1.0),Hug) source=src/app.rs:9751
-            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0 kind=Group rect=(336,308,1250,16) size=(Fill(1.0),Hug) source=src/app.rs:21354
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0.spacer.0 kind=Spacer rect=(348,316,1057,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:21355
-              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0.text[chat:text:4:turn-stats] kind=Text rect=(1405,308,169,16) size=(Hug,Hug) text="in 1,284 · cached 980 · out 86" text_role=caption text_color=muted-foreground source=src/app.rs:22167
-        root.group.0.group.2.group.0.group.2 kind=Group rect=(328,692,1272,208) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:20619
-          root.group.0.group.2.group.0.group.2.group.0 kind=Group rect=(340,704,1248,32) size=(Fill(1.0),Hug) source=src/app.rs:20687
-            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:cancel] kind=button rect=(1354,704,66,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Cancel" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:20678
-            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:archive] kind=button rect=(1428,704,71,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Archive" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:20680
-            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:compact] kind=button rect=(1507,704,81,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Compact" text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:20681
-          root.group.0.group.2.group.0.group.2.group.1 kind=Group rect=(340,744,1248,120) size=(Fill(1.0),Hug) source=src/app.rs:20606
-            root.group.0.group.2.group.0.group.2.group.1.text_area[compose] kind=text_area rect=(340,744,1137,120) size=(Fill(1.0),Fixed(120.0)) surface_role=input fill=muted source=src/app.rs:20585
-              root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0 kind=Scroll rect=(352,752,1113,104) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:20585
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1 kind=Group rect=(339,264,1247,36) size=(Fill(1.0),Hug) source=src/transformer.rs:1386
+                root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.3.group.0.group.1.text[chat:text:3:assistant:md:p:0..159] kind=Text rect=(351,272,1227,20) size=(Fill(1.0),Hug) text="Yes — it's the Mavis prompt that scopes …" wrap=Wrap text_color=foreground source=src/transformer.rs:1626
+          root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4 kind=Group rect=(328,308,1272,24) size=(Fill(1.0),Hug) source=src/app.rs:9964
+            root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0 kind=Group rect=(336,308,1250,16) size=(Fill(1.0),Hug) source=src/app.rs:22059
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0.spacer.0 kind=Spacer rect=(348,316,1057,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:22060
+              root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.4.group.0.text[chat:text:4:turn-stats] kind=Text rect=(1405,308,169,16) size=(Hug,Hug) text="in 1,284 · cached 980 · out 86" text_role=caption text_color=muted-foreground source=src/app.rs:23005
+        root.group.0.group.2.group.0.group.2 kind=Group rect=(328,692,1272,208) size=(Fill(1.0),Hug) surface_role=panel fill=card source=src/app.rs:21324
+          root.group.0.group.2.group.0.group.2.group.0 kind=Group rect=(340,704,1248,32) size=(Fill(1.0),Hug) source=src/app.rs:21392
+            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:cancel] kind=button rect=(1354,704,66,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Cancel" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:21383
+            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:archive] kind=button rect=(1428,704,71,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Archive" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:21385
+            root.group.0.group.2.group.0.group.2.group.0.button[thread-action:compact] kind=button rect=(1507,704,81,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Compact" overflow=Ellipsis text_role=label text_align=Center text_color=muted-foreground source=src/app.rs:21386
+          root.group.0.group.2.group.0.group.2.group.1 kind=Group rect=(340,744,1248,120) size=(Fill(1.0),Hug) source=src/app.rs:21311
+            root.group.0.group.2.group.0.group.2.group.1.text_area[compose] kind=text_area rect=(340,744,1137,120) size=(Fill(1.0),Fixed(120.0)) surface_role=input fill=muted source=src/app.rs:21290
+              root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0 kind=Scroll rect=(352,752,1113,104) size=(Fill(1.0),Fill(1.0)) clip=true scroll_y=0 source=src/app.rs:21290
                 root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0.text_area_content.0 kind=text_area_content rect=(352,752,1113,20) size=(Fill(1.0),Hug)
-                  root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0.text_area_content.0.text.0 kind=Text rect=(352,752,1113,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:20585
-            root.group.0.group.2.group.0.group.2.group.1.icon_button[compose:attach] kind=icon_button rect=(1489,832,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:d68eab67 text_color=muted-foreground source=src/app.rs:20582
-            root.group.0.group.2.group.0.group.2.group.1.button[send] kind=button rect=(1533,832,55,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Send" text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:20576
-          root.group.0.group.2.group.0.group.2.group.2 kind=Group rect=(340,872,1248,16) size=(Fill(1.0),Hug) source=src/app.rs:20649
-            root.group.0.group.2.group.0.group.2.group.2.spacer.0 kind=Spacer rect=(340,880,1053,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:20649
-            root.group.0.group.2.group.0.group.2.group.2.group.1 kind=Group rect=(1405,872,60,16) size=(Hug,Hug) source=src/app.rs:20638
-              root.group.0.group.2.group.0.group.2.group.2.group.1.icon.0 kind=icon rect=(1405,873,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=custom:e97bcf64 text_color=muted-foreground source=src/app.rs:20639
-              root.group.0.group.2.group.0.group.2.group.2.group.1.text.1 kind=Text rect=(1423,872,42,16) size=(Hug,Hug) text="to send" text_color=muted-foreground source=src/app.rs:20642
-            root.group.0.group.2.group.0.group.2.group.2.text.2 kind=Text rect=(1477,872,111,16) size=(Hug,Hug) text="Shift+↵ for newline" text_color=muted-foreground source=src/app.rs:20647
+                  root.group.0.group.2.group.0.group.2.group.1.text_area[compose].scroll.0.text_area_content.0.text.0 kind=Text rect=(352,752,1113,20) size=(Fill(1.0),Hug) text="" wrap=Wrap text_color=foreground source=src/app.rs:21290
+            root.group.0.group.2.group.0.group.2.group.1.icon_button[compose:attach] kind=icon_button rect=(1489,832,32,32) size=(Fixed(32.0),Fixed(32.0)) surface_role=raised icon=custom:d68eab67 text_color=muted-foreground source=src/app.rs:21287
+            root.group.0.group.2.group.0.group.2.group.1.button[send] kind=button rect=(1533,832,55,32) size=(Hug,Fixed(32.0)) surface_role=raised text="Send" overflow=Ellipsis text_role=label text_align=Center fill=primary text_color=primary-foreground source=src/app.rs:21281
+          root.group.0.group.2.group.0.group.2.group.2 kind=Group rect=(340,872,1248,16) size=(Fill(1.0),Hug) source=src/app.rs:21354
+            root.group.0.group.2.group.0.group.2.group.2.spacer.0 kind=Spacer rect=(340,880,1053,0) size=(Fill(1.0),Fill(1.0)) source=src/app.rs:21354
+            root.group.0.group.2.group.0.group.2.group.2.group.1 kind=Group rect=(1405,872,60,16) size=(Hug,Hug) source=src/app.rs:21343
+              root.group.0.group.2.group.0.group.2.group.2.group.1.icon.0 kind=icon rect=(1405,873,14,14) size=(Fixed(14.0),Fixed(14.0)) icon=custom:e97bcf64 text_color=muted-foreground source=src/app.rs:21344
+              root.group.0.group.2.group.0.group.2.group.2.group.1.text.1 kind=Text rect=(1423,872,42,16) size=(Hug,Hug) text="to send" text_color=muted-foreground source=src/app.rs:21347
+            root.group.0.group.2.group.0.group.2.group.2.text.2 kind=Text rect=(1477,872,111,16) size=(Hug,Hug) text="Shift+↵ for newline" text_color=muted-foreground source=src/app.rs:21352

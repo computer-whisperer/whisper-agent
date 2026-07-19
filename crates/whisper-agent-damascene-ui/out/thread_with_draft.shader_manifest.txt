@@ -1,19 +1,19 @@
 stock::rounded_rect  used 16 times
   root.group.0.group.0 fill=card inner_rect=(0.00,0.00,320.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 shadow=4.00 stroke=border stroke_width=1.00 surface_role=1.00
-  root.group.0.group.0.scroll[sidebar-content].tabs_list.0 fill=muted inner_rect=(18.00,80.00,284.00,40.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 stroke=border stroke_width=1.00 surface_role=0.00
-  root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] fill=accent inner_rect=(22.00,84.00,136.00,32.00) radii=(8.00,4.00,4.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
-  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] fill=accent inner_rect=(18.00,180.00,284.00,52.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
-  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 fill=primary inner_rect=(18.00,180.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
-  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 fill=primary inner_rect=(18.00,236.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0 fill=muted inner_rect=(18.00,80.00,272.00,40.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default] fill=accent inner_rect=(22.00,84.00,130.00,32.00) radii=(8.00,4.00,4.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1] fill=accent inner_rect=(20.00,180.00,268.00,52.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=border stroke_width=1.00 surface_role=6.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0 fill=primary inner_rect=(20.00,180.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0 fill=primary inner_rect=(20.00,236.00,3.00,52.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 surface_role=0.00
   root.group.0.group.0.group.2 inner_rect=(16.00,808.00,288.00,76.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 stroke=border stroke_width=1.00 surface_role=0.00
   root.group.0.group.0.group.2.group.1.group.0.status-dot.0 fill=success inner_rect=(27.00,866.00,8.00,8.00) radii=(4.00,4.00,4.00,4.00) radius=4.00 surface_role=0.00
-  root.group.0.group[sidebar:resize].resize-handle-hairline.0 fill=border inner_rect=(323.00,0.00,2.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
+  root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0 fill=border inner_rect=(323.00,0.00,2.00,900.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
   root.group.0.group.2.group.0.group.0 inner_rect=(328.00,0.00,1272.00,84.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 stroke=border stroke_width=1.00 surface_role=0.00
-  root.group.0.group.2.group.0.group.0.group.0.badge.2 fill=muted inner_rect=(1509.49,22.00,34.51,20.00) radii=(999.00,999.00,999.00,999.00) radius=999.00 stroke=border stroke_width=1.00 surface_role=0.00
+  root.group.0.group.2.group.0.group.0.group.0.badge.2 fill=muted inner_rect=(1507.49,22.00,36.51,20.00) radii=(6.00,6.00,6.00,6.00) radius=6.00 stroke=border stroke_width=1.00 surface_role=0.00
   root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0 fill=info inner_rect=(336.00,92.00,1250.00,36.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
   root.group.0.group.2.group.0.virtual_list[chat-scroll:t-1].group.0.group.0.log_gutter.0 fill=info inner_rect=(336.00,92.00,3.00,36.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 surface_role=0.00
   root.group.0.group.2.group.0.group.2 fill=card inner_rect=(328.00,716.00,1272.00,184.00) radii=(0.00,0.00,0.00,0.00) radius=0.00 shadow=4.00 stroke=border stroke_width=1.00 surface_role=1.00
-  root.group.0.group.2.group.0.group.2.group.1.text_area[compose] fill=rgba(30,31,34,255) inner_rect=(340.00,768.00,1137.31,120.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=input stroke_width=1.00 surface_role=7.00
+  root.group.0.group.2.group.0.group.2.group.1.text_area[compose] fill=rgba(0.11115875,0.11469228,0.12529242,1) inner_rect=(340.00,768.00,1137.31,120.00) radii=(8.00,8.00,8.00,8.00) radius=8.00 shadow=0.00 stroke=input stroke_width=1.00 surface_role=7.00
   root.group.0.group.2.group.0.group.2.group.1.button[send] fill=primary inner_rect=(1533.31,856.00,54.69,32.00) radii=(6.00,6.00,6.00,6.00) radius=6.00 shadow=2.00 stroke=primary stroke_width=1.00 surface_role=2.00
 
 stock::text  used 19 times
@@ -22,11 +22,11 @@ stock::text  used 19 times
   root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch] text="scratch" color=muted-foreground size=14.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
   root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0 text="Threads (2)" color=muted-foreground size=12.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
   root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0 text="first conversation" color=foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
-  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 text="idle · 8d" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1 text="idle · 2mo" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
   root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0 text="t-2" color=foreground size=14.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
-  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 text="working · 8d" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1 text="working · 2mo" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
   root.group.0.group.0.group.2.group.1.text.1 text="connected" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
-  root.group.0.group.0.group.2.group.1.text.2 text="v0.3.20" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
+  root.group.0.group.0.group.2.group.1.text.2 text="v0.3.30" color=muted-foreground size=14.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start
   root.group.0.group.2.group.0.group.0.group.0.heading.0 text="first conversation" color=foreground size=16.0 family=Inter weight=Semibold mono=false wrap=NoWrap anchor=Start
   root.group.0.group.2.group.0.group.0.group.0.badge.2 text="idle" color=muted-foreground size=12.0 family=Inter weight=Medium mono=false wrap=NoWrap anchor=Middle
   root.group.0.group.2.group.0.group.0.group.1.text.0 text="t-1" color=muted-foreground size=12.0 family=Inter weight=Regular mono=false wrap=NoWrap anchor=Start

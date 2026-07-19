@@ -65,23 +65,24 @@ crates/
 The damascene-ui crate replaces the deleted `whisper-agent-webui`
 (browser, egui) and `whisper-agent-desktop` (native, egui) crates —
 same workspace shape, single ui implementation across both targets.
-`damascene-core` and `damascene-winit-wgpu` come in via path-deps to a
-sibling worktree.
+`damascene-core` and `damascene-winit-wgpu` normally come from
+crates.io; commented path specs in the manifests make it easy to test
+an unreleased sibling worktree.
 
-### Damascene as a path-dep
+### Damascene release and local override
 
-Damascene is under active development; we track upstream `HEAD` rather than a
-crates.io release. Path-dep reaches up out of the workspace:
+The checked-in dependency tracks the latest tested crates.io release:
 
 ```toml
 # crates/whisper-agent-damascene-ui/Cargo.toml
-damascene-core = { path = "../../../../damascene/damascene.main/crates/damascene-core" }
+damascene-core = "0.6.0"
+# damascene-core = { path = "../../../../damascene/damascene.main/crates/damascene-core" }
 ```
 
 The four `..`s reflect the user's worktree convention:
-`~/workspace/{damascene,whisper-agent}/{damascene,whisper}.main/`. When damascene
-stabilizes and ships to crates.io, this becomes a versioned dep + the path
-gets dropped (or kept behind a `[patch]` for development).
+`~/workspace/{damascene,whisper-agent}/{damascene,whisper}.main/`.
+Temporarily swap the versioned line for the path line when validating
+upstream work before a release.
 
 ## Architecture
 
@@ -254,7 +255,7 @@ Each stage is a self-contained slice with its own commit. The progression is
 roughly the inverse of dependency depth: read-only shell first, then
 write paths, then composition, then cross-cutting features.
 
-### Sidebar redesign (in flight)
+### ✅ Sidebar redesign
 
 The egui sidebar's pod-as-collapsible-section idiom doesn't scale when
 one pod dominates and others are sparse — a real-world snapshot of the
@@ -607,21 +608,21 @@ Also still deferred:
 - inline images in `ContentBlock::ToolResult` bodies (today
   collapsed via `tool_result_text_summary`'s text-only extractor)
 
-### 🌗 Stage 8 — Modals (in flight)
+### ✅ Stage 8 — Modals
 
 `dialog` is the widget for centered form modals; `sheet` is the
 fit for document-shaped surfaces (anything multi-column or
 multi-tab). The egui sibling has 8 modals, each a few hundred
 lines:
-- settings (server config, shared MCP hosts, embedding providers)
-- knowledge buckets
+- ✅ settings (server config, shared MCP hosts, embedding providers)
+- ✅ knowledge buckets
 - ✅ behavior editor (v1: name / description / trigger kind /
   cron schedule / prompt — sheet, not dialog)
 - ✅ pod editor (raw TOML — sheet, not dialog)
 - ✅ new pod
 - ✅ new behavior
 - ✅ fork thread (paired with per-User-row hover affordance)
-- file / JSON / image viewers
+- ✅ file / JSON / image viewers
 
 **Pattern landed with the `+ New pod` modal:**
 

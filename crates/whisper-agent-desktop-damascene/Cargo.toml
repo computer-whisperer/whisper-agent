@@ -17,8 +17,8 @@ whisper-agent-protocol = { workspace = true }
 # Damascene's optional native winit + wgpu host. Owns window creation,
 # event loop, surface configuration, and frame submission so this
 # binary only has to plug a `ChatApp` into it.
-damascene-core = "0.4.3"
-damascene-winit-wgpu = "0.4.3"
+damascene-core = "0.6.0"
+damascene-winit-wgpu = "0.6.0"
 # damascene-core = { path = "../../../../damascene/damascene.main/crates/damascene-core" }
 # damascene-winit-wgpu = { path = "../../../../damascene/damascene.main/crates/damascene-winit-wgpu" }
 
@@ -27,7 +27,7 @@ damascene-winit-wgpu = "0.4.3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 # Native WebSocket client. Mirrors the egui desktop crate's TLS feature
 # pick so `wss://` works against the same server cert chain.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }
 # rustls 0.23 refuses to auto-pick a crypto provider when both `ring`
 # and `aws-lc-rs` are reachable; the egui sibling pins `ring` and we
 # match it so only one provider is registered process-wide.

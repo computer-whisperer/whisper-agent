@@ -469,20 +469,21 @@ enum BpeSource {
 }
 
 fn fetch_hf_tokenizer(model_id: &str) -> Result<(Tokenizer, String), String> {
-    // `Api::new()` uses `Cache::default()`, which calls `dirs::home_dir()`
-    // and writes under `$HOME/.cache/huggingface`. That blows up on the
+    // `HFClientSync::new()` resolves its default cache below `$HF_HOME`
+    // (or `$HOME/.cache/huggingface`). The latter blows up on the
     // server image: the runtime user is created with `--no-create-home`,
     // so `$HOME` resolves to the non-existent (root-owned)
     // `/home/whisper-agent` and every cache write hits EACCES. The
     // chunker then silently falls back to the char-window heuristic.
-    // `Api::from_env()` honors `HF_HOME` (set in the Dockerfile to a
-    // writable path on the data volume).
-    let api = hf_hub::api::sync::ApiBuilder::from_env()
-        .build()
-        .map_err(|e| format!("hf-hub api init: {e}"))?;
-    let repo = api.model(model_id.to_string());
+    // `HFClientSync::new()` honors `HF_HOME` (set in the Dockerfile to
+    // a writable path on the data volume).
+    let api = hf_hub::HFClientSync::new().map_err(|e| format!("hf-hub api init: {e}"))?;
+    let (owner, name) = hf_hub::split_id(model_id);
+    let repo = api.model(owner, name);
     let path = repo
-        .get("tokenizer.json")
+        .download_file()
+        .filename("tokenizer.json")
+        .send()
         .map_err(|e| format!("hf-hub get tokenizer.json: {e}"))?;
     load_path_tokenizer(&path).map_err(|e| match e {
         ResolveError::PathNotFound(_, msg) => msg,

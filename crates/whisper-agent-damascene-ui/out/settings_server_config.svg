@@ -1,22 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
 <defs>
-  <filter id="shadow-sm" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+  <filter id="shadow-xs" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.05"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-sm" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.5"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1"/>
+    <feOffset dx="0" dy="1"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="shadow-md" x="-40%" y="-40%" width="180%" height="200%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
     <feGaussianBlur in="SourceAlpha" stdDeviation="2"/>
     <feOffset dx="0" dy="2"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.20"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
-  <filter id="shadow-md" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
-    <feOffset dx="0" dy="6"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-  </filter>
-  <filter id="shadow-lg" x="-20%" y="-20%" width="140%" height="140%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
-    <feOffset dx="0" dy="12"/>
-    <feComponentTransfer><feFuncA type="linear" slope="0.32"/></feComponentTransfer>
-    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  <filter id="shadow-lg" x="-60%" y="-60%" width="220%" height="260%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="7.5"/>
+    <feOffset dx="0" dy="10"/>
+    <feComponentTransfer result="l1"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+    <feOffset dx="0" dy="4"/>
+    <feComponentTransfer result="l2"><feFuncA type="linear" slope="0.10"/></feComponentTransfer>
+    <feMerge><feMergeNode in="l1"/><feMergeNode in="l2"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
 </defs>
 <rect width="100%" height="100%" fill="#09090b"/>
@@ -48,40 +63,40 @@
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-files]" data-icon="folder" x="241.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
 <svg data-node="root.group.0.group.0.group.0.group.0.icon_button[sidebar:pod-settings]" data-icon="settings" x="281.00" y="33.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <clipPath id="clip-6"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-6)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="284.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0" data-shader="stock::rounded_rect" x="18.00" y="80.00" width="272.00" height="40.00" rx="8.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" />
 </g>
 <clipPath id="clip-7"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-7)">
-<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 154.00 A 4.00 4.00 0 0 1 158.00 88.00 V 112.00 A 4.00 4.00 0 0 1 154.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<path data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::rounded_rect" d="M 30.00 84.00 H 148.00 A 4.00 4.00 0 0 1 152.00 88.00 V 112.00 A 4.00 4.00 0 0 1 148.00 116.00 H 30.00 A 8.00 8.00 0 0 1 22.00 108.00 V 92.00 A 8.00 8.00 0 0 1 30.00 84.00 Z" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-8"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-8)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="90.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:default]" data-shader="stock::text" x="87.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">default</text>
 </g>
 <clipPath id="clip-9"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-9)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="230.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].tabs_list.0.tab_trigger[pod-tabs:tab:scratch]" data-shader="stock::text" x="221.00" y="105.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">scratch</text>
 </g>
 <clipPath id="clip-10"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-10)">
 <text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.text.0" data-shader="stock::text" x="26.00" y="162.37" font-family="Inter Variable" font-size="12.00" font-weight="600" fill="#b0b4ba" text-anchor="start">Threads (2)</text>
 </g>
 <clipPath id="clip-11"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-11)">
-<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="271.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+<svg data-node="root.group.0.group.0.scroll[sidebar-content].group.1.group.0.icon_button[sidebar:new-thread]" data-icon="plus" x="259.00" y="149.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
 </g>
 <clipPath id="clip-12"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-12)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="180.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].item_rail.0" data-shader="stock::rounded_rect" x="20.00" y="180.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
 </g>
 <clipPath id="clip-13"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-13)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="203.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.0" data-shader="stock::text" x="32.00" y="203.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">first conversation</text>
 </g>
 <clipPath id="clip-14"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-14)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="220.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">idle · 8d</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-1].group.1.group.0.text.1" data-shader="stock::text" x="32.00" y="220.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">idle · 2mo</text>
 </g>
 <clipPath id="clip-15"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-15)">
-<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0" data-shader="stock::rounded_rect" x="18.00" y="236.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
+<rect data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].item_rail.0" data-shader="stock::rounded_rect" x="20.00" y="236.00" width="3.00" height="52.00" rx="1.50" fill="rgba(0,144,255,0.000)" />
 </g>
 <clipPath id="clip-16"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-16)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0" data-shader="stock::text" x="30.00" y="259.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">t-2</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.0" data-shader="stock::text" x="32.00" y="259.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#edeef0" text-anchor="start">t-2</text>
 </g>
 <clipPath id="clip-17"><rect x="16.00" y="80.00" width="288.00" height="712.00"/></clipPath><g clip-path="url(#clip-17)">
-<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1" data-shader="stock::text" x="30.00" y="276.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">working · 8d</text>
+<text data-node="root.group.0.group.0.scroll[sidebar-content].group.1.item_group.1.item[thread:t-2].group.1.group.0.text.1" data-shader="stock::text" x="32.00" y="276.37" font-family="Inter Variable" font-size="12.00" font-weight="400" fill="#b0b4ba" text-anchor="start">working · 2mo</text>
 </g>
 <rect data-node="root.group.0.group.0.group.2" data-shader="stock::rounded_rect" x="16.00" y="808.00" width="288.00" height="76.00" rx="0.00" fill="none" stroke="#363a3f" stroke-width="1.00" />
 <svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:buckets]" data-icon="custom" x="233.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
@@ -92,35 +107,35 @@
 <svg data-node="root.group.0.group.0.group.2.group.0.icon_button[sidebar:server-settings]" data-icon="settings" x="273.00" y="829.00" width="14.00" height="14.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.43" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.8-1L14.4 3h-4.8L9.3 6a7 7 0 0 0-1.8 1L5.1 6l-2 3.5 2 1.5a7 7 0 0 0 0 2l-2 1.5 2 3.5 2.4-1a7 7 0 0 0 1.8 1l.3 3h4.8l.3-3a7 7 0 0 0 1.8-1l2.4 1 2-3.5-2-1.5a7 7 0 0 0 .1-1Z"/></svg>
 <rect data-node="root.group.0.group.0.group.2.group.1.group.0.status-dot.0" data-shader="stock::rounded_rect" x="27.00" y="866.00" width="8.00" height="8.00" rx="4.00" fill="#30a46c" />
 <text data-node="root.group.0.group.0.group.2.group.1.text.1" data-shader="stock::text" x="46.00" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">connected</text>
-<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.26" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.20</text>
-<rect data-node="root.group.0.group[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
+<text data-node="root.group.0.group.0.group.2.group.1.text.2" data-shader="stock::text" x="246.53" y="875.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">v0.3.30</text>
+<rect data-node="root.group.0.resize-handle[sidebar:resize].resize-handle-hairline.0" data-shader="stock::rounded_rect" x="323.00" y="0.00" width="2.00" height="900.00" rx="0.00" fill="#363a3f" />
 <rect data-node="root.group.0.group.2.group.0.group.0.card.0" data-shader="stock::rounded_rect" x="474.00" y="24.00" width="980.00" height="568.00" rx="12.00" fill="#18191b" stroke="rgba(54,58,63,0.824)" stroke-width="1.00" filter="url(#shadow-sm)" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.0.heading.0" data-shader="stock::text" x="498.00" y="61.82" font-family="Inter Variable" font-size="16.00" font-weight="600" fill="#edeef0" text-anchor="start">Start a new conversation</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.0.text.1" data-shader="stock::text" x="498.00" y="87.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Pick the conversation's main runtime target. Empty pickers fall through to the active pod's defaults.</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.0" data-shader="stock::text" x="500.00" y="131.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Backend</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="500.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend]" data-shader="stock::rounded_rect" x="500.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].text.0" data-shader="stock::text" x="510.00" y="165.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">loading pod default…</text>
 <svg data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.form_control.1.select_trigger[picker:backend].icon.1" data-icon="chevron-down" x="930.00" y="152.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.0.text.2" data-shader="stock::text" x="500.00" y="199.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">3 backends configured</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.0" data-shader="stock::text" x="972.00" y="131.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Model</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="972.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model]" data-shader="stock::rounded_rect" x="972.00" y="144.00" width="456.00" height="32.00" rx="6.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].text.0" data-shader="stock::text" x="982.00" y="165.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">loading pod default…</text>
 <svg data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.form_control.1.select_trigger[picker:model].icon.1" data-icon="chevron-down" x="1402.00" y="152.00" width="16.00" height="16.00" viewBox="0 0 24 24" fill="none" stroke="#b0b4ba" stroke-width="3.00" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.0.group.1.text.2" data-shader="stock::text" x="972.00" y="199.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">loading pod default…</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.0" data-shader="stock::text" x="500.00" y="231.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Host envs</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="500.00" y="244.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::text" x="531.77" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:custom]" data-shader="stock::text" x="603.42" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Custom</text>
-<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group[picker:host-envs:mode].toggle[picker:host-envs:mode:toggle:none]" data-shader="stock::text" x="671.14" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">None</text>
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::rounded_rect" x="500.00" y="244.00" width="63.54" height="32.00" rx="6.00" fill="#0d2847" stroke="rgba(54,58,63,0.706)" stroke-width="1.00" />
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:inherit]" data-shader="stock::text" x="531.77" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Inherit</text>
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:custom]" data-shader="stock::text" x="603.42" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Custom</text>
+<text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.toggle_group.0.toggle[picker:host-envs:mode:toggle:none]" data-shader="stock::text" x="671.14" y="265.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">None</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.form_control.1.group.0.text.1" data-shader="stock::text" x="500.00" y="299.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">Inherits the pod default host envs; fetching pod config…</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.1.text.2" data-shader="stock::text" x="500.00" y="327.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#b0b4ba" text-anchor="start">fetching pod config…</text>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.text.0" data-shader="stock::text" x="500.00" y="359.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="start">Message</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose]" data-shader="stock::rounded_rect" x="500.00" y="372.00" width="928.00" height="140.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose]" data-shader="stock::rounded_rect" x="500.00" y="372.00" width="928.00" height="140.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 <clipPath id="clip-47"><rect x="512.00" y="380.00" width="904.00" height="124.00"/></clipPath><g clip-path="url(#clip-47)">
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.1.group.0.group.2.form_control.1.text_area[compose].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="512.00" y="390.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start"></text>
 </g>
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[new-thread:overrides:open]" data-shader="stock::text" x="560.56" y="557.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#b0b4ba" text-anchor="middle">Edit overrides…</text>
-<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::rounded_rect" x="1377.09" y="536.00" width="52.91" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::rounded_rect" x="1377.09" y="536.00" width="52.91" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-xs)" />
 <text data-node="root.group.0.group.2.group.0.group.0.card.0.group.2.group.0.button[send]" data-shader="stock::text" x="1403.55" y="557.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="rgba(255,255,255,0.502)" text-anchor="middle">Start</text>
 <clipPath id="clip-51"><rect x="0.00" y="0.00" width="1600.00" height="900.00"/></clipPath><g clip-path="url(#clip-51)">
 <rect data-node="root.overlay.1.scrim[settings:dismiss]" data-shader="stock::rounded_rect" x="0.00" y="0.00" width="1600.00" height="900.00" rx="0.00" fill="rgba(0,0,0,0.800)" />
@@ -154,7 +169,7 @@
 <text data-node="root.overlay.1.modal.1.tabs_list.1.tab_trigger[settings:tabs:tab:server-config]" data-shader="stock::text" x="1056.50" y="247.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="#70b8ff" text-anchor="middle">Server config</text>
 </g>
 <clipPath id="clip-61"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-61)">
-<rect data-node="root.overlay.1.modal.1.group.2.text_area[settings:server-config:body]" data-shader="stock::rounded_rect" x="456.00" y="278.00" width="688.00" height="384.00" rx="8.00" fill="#1e1f22" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
+<rect data-node="root.overlay.1.modal.1.group.2.text_area[settings:server-config:body]" data-shader="stock::rounded_rect" x="456.00" y="278.00" width="688.00" height="384.00" rx="8.00" fill="#1c1d20" stroke="rgba(54,58,63,0.745)" stroke-width="1.00" />
 </g>
 <clipPath id="clip-62"><rect x="468.00" y="286.00" width="664.00" height="368.00"/></clipPath><g clip-path="url(#clip-62)">
 <text data-node="root.overlay.1.modal.1.group.2.text_area[settings:server-config:body].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="468.00" y="301.09" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start">[server]</text>
@@ -167,19 +182,19 @@
 <text data-node="root.overlay.1.modal.1.group.2.text_area[settings:server-config:body].scroll.0.text_area_content.0.text.0" data-shader="stock::text" x="468.00" y="436.00" font-family="Inter Variable" font-size="14.00" font-weight="400" fill="#edeef0" text-anchor="start"></text>
 </g>
 <clipPath id="clip-63"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-63)">
-<rect data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:revert]" data-shader="stock::rounded_rect" x="456.00" y="674.00" width="63.26" height="32.00" rx="6.00" fill="rgba(33,34,37,0.502)" stroke="rgba(54,58,63,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:revert]" data-shader="stock::rounded_rect" x="456.00" y="674.00" width="63.26" height="32.00" rx="6.00" fill="rgba(33,34,37,0.502)" stroke="rgba(54,58,63,0.502)" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-64"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-64)">
 <text data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:revert]" data-shader="stock::text" x="487.63" y="695.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="rgba(237,238,240,0.502)" text-anchor="middle">Revert</text>
 </g>
 <clipPath id="clip-65"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-65)">
-<rect data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:save]" data-shader="stock::rounded_rect" x="527.26" y="674.00" width="53.15" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:save]" data-shader="stock::rounded_rect" x="527.26" y="674.00" width="53.15" height="32.00" rx="6.00" fill="rgba(0,144,255,0.502)" stroke="rgba(0,144,255,0.502)" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-66"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-66)">
 <text data-node="root.overlay.1.modal.1.group.2.group.1.button[settings:server-config:save]" data-shader="stock::text" x="553.83" y="695.09" font-family="Inter Variable" font-size="14.00" font-weight="600" fill="rgba(255,255,255,0.502)" text-anchor="middle">Save</text>
 </g>
 <clipPath id="clip-67"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-67)">
-<rect data-node="root.overlay.1.modal.1.group.3.button[settings:close]" data-shader="stock::rounded_rect" x="1085.99" y="722.00" width="58.01" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-sm)" />
+<rect data-node="root.overlay.1.modal.1.group.3.button[settings:close]" data-shader="stock::rounded_rect" x="1085.99" y="722.00" width="58.01" height="32.00" rx="6.00" fill="#212225" stroke="#363a3f" stroke-width="1.00" filter="url(#shadow-xs)" />
 </g>
 <clipPath id="clip-68"><rect x="440.00" y="130.00" width="720.00" height="640.00"/></clipPath><g clip-path="url(#clip-68)">
 <text data-node="root.overlay.1.modal.1.group.3.button[settings:close]" data-shader="stock::text" x="1114.99" y="743.09" font-family="Inter Variable" font-size="14.00" font-weight="500" fill="#edeef0" text-anchor="middle">Close</text>
