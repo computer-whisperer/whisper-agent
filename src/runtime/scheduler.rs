@@ -3056,8 +3056,9 @@ impl Scheduler {
         // or synthesized). Only refs with `ticks` claim the ticker; a
         // second claim on the same thread violates the single-ticker
         // invariant and is healed by demoting the later ref to
-        // non-ticking (first weave wins, deterministically by the
-        // persister's load order).
+        // non-ticking. First-loaded wins — read_dir order is arbitrary,
+        // but any single winner restores the invariant, and the
+        // demotion is flushed so the choice sticks across restarts.
         for mut weave in state.weaves {
             for thread_ref in &mut weave.threads {
                 if !thread_ref.ticks {
@@ -3632,9 +3633,26 @@ impl Scheduler {
                     caps.behaviors, ceiling.behaviors
                 ));
             }
-            base_scope.pod_modify = caps.pod_modify;
-            base_scope.dispatch = caps.dispatch;
-            base_scope.behaviors = caps.behaviors;
+            if ticked_by_weave.is_some() {
+                // Derived threads act with the weave's authority (the
+                // primary thread's scope is the base): a caps override
+                // may only narrow it, never re-widen toward the pod
+                // ceiling. Behavior fires keep assignment semantics —
+                // their base IS the behavior's own declared scope.
+                if caps.pod_modify < base_scope.pod_modify {
+                    base_scope.pod_modify = caps.pod_modify;
+                }
+                if caps.dispatch < base_scope.dispatch {
+                    base_scope.dispatch = caps.dispatch;
+                }
+                if caps.behaviors < base_scope.behaviors {
+                    base_scope.behaviors = caps.behaviors;
+                }
+            } else {
+                base_scope.pod_modify = caps.pod_modify;
+                base_scope.dispatch = caps.dispatch;
+                base_scope.behaviors = caps.behaviors;
+            }
         }
         let mut scope = match &dispatched_by_parent {
             Some((parent_id, _)) => match self.tasks.get(parent_id) {
@@ -3794,20 +3812,19 @@ impl Scheduler {
     }
 
     /// Push the setup prefix onto a freshly-registered thread's
-    /// conversation. System prompt is pod config — always available
-    /// synchronously, pushed immediately. Tool manifest depends on
-    /// resource state — if the thread has a host-env binding whose
-    /// MCP hasn't finished its initial `tools/list` yet, the
-    /// `Role::Tools` push is **deferred** to the
-    /// `HostEnvMcpCompleted` handler so the snapshot captures the
-    /// real catalog rather than an empty placeholder.
+    /// conversation: system prompt (pod config, always available
+    /// synchronously), then the tool manifest and memory block via
+    /// `finalize_setup_prefix` — all synchronous, so the full prefix
+    /// is in place before `create_task` returns. (The v1-era deferral
+    /// of the `Role::Tools` push to a host-env MCP completion handler
+    /// was removed with the v1 retirement; `finalize_setup_prefix` is
+    /// idempotent but no longer has a late caller.)
     ///
-    /// Why defer instead of refresh-later: the setup prefix is
-    /// cache-fingerprint-critical to the model provider — once the
-    /// thread starts trading messages with the LLM, mutating
-    /// `messages[1]` busts the entire cached prefix and forces a
-    /// rewrite on every subsequent turn. Getting it right the first
-    /// time beats fixing it up after.
+    /// The setup prefix is cache-fingerprint-critical to the model
+    /// provider — once the thread starts trading messages with the
+    /// LLM, mutating `messages[1]` busts the entire cached prefix and
+    /// forces a rewrite on every subsequent turn. Getting it right
+    /// the first time beats fixing it up after.
     ///
     /// `override_choice` — when `Some`, takes precedence over the
     /// pod's cached `system_prompt`. `File { name }` reads
@@ -4989,11 +5006,15 @@ impl Scheduler {
                     // message and re-enter the step loop — it will
                     // kick a fresh turn. Remaining follow-ups wait
                     // for the next boundary.
-                    let has_followup = self
-                        .tasks
-                        .get(thread_id)
-                        .map(|t| !t.pending_tool_result_followups.is_empty())
-                        .unwrap_or(false);
+                    // Dormant threads keep their follow-ups queued —
+                    // dequeuing here would hand each one to the rejecting
+                    // input guard and drain the queue into the void.
+                    let has_followup = self.thread_ticker.contains_key(thread_id)
+                        && self
+                            .tasks
+                            .get(thread_id)
+                            .map(|t| !t.pending_tool_result_followups.is_empty())
+                            .unwrap_or(false);
                     if has_followup && let Some(task) = self.tasks.get_mut(thread_id) {
                         let notification = task.pending_tool_result_followups.remove(0);
                         self.mark_dirty(thread_id);
@@ -5645,6 +5666,12 @@ impl Scheduler {
     }
 
     fn inject_pending_knowledge_nudge(&mut self, thread_id: &str) -> bool {
+        // Dormant threads keep their nudges queued: injecting would kick
+        // a turn whose first boundary has no ticking weave to route it.
+        // The queue drains normally once a weave adopts the thread.
+        if !self.thread_ticker.contains_key(thread_id) {
+            return false;
+        }
         let should_inject = self
             .tasks
             .get(thread_id)

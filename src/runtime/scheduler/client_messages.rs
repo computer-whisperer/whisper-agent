@@ -1145,17 +1145,28 @@ impl Scheduler {
                     self.tasks.remove(thread_id);
                     self.cancel_tokens.remove(thread_id);
                     self.dirty.remove(thread_id);
-                    // Weave state rides with the pod directory; drop the
-                    // in-memory entries (the on-disk JSONs move to
-                    // .archived/ with the rest of the pod).
-                    if let Some(weave_id) = self.thread_ticker.remove(thread_id) {
-                        self.weaves.remove(&weave_id);
-                        self.dirty_weaves.remove(&weave_id);
-                    }
+                    self.thread_ticker.remove(thread_id);
                     self.router.drop_thread(thread_id);
                     if let Some((bindings, config)) = resources {
                         self.release_thread_resources(thread_id, &pod_id, &bindings, &config);
                     }
+                }
+                // Weave state rides with the pod directory; drop the
+                // in-memory entries by pod ownership (the on-disk JSONs
+                // move to .archived/ with the rest of the pod). Keyed on
+                // `pod_id` rather than the ticker index so weaves with
+                // only dormant refs don't leak — a leaked entry would
+                // let a later `flush_dirty` re-create the weaves dir
+                // inside the archived pod.
+                let pod_weave_ids: Vec<String> = self
+                    .weaves
+                    .values()
+                    .filter(|weave| weave.pod_id == pod_id)
+                    .map(|weave| weave.id.clone())
+                    .collect();
+                for weave_id in pod_weave_ids {
+                    self.weaves.remove(&weave_id);
+                    self.dirty_weaves.remove(&weave_id);
                 }
                 // Broadcast first so every client clears its view before the
                 // disk move completes; the disk write is best-effort.

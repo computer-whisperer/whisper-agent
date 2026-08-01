@@ -219,6 +219,15 @@ impl Scheduler {
                         detail: "thread is not at a clean turn boundary".into(),
                     });
                 }
+                // Compaction runs a turn on the thread; a dormant one
+                // (no ticking weave) can't run it, and the COMPACTING
+                // bit would wedge set when the input guard rejects the
+                // summary prompt.
+                if !self.thread_ticker.contains_key(thread_id) {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: "thread is dormant (no weave ticks it)".into(),
+                    });
+                }
                 Ok(())
             }
             Function::CreateThread { pod_id, parent, .. } => {
@@ -602,10 +611,15 @@ impl Scheduler {
             );
             return;
         }
-        let parent_can_accept = matches!(
-            parent_state,
-            ThreadStateLabel::Idle | ThreadStateLabel::Completed
-        );
+        // A dormant parent (no ticking weave) can't run the turn this
+        // notification kicks — queue instead of delivering into the
+        // rejecting input guard, so the child's result survives until a
+        // weave adopts the parent.
+        let parent_can_accept = self.thread_ticker.contains_key(parent_thread_id)
+            && matches!(
+                parent_state,
+                ThreadStateLabel::Idle | ThreadStateLabel::Completed
+            );
         if !parent_can_accept {
             // Parent is mid-turn; queue the notification on the
             // parent's state. `drain_pending_tool_result_followups`

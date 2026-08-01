@@ -7,9 +7,14 @@ persistence at `<pod>/weaves/<weave_id>.json`), and the cross-thread
 effect vocabulary: `append_entry` / `derive_thread` / `adopt_ticker` /
 `release_ticker` executors with scheduler admission, journaled outcomes
 (refusals included), persisted per-ref ticker flags, and dormant-thread
-semantics. The executors' first emitter is the scripted driver of step 7;
-until it lands they are exercised by tests only. The architectural target
-was re-ratified 2026-07-31 into the pod/weave/thread model below.
+semantics. The executors' first emitter is the scripted driver of step 7.
+Test coverage honesty: the weave/journal/persistence building blocks are
+unit-tested, but the scheduler-level executors themselves have no test
+harness (constructing a `Scheduler` requires the full dependency
+surface) — their admission logic first runs under test when step 7's
+driver loop exercises it, unless a harness is built first. The
+architectural target was re-ratified 2026-07-31 into the pod/weave/
+thread model below.
 
 This document records the migration from the original one-user/one-model
 agent loop to pods hosting materialized model contexts (threads) coordinated
@@ -216,10 +221,16 @@ preserve the hand-mirrored Kotlin protocol layer.
    `append_entry` is pure transcript pollution (no wake) and is refused
    while the target is mid-generation, preserving the materialized-log
    forensics rule; input to a dormant thread is rejected at the input
-   path rather than failing the thread; sweeps unreference from every
-   weave and retire emptied ones. Ticker claims persist per-ref
-   (`ticks`, defaulting true for step-5 JSON) and conflicting claims are
-   demoted deterministically at load.
+   path rather than failing the thread, while queued work (knowledge
+   nudges, async dispatch follow-ups) stays queued until a weave adopts
+   it, and compaction is refused outright; a derived thread's caps
+   override composes by narrowing against the primary scope, never
+   assignment; sweeps unreference from every weave and retire emptied
+   ones, and pod archival drops weaves by pod ownership (not the ticker
+   index) so dormant-only weaves don't leak. Ticker claims persist per-ref
+   (`ticks`, defaulting true for step-5 JSON); conflicting claims are
+   healed at load by demoting all but the first-loaded ref and flushing
+   the demotion, so the winner sticks across restarts.
 7. First scripted (Lua) driver plus the minimal presentation vocabulary.
    Exercise case: the auto-mode permission checker — a derived thread with
    curated seed, custom prompt, tools disabled, intercepting tool admission —
