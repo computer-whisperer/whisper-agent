@@ -3245,6 +3245,7 @@ impl Scheduler {
                 } else {
                     let mut cancel_events = Vec::new();
                     child.cancel(&mut cancel_events);
+                    self.weave_cancelled(child_id);
                     self.fire_and_reset_cancel_token(child_id);
                     self.router.dispatch_events(child_id, cancel_events);
                     self.mark_dirty(child_id);
@@ -3305,6 +3306,7 @@ impl Scheduler {
         };
         let mut cancel_events = Vec::new();
         task.cancel(&mut cancel_events);
+        self.weave_cancelled(thread_id);
         // Fire the per-thread cancel signal so any in-flight
         // model/tool/MCP HTTP request aborts at the wire instead of
         // running to completion and having its result discarded.

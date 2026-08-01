@@ -1145,6 +1145,13 @@ impl Scheduler {
                     self.tasks.remove(thread_id);
                     self.cancel_tokens.remove(thread_id);
                     self.dirty.remove(thread_id);
+                    // Weave state rides with the pod directory; drop the
+                    // in-memory entries (the on-disk JSONs move to
+                    // .archived/ with the rest of the pod).
+                    if let Some(weave_id) = self.thread_ticker.remove(thread_id) {
+                        self.weaves.remove(&weave_id);
+                        self.dirty_weaves.remove(&weave_id);
+                    }
                     self.router.drop_thread(thread_id);
                     if let Some((bindings, config)) = resources {
                         self.release_thread_resources(thread_id, &pod_id, &bindings, &config);

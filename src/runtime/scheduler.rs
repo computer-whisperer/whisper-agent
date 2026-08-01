@@ -801,6 +801,15 @@ pub struct Scheduler {
     knowledge_config: crate::pod::config::KnowledgeConfig,
 
     tasks: HashMap<String, Thread>,
+    /// Durable driver instances. Every thread is coordinated by exactly
+    /// one ticking weave (step 5: a singleton weave sharing the thread's
+    /// id). Driver policy, driver state, and the effect journal live
+    /// here; threads keep only the mechanical I/O state machine.
+    weaves: HashMap<String, crate::runtime::weave::Weave>,
+    /// Single-ticker index: thread id → the weave that drives its turns.
+    /// Maintained alongside `tasks`/`weaves` registration; a thread with
+    /// no entry cannot run.
+    thread_ticker: HashMap<String, String>,
     /// Per-thread cancel signal. Cloned into every dispatched I/O
     /// future; firing it aborts the in-flight HTTP request (model
     /// call or MCP invoke) instead of merely discarding the result
@@ -828,6 +837,11 @@ pub struct Scheduler {
     /// Tasks modified during the current scheduler-loop iteration. Flushed to the
     /// persister before the next iteration starts.
     dirty: HashSet<String>,
+    /// Weaves modified during the current scheduler-loop iteration.
+    /// Flushed alongside `dirty` — pending journal records must be on
+    /// disk before their lazy provider/tool futures are polled
+    /// (write-ahead boundary).
+    dirty_weaves: HashSet<String>,
     /// Behavior ids whose `state.json` needs writeback. Keyed by
     /// `(pod_id, behavior_id)`. Serialization through this set (rather
     /// than tokio::spawn per update) means two rapid state changes
@@ -1043,12 +1057,15 @@ impl Scheduler {
                 knowledge_autoquery_in_flight: HashSet::new(),
                 knowledge_config,
                 tasks: HashMap::new(),
+                weaves: HashMap::new(),
+                thread_ticker: HashMap::new(),
                 cancel_tokens: HashMap::new(),
                 router: ThreadEventRouter::new(audit, host_id),
                 forensic_sink,
                 resources,
                 next_op_id: 1,
                 dirty: HashSet::new(),
+                dirty_weaves: HashSet::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
                 usage_tx,
@@ -2676,17 +2693,6 @@ impl Scheduler {
         })
     }
 
-    /// Iterate the thread's bound MCP host entries in precedence
-    /// order. v1 host-env MCPs are gone; the v2 path doesn't go
-    /// through the resource registry, so this only walks shared MCP
-    /// hosts in pod-declared order (no prefix on legacy entries).
-    fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<BoundMcp<'_>> {
-        let Some(task) = self.tasks.get(thread_id) else {
-            return Vec::new();
-        };
-        self.bound_mcp_hosts_for(thread_id, &task.config.participants.default_responder)
-    }
-
     fn bound_mcp_hosts_for(
         &self,
         thread_id: &str,
@@ -3044,9 +3050,18 @@ impl Scheduler {
             // the same id — disk wins.
             self.pods.insert(pod.id.clone(), pod);
         }
+        // Register weaves before their threads so the ticker index is
+        // populated by the time any thread becomes steppable. The
+        // persister guarantees every loaded thread has a weave (loaded
+        // or synthesized).
+        for weave in state.weaves {
+            for thread_ref in &weave.threads {
+                self.thread_ticker
+                    .insert(thread_ref.thread_id.clone(), weave.id.clone());
+            }
+            self.weaves.insert(weave.id.clone(), weave);
+        }
         for mut task in state.threads {
-            let had_legacy_driver_state = task.turns_in_cycle != 0;
-            task.migrate_legacy_driver_state();
             // Re-pre-register each of the thread's host-env bindings so
             // the registry knows their (provider, spec) pairs. For
             // `Named` bindings we look up the pod entry by name; for
@@ -3055,7 +3070,7 @@ impl Scheduler {
             // spec no longer matches any allow entry) are dropped; if
             // the resulting list is empty and the pod has a default,
             // we re-seed from the default.
-            let mut bindings_dirty = had_legacy_driver_state;
+            let mut bindings_dirty = false;
             // Escalation is a live-conn pointer; conn ids don't
             // survive a process restart. Any persisted
             // `Interactive{via_conn}` refers to a conn that no longer
@@ -3294,6 +3309,12 @@ impl Scheduler {
         }
     }
 
+    fn mark_weave_dirty(&mut self, weave_id: &str) {
+        if self.persister.is_some() {
+            self.dirty_weaves.insert(weave_id.to_string());
+        }
+    }
+
     /// Mark a behavior's `state.json` for writeback at the next flush.
     /// Mirrors `mark_dirty` for threads — the batched flush at the end
     /// of each scheduler-loop iteration serializes writes per-behavior,
@@ -3310,6 +3331,7 @@ impl Scheduler {
     async fn flush_dirty(&mut self) {
         let Some(persister) = &self.persister else {
             self.dirty.clear();
+            self.dirty_weaves.clear();
             self.dirty_behaviors.clear();
             return;
         };
@@ -3320,6 +3342,15 @@ impl Scheduler {
             };
             if let Err(e) = persister.flush(task).await {
                 error!(thread_id = %thread_id, error = %e, "persist flush failed");
+            }
+        }
+        let dirty_weaves = std::mem::take(&mut self.dirty_weaves);
+        for weave_id in dirty_weaves {
+            let Some(weave) = self.weaves.get(&weave_id) else {
+                continue;
+            };
+            if let Err(e) = persister.flush_weave(weave).await {
+                error!(weave_id = %weave_id, error = %e, "weave flush failed");
             }
         }
         let dirty_behaviors = std::mem::take(&mut self.dirty_behaviors);
@@ -4103,6 +4134,23 @@ impl Scheduler {
         let thread_id = task.id.clone();
         let pod_id = task.pod_id.clone();
 
+        // Every new thread gets its singleton ticking weave (created here
+        // rather than per creation path so forks, compaction
+        // continuations, dispatches, and behavior spawns all pass
+        // through). Load-path registration happens in `load_state`; a
+        // ticker entry that already exists is respected.
+        if !self.thread_ticker.contains_key(&thread_id) {
+            let weave = crate::runtime::weave::Weave::singleton_for_thread(
+                thread_id.clone(),
+                pod_id.clone(),
+                task.config.driver.clone(),
+            );
+            self.thread_ticker
+                .insert(thread_id.clone(), weave.id.clone());
+            self.mark_weave_dirty(&weave.id);
+            self.weaves.insert(weave.id.clone(), weave);
+        }
+
         let backend_names: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
             .chain(
                 task.config
@@ -4374,6 +4422,7 @@ impl Scheduler {
             self.router.dispatch_events(thread_id, events);
             list
         };
+        self.weave_interrupt_pending(thread_id, "superseded by new user message");
         for tool_use_id in &interrupted {
             if let Some(fn_id) = self.find_tool_function_for(thread_id, tool_use_id) {
                 self.complete_function(
@@ -4410,6 +4459,7 @@ impl Scheduler {
         // nudges the thread out via `clear_waiting_resource` as each
         // resource transitions Ready (sandbox or primary MCP).
         let pending_resources = self.pending_resources_for(thread_id);
+        self.weave_input_accepted(thread_id);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_user_message(text.clone(), attachments.clone(), pending_resources);
@@ -4455,6 +4505,7 @@ impl Scheduler {
         // Deliberately don't derive a title from this text — a
         // machine-rendered notification isn't a useful thread title.
         let pending_resources = self.pending_resources_for(thread_id);
+        self.weave_input_accepted(thread_id);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_tool_result_text(text.clone(), pending_resources);
@@ -4520,8 +4571,6 @@ impl Scheduler {
         }
         self.maybe_launch_knowledge_autoquery(&thread_id, &result, pending_io);
 
-        // Build per-tool-name annotation map so the task's approval policy can consult it.
-        let annotations = self.annotations_for(&thread_id);
         // Snapshot the tool-call outcome before handing the result to
         // the thread (which consumes it by move). The snapshot lets us
         // close out the matching `ActiveFunctionEntry` after the
@@ -4537,13 +4586,24 @@ impl Scheduler {
             _ => None,
         };
         if let Some(task) = self.tasks.get_mut(&thread_id) {
-            task.apply_io_result(op_id, result, &annotations, &mut events);
+            task.apply_io_result(op_id, result, &mut events);
             if !knowledge_hit_keys.is_empty() {
                 task.seen_knowledge_hits.extend(knowledge_hit_keys);
             }
         } else {
             warn!(%thread_id, op_id, "io completion for unknown task");
             return;
+        }
+        // A model-call error fails the thread inside `apply_io_result`;
+        // the thread no longer owns the journal, so resolve the pending
+        // `RunAgent` record on its ticking weave here. Idempotent — only
+        // Pending records are touched.
+        if let Some(message) = self
+            .tasks
+            .get(&thread_id)
+            .and_then(|task| task.failure_detail())
+        {
+            self.weave_fail_pending(&thread_id, &message);
         }
         let suppress_knowledge_nudge = events.iter().any(|event| {
             matches!(
@@ -4796,27 +4856,6 @@ impl Scheduler {
         self.step_until_blocked(&completion.thread_id, pending_io);
     }
 
-    fn annotations_for(&self, thread_id: &str) -> HashMap<String, ToolAnnotations> {
-        let mut out: HashMap<String, ToolAnnotations> = crate::tools::builtin_tools::annotations();
-        for bound in self.bound_mcp_hosts(thread_id) {
-            for (name, ann) in &bound.entry.annotations {
-                // Annotations are keyed by the *public* tool name so
-                // approval lookups match what the model called. For
-                // host-env MCPs that's `{env_prefix}_{name}`; shared
-                // MCPs and builtins use the bare name.
-                let public_name = match bound.prefix {
-                    Some(prefix) => format!("{prefix}_{name}"),
-                    None => name.clone(),
-                };
-                // First-wins matches `route_tool`'s builtin-then-host
-                // precedence, so the approval decision agrees with
-                // where the call will actually land.
-                out.entry(public_name).or_insert_with(|| ann.clone());
-            }
-        }
-        out
-    }
-
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
     fn step_until_blocked(
@@ -4860,6 +4899,10 @@ impl Scheduler {
                     };
                 }
                 StepOutcome::Continue => continue,
+                StepOutcome::Boundary(boundary) => {
+                    self.apply_thread_boundary(thread_id, boundary, pending_io);
+                    continue;
+                }
                 StepOutcome::Paused => {
                     // Idle turn boundary. If this thread has queued
                     // `<dispatched-thread-notification>` envelopes
@@ -4910,6 +4953,321 @@ impl Scheduler {
         // targeting it as their `ThreadToolCall` caller.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
+    }
+
+    /// Route a [`ThreadBoundary`] through the thread's ticking weave and
+    /// apply the driver's decision back onto the thread. Every path either
+    /// changes the thread's state or fails the thread — the step loop
+    /// re-enters after this, and an unchanged boundary state would spin.
+    ///
+    /// Journal choreography: pending records (`RunAgent`,
+    /// `DispatchTools`) are written to the weave before the matching
+    /// thread transition and I/O dispatch; the batched `flush_dirty` at
+    /// the end of the loop iteration lands them on disk before the lazy
+    /// I/O futures are polled (write-ahead boundary). Synchronous effects
+    /// (`Continue`, `Finish`) are recorded completed.
+    fn apply_thread_boundary(
+        &mut self,
+        thread_id: &str,
+        boundary: crate::runtime::thread::ThreadBoundary,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        use crate::runtime::driver::{DriverEffect, DriverFinishReason, PersistedDriverEffect};
+        use crate::runtime::thread::ThreadBoundary;
+
+        let Some((participants, max_turns)) = self
+            .tasks
+            .get(thread_id)
+            .map(|task| (task.config.participants.clone(), task.config.max_turns))
+        else {
+            return;
+        };
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            self.fail_thread_at_boundary(thread_id, "weave", "no ticking weave for thread");
+            return;
+        };
+        if !self.weaves.contains_key(&weave_id) {
+            self.fail_thread_at_boundary(thread_id, "weave", "ticking weave is not registered");
+            return;
+        }
+        self.mark_weave_dirty(&weave_id);
+
+        match boundary {
+            ThreadBoundary::TurnStart => {
+                let effect = self
+                    .weaves
+                    .get_mut(&weave_id)
+                    .expect("checked above")
+                    .next_effect(&participants, max_turns);
+                match effect {
+                    Ok(DriverEffect::RunAgent {
+                        participant_id,
+                        turn,
+                    }) => {
+                        let generation = whisper_agent_protocol::GenerationContext::new(
+                            uuid::Uuid::new_v4().to_string(),
+                            participant_id,
+                        );
+                        let effect_id = self
+                            .weaves
+                            .get_mut(&weave_id)
+                            .expect("checked above")
+                            .record_pending_effect(PersistedDriverEffect::RunAgent {
+                                generation: generation.clone(),
+                                turn,
+                            });
+                        let op_id = self.next_op_id;
+                        self.next_op_id += 1;
+                        let mut events = Vec::new();
+                        let request = self.tasks.get_mut(thread_id).and_then(|task| {
+                            task.begin_model_call(op_id, generation, effect_id, turn, &mut events)
+                        });
+                        self.router.dispatch_events(thread_id, events);
+                        match request {
+                            Some(req) => {
+                                let fut =
+                                    io_dispatch::build_io_future(self, thread_id.to_string(), req);
+                                pending_io.push(fut);
+                            }
+                            None => self.fail_thread_at_boundary(
+                                thread_id,
+                                "weave",
+                                "RunAgent effect did not apply at turn start",
+                            ),
+                        }
+                    }
+                    Ok(DriverEffect::Finish) => {
+                        self.record_completed_weave_effect(
+                            &weave_id,
+                            PersistedDriverEffect::Finish {
+                                generation: None,
+                                reason: DriverFinishReason::TurnLimit,
+                            },
+                        );
+                        tracing::warn!(
+                            max_turns,
+                            thread_id = %thread_id,
+                            "driver finished cycle at turn limit"
+                        );
+                        self.finish_thread_cycle(thread_id);
+                    }
+                    Ok(other) => self.fail_thread_at_boundary(
+                        thread_id,
+                        "driver",
+                        &format!("driver returned invalid effect at runnable boundary: {other:?}"),
+                    ),
+                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
+                }
+            }
+            ThreadBoundary::AgentCompleted {
+                generation,
+                effect_id,
+                has_tool_calls,
+            } => {
+                let weave = self.weaves.get_mut(&weave_id).expect("checked above");
+                weave.complete_effect(effect_id);
+                let effect = weave.agent_completed(
+                    &generation.participant_id,
+                    &participants,
+                    has_tool_calls,
+                );
+                match effect {
+                    Ok(DriverEffect::DispatchTools) => {
+                        let tool_use_ids: Vec<String> = self
+                            .tasks
+                            .get(thread_id)
+                            .map(|task| match &task.internal {
+                                crate::runtime::thread::ThreadInternalState::AgentBoundary {
+                                    pending_tool_uses,
+                                    ..
+                                } => pending_tool_uses
+                                    .iter()
+                                    .map(|t| t.tool_use_id.clone())
+                                    .collect(),
+                                _ => Vec::new(),
+                            })
+                            .unwrap_or_default();
+                        let dispatch_effect_id = self
+                            .weaves
+                            .get_mut(&weave_id)
+                            .expect("checked above")
+                            .record_pending_effect(PersistedDriverEffect::DispatchTools {
+                                generation,
+                                tool_use_ids,
+                            });
+                        let applied = self
+                            .tasks
+                            .get_mut(thread_id)
+                            .map(|task| task.begin_tool_dispatch(dispatch_effect_id))
+                            .unwrap_or(false);
+                        if !applied {
+                            self.fail_thread_at_boundary(
+                                thread_id,
+                                "weave",
+                                "DispatchTools effect did not apply at agent boundary",
+                            );
+                        }
+                    }
+                    Ok(DriverEffect::Finish) => {
+                        self.record_completed_weave_effect(
+                            &weave_id,
+                            PersistedDriverEffect::Finish {
+                                generation: Some(generation),
+                                reason: DriverFinishReason::AgentCompleted,
+                            },
+                        );
+                        self.finish_thread_cycle(thread_id);
+                    }
+                    Ok(other) => self.fail_thread_at_boundary(
+                        thread_id,
+                        "driver",
+                        &format!(
+                            "driver returned invalid effect after agent completion: {other:?}"
+                        ),
+                    ),
+                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
+                }
+            }
+            ThreadBoundary::ToolsCompleted {
+                generation,
+                effect_id,
+            } => {
+                let weave = self.weaves.get_mut(&weave_id).expect("checked above");
+                weave.complete_effect(effect_id);
+                let effect = weave.tools_completed(&generation.participant_id, &participants);
+                match effect {
+                    Ok(DriverEffect::Continue) => {
+                        self.record_completed_weave_effect(
+                            &weave_id,
+                            PersistedDriverEffect::Continue { generation },
+                        );
+                        let applied = self
+                            .tasks
+                            .get_mut(thread_id)
+                            .map(|task| task.continue_cycle())
+                            .unwrap_or(false);
+                        if !applied {
+                            self.fail_thread_at_boundary(
+                                thread_id,
+                                "weave",
+                                "Continue effect did not apply at tools boundary",
+                            );
+                        }
+                    }
+                    Ok(DriverEffect::Finish) => {
+                        self.record_completed_weave_effect(
+                            &weave_id,
+                            PersistedDriverEffect::Finish {
+                                generation: Some(generation),
+                                reason: DriverFinishReason::ToolsCompleted,
+                            },
+                        );
+                        self.finish_thread_cycle(thread_id);
+                    }
+                    Ok(other) => self.fail_thread_at_boundary(
+                        thread_id,
+                        "driver",
+                        &format!("driver returned invalid effect after tools: {other:?}"),
+                    ),
+                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
+                }
+            }
+        }
+    }
+
+    /// Record a synchronously-completed effect on a weave that is known
+    /// to be registered.
+    fn record_completed_weave_effect(
+        &mut self,
+        weave_id: &str,
+        effect: crate::runtime::driver::PersistedDriverEffect,
+    ) {
+        if let Some(weave) = self.weaves.get_mut(weave_id) {
+            weave.record_completed_effect(effect);
+        }
+    }
+
+    /// Reset the ticking weave's driver cycle state after external input
+    /// was accepted into `thread_id`. The ratified input path: input
+    /// arrives at the weave, which resets its cycle and routes the
+    /// append to its primary thread.
+    fn weave_input_accepted(&mut self, thread_id: &str) {
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            return;
+        };
+        if let Some(weave) = self.weaves.get_mut(&weave_id) {
+            if let Err(error) = weave.input_accepted() {
+                warn!(%thread_id, weave_id = %weave_id, %error, "weave rejected input");
+            }
+            self.mark_weave_dirty(&weave_id);
+        }
+    }
+
+    /// Interrupt any pending journal records on `thread_id`'s ticking
+    /// weave (cancel / heal paths). No-op when nothing is pending.
+    fn weave_interrupt_pending(&mut self, thread_id: &str, reason: &str) {
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            return;
+        };
+        if let Some(weave) = self.weaves.get_mut(&weave_id) {
+            weave.interrupt_pending(reason);
+            self.mark_weave_dirty(&weave_id);
+        }
+    }
+
+    /// Fail any pending journal records on `thread_id`'s ticking weave.
+    /// Called when the thread reaches `Failed` outside the boundary
+    /// router (model-call errors integrate inside the thread).
+    pub(super) fn weave_fail_pending(&mut self, thread_id: &str, message: &str) {
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            return;
+        };
+        if let Some(weave) = self.weaves.get_mut(&weave_id) {
+            weave.fail_pending(message);
+            self.mark_weave_dirty(&weave_id);
+        }
+    }
+
+    /// Interrupt pending weave journal records for a cancelled thread.
+    /// Shared by the CancelThread handler and cascade-cancel paths in
+    /// `scheduler/functions.rs`.
+    pub(super) fn weave_cancelled(&mut self, thread_id: &str) {
+        self.weave_interrupt_pending(thread_id, "cancelled");
+    }
+
+    /// Apply a driver `Finish` to the thread and broadcast the events.
+    fn finish_thread_cycle(&mut self, thread_id: &str) {
+        let mut events = Vec::new();
+        if let Some(task) = self.tasks.get_mut(thread_id) {
+            task.finish_cycle(&mut events);
+        }
+        self.router.dispatch_events(thread_id, events);
+        self.mark_dirty(thread_id);
+    }
+
+    /// Fail a thread at a weave boundary, resolving any pending journal
+    /// records with the same message and broadcasting the error.
+    fn fail_thread_at_boundary(&mut self, thread_id: &str, phase: &str, message: &str) {
+        if let Some(weave_id) = self.thread_ticker.get(thread_id).cloned()
+            && let Some(weave) = self.weaves.get_mut(&weave_id)
+        {
+            weave.fail_pending(message);
+            self.mark_weave_dirty(&weave_id);
+        }
+        let mut events = vec![crate::runtime::thread::ThreadEvent::Error {
+            message: message.to_string(),
+        }];
+        if let Some(task) = self.tasks.get_mut(thread_id) {
+            let prev_public = task.public_state();
+            task.fail(phase, message);
+            let new_public = task.public_state();
+            if prev_public != new_public {
+                events
+                    .push(crate::runtime::thread::ThreadEvent::StateChanged { state: new_public });
+            }
+        }
+        self.router.dispatch_events(thread_id, events);
+        self.mark_dirty(thread_id);
     }
 
     fn should_wait_for_knowledge_autoquery(&self, thread_id: &str) -> bool {
@@ -5110,6 +5468,26 @@ impl Scheduler {
         self.tasks.remove(thread_id);
         self.cancel_tokens.remove(thread_id);
         self.dirty.remove(thread_id);
+        // Weave teardown: drop the ticker entry, unreference the thread,
+        // and retire the weave entirely once it references nothing (the
+        // singleton case today).
+        let mut weave_to_remove: Option<String> = None;
+        if let Some(weave_id) = self.thread_ticker.remove(thread_id) {
+            let now_empty = match self.weaves.get_mut(&weave_id) {
+                Some(weave) => {
+                    weave.threads.retain(|r| r.thread_id != thread_id);
+                    weave.threads.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                self.weaves.remove(&weave_id);
+                self.dirty_weaves.remove(&weave_id);
+                weave_to_remove = Some(weave_id);
+            } else {
+                self.mark_weave_dirty(&weave_id);
+            }
+        }
         // v2 sessions are per-thread (no dedup) so nothing to release-
         // count — drop fires CloseSession to the daemon. In-flight
         // dispatch futures hold their own Arc<SessionHandle> clones,
@@ -5147,6 +5525,19 @@ impl Scheduler {
             };
             if let Err(e) = result {
                 warn!(thread_id = %tid, error = %e, "retention sweep disk op failed");
+            }
+            if let Some(weave_id) = weave_to_remove {
+                let result = match action {
+                    RetentionAction::Archive => {
+                        self::retention::archive_weave_json(&pod_dir, &weave_id).await
+                    }
+                    RetentionAction::Delete => {
+                        self::retention::delete_weave_json(&pod_dir, &weave_id).await
+                    }
+                };
+                if let Err(e) = result {
+                    warn!(weave_id = %weave_id, error = %e, "weave retention disk op failed");
+                }
             }
         });
     }

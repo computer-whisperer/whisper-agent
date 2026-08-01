@@ -36,8 +36,9 @@ use tracing::{info, warn};
 use crate::pod::behaviors::{self as pod_behaviors};
 use crate::pod::fs::MEMORY_DIR;
 use crate::pod::fs::is_readonly_path;
-use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR};
+use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR, WEAVES_DIR};
 use crate::runtime::thread::{Thread, ThreadInternalState};
+use crate::runtime::weave::Weave;
 use whisper_agent_protocol::{
     FsEntry, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
     ThreadSummary,
@@ -49,6 +50,10 @@ use whisper_agent_protocol::{
 pub struct LoadedState {
     pub pods: Vec<Pod>,
     pub threads: Vec<Thread>,
+    /// Durable driver instances, one per thread today (singleton weaves).
+    /// Threads persisted before weaves existed have one synthesized at
+    /// load, lifting any thread-level driver state and journal.
+    pub weaves: Vec<Weave>,
 }
 
 /// Upper bound on files the webui's generic viewer will read. 1 MiB is
@@ -96,6 +101,38 @@ impl Persister {
         self.pod_dir(pod_id)
             .join(THREADS_DIR)
             .join(format!("{thread_id}.json"))
+    }
+
+    fn weave_path(&self, pod_id: &str, weave_id: &str) -> PathBuf {
+        self.pod_dir(pod_id)
+            .join(WEAVES_DIR)
+            .join(format!("{weave_id}.json"))
+    }
+
+    /// Write one weave's JSON to
+    /// `<pods_root>/<weave.pod_id>/weaves/<weave.id>.json`.
+    pub async fn flush_weave(&self, weave: &Weave) -> Result<()> {
+        let weaves_dir = self.pod_dir(&weave.pod_id).join(WEAVES_DIR);
+        fs::create_dir_all(&weaves_dir)
+            .await
+            .with_context(|| format!("mkdir {}", weaves_dir.display()))?;
+        let json = serde_json::to_vec_pretty(weave)?;
+        let path = self.weave_path(&weave.pod_id, &weave.id);
+        fs::write(&path, json)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Remove one weave's JSON. Missing file is not an error — archive
+    /// and delete paths race with GC and both outcomes mean "gone".
+    pub async fn remove_weave(&self, pod_id: &str, weave_id: &str) -> Result<()> {
+        let path = self.weave_path(pod_id, weave_id);
+        match fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+        }
     }
 
     /// Write the task's thread JSON. The thread lands at
@@ -182,6 +219,7 @@ impl Persister {
         let mut state = LoadedState {
             pods: Vec::new(),
             threads: Vec::new(),
+            weaves: Vec::new(),
         };
         let mut entries = match fs::read_dir(&self.pods_root).await {
             Ok(e) => e,
@@ -209,9 +247,10 @@ impl Persister {
                 continue;
             }
             match load_pod(&path, name).await {
-                Ok((pod, threads)) => {
+                Ok((pod, threads, weaves)) => {
                     state.pods.push(pod);
                     state.threads.extend(threads);
+                    state.weaves.extend(weaves);
                 }
                 Err(e) => {
                     warn!(path = %path.display(), error = %e, "skip pod: failed to load");
@@ -221,6 +260,7 @@ impl Persister {
         info!(
             pods = state.pods.len(),
             threads = state.threads.len(),
+            weaves = state.weaves.len(),
             "loaded persisted state",
         );
         Ok(state)
@@ -667,10 +707,18 @@ async fn read_thread_summaries(pod_dir: &Path, pod_id: &str) -> Vec<ThreadSummar
     out
 }
 
-/// Load one pod directory: parse `pod.toml`, then walk `threads/` and read
-/// every JSON underneath. Stamps `pod_id` onto each loaded thread so the
-/// scheduler can register it against the right pod.
-async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
+/// Load one pod directory: parse `pod.toml`, then walk `threads/` and
+/// `weaves/` and read every JSON underneath. Stamps `pod_id` onto each
+/// loaded thread and weave so the scheduler can register them against the
+/// right pod.
+///
+/// Every thread ends up coordinated by a weave: threads persisted before
+/// weaves existed get a singleton synthesized here, lifting any
+/// thread-level driver state / effect journal (and the still-older raw
+/// `turns_in_cycle` counter) into it. After load no I/O can be in flight
+/// — `load_one` heals in-flight threads — so any journal record still
+/// pending is stale and is marked interrupted.
+async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>, Vec<Weave>)> {
     let toml_path = pod_dir.join(POD_TOML);
     let raw_toml = fs::read_to_string(&toml_path)
         .await
@@ -713,6 +761,40 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
         }
     }
 
+    let mut weaves: Vec<Weave> = Vec::new();
+    let weaves_dir = pod_dir.join(WEAVES_DIR);
+    if let Ok(mut entries) = fs::read_dir(&weaves_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match load_one_weave(&path, pod_id).await {
+                Ok(weave) => weaves.push(weave),
+                Err(e) => warn!(path = %path.display(), error = %e, "skip unreadable weave file"),
+            }
+        }
+    }
+    for task in &mut threads {
+        if weaves.iter().any(|w| w.references(&task.id)) {
+            continue;
+        }
+        let mut weave =
+            Weave::singleton_for_thread(task.id.clone(), pod_id, task.config.driver.clone());
+        weave.import_thread_driver_state(
+            std::mem::take(&mut task.driver_state),
+            std::mem::take(&mut task.effect_journal),
+            task.turns_in_cycle,
+        );
+        task.turns_in_cycle = 0;
+        weaves.push(weave);
+    }
+    for weave in &mut weaves {
+        if weave.effect_journal.has_pending() {
+            weave.interrupt_pending("task was in-flight at last shutdown");
+        }
+    }
+
     let mut pod = Pod::new(
         PodId::from(pod_id),
         pod_dir.to_path_buf(),
@@ -727,7 +809,19 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>)> {
     for b in pod_behaviors::load_behaviors_for_pod(pod_dir, pod_id).await {
         pod.behaviors.insert(b.id.clone(), b);
     }
-    Ok((pod, threads))
+    Ok((pod, threads, weaves))
+}
+
+async fn load_one_weave(path: &Path, pod_id: &str) -> Result<Weave> {
+    let bytes = fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut weave: Weave =
+        serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))?;
+    // Stamp pod_id from the directory we found it in — same rename rule
+    // as threads.
+    weave.pod_id = pod_id.to_string();
+    Ok(weave)
 }
 
 async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
@@ -916,6 +1010,8 @@ fn is_in_flight(state: &ThreadInternalState) -> bool {
             | ThreadInternalState::NeedsModelCall
             | ThreadInternalState::AwaitingModel { .. }
             | ThreadInternalState::AwaitingTools { .. }
+            | ThreadInternalState::AgentBoundary { .. }
+            | ThreadInternalState::ToolsBoundary { .. }
     )
 }
 
@@ -1108,34 +1204,89 @@ mod tests {
 
     #[tokio::test]
     async fn load_interrupts_journaled_effect_that_was_in_flight_at_shutdown() {
+        use whisper_agent_protocol::GenerationContext;
+
         let dir = temp_dir();
         let p = Persister::new(dir.clone()).await.unwrap();
         let mut task = sample_task("t-effect-restart");
         task.submit_user_message("hello".into(), Vec::new(), Vec::new());
-        let mut next_op_id = 1;
+
+        // Mirror the scheduler's boundary choreography: journal the
+        // pending RunAgent on the weave, apply it to the thread, flush
+        // both — the state a crash mid-model-call leaves on disk.
+        let mut weave = crate::runtime::weave::Weave::singleton_for_thread(
+            task.id.clone(),
+            task.pod_id.clone(),
+            task.config.driver.clone(),
+        );
+        weave.input_accepted().unwrap();
+        let generation = GenerationContext::new("run-restart", "agent");
+        let effect_id =
+            weave.record_pending_effect(crate::runtime::driver::PersistedDriverEffect::RunAgent {
+                generation: generation.clone(),
+                turn: 1,
+            });
         let mut events = Vec::new();
-        assert!(matches!(
-            task.step(&mut next_op_id, &mut events),
-            crate::runtime::thread::StepOutcome::DispatchIo(
-                crate::runtime::thread::IoRequest::ModelCall { .. }
-            )
-        ));
-        assert!(task.effect_journal.has_pending());
+        assert!(
+            task.begin_model_call(1, generation, effect_id, 1, &mut events)
+                .is_some()
+        );
+        assert!(weave.effect_journal.has_pending());
         p.flush(&task).await.unwrap();
+        p.flush_weave(&weave).await.unwrap();
 
         let loaded = p.load_all().await.unwrap();
         assert_eq!(loaded.threads.len(), 1);
+        assert_eq!(loaded.weaves.len(), 1);
         let resumed = &loaded.threads[0];
         assert!(matches!(
             &resumed.internal,
             ThreadInternalState::Failed { at_phase, .. } if at_phase == "resume"
         ));
-        assert!(!resumed.effect_journal.has_pending());
+        let resumed_weave = &loaded.weaves[0];
+        assert_eq!(resumed_weave.id, "t-effect-restart");
+        assert!(!resumed_weave.effect_journal.has_pending());
         assert!(matches!(
-            &resumed.effect_journal.records()[0].outcome,
+            &resumed_weave.effect_journal.records()[0].outcome,
             crate::runtime::driver::DriverEffectOutcome::Interrupted { reason }
                 if reason == "task was in-flight at last shutdown"
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_synthesizes_singleton_weave_and_lifts_legacy_driver_fields() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let task = sample_task("t-weave-synth");
+        p.flush(&task).await.unwrap();
+        // Rewrite the thread JSON as the pre-weave generation: thread-level
+        // driver state with a non-zero cycle counter.
+        let thread_path = dir
+            .join("t-weave-synth")
+            .join(crate::pod::THREADS_DIR)
+            .join("t-weave-synth.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&thread_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "driver_state".into(),
+            serde_json::json!({
+                "kind": "builtin_single_agent_chat",
+                "cycles_started": 2,
+                "turns_in_cycle": 3,
+            }),
+        );
+        std::fs::write(&thread_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let loaded = p.load_all().await.unwrap();
+        assert_eq!(loaded.weaves.len(), 1);
+        let weave = &loaded.weaves[0];
+        assert_eq!(weave.id, "t-weave-synth");
+        assert_eq!(weave.primary_thread_id(), Some("t-weave-synth"));
+        assert_eq!(
+            crate::runtime::driver::turns_in_cycle(&weave.driver_state),
+            3
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

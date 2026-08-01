@@ -38,6 +38,9 @@ pub type ThreadId = String;
 pub const POD_TOML: &str = "pod.toml";
 /// Subdirectory under the pod that holds per-thread JSON files.
 pub const THREADS_DIR: &str = "threads";
+/// Subdirectory under the pod that holds per-weave JSON files —
+/// durable driver instances coordinating the pod's threads.
+pub const WEAVES_DIR: &str = "weaves";
 /// Filename of the per-pod operational state (pause flag, etc.).
 /// Kept out of `pod.toml` so pause/resume doesn't touch
 /// version-controlled config.

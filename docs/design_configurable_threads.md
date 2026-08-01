@@ -1,9 +1,13 @@
 # Configurable Threads and Weaves
 
-Status: **participant foundation, execution profiles, the compatibility
-driver, and its durable effect journal landed** (migration steps 1–4). The
-architectural target was re-ratified 2026-07-31 into the pod/weave/thread
-model below; steps 5+ are rewritten against it and have not started.
+Status: **steps 1–5 landed** — participant foundation, execution profiles,
+the compatibility driver with its durable effect journal, and the weave
+entity itself: every thread is coordinated by a singleton weave, driver
+policy is inverted out of `Thread` (boundary outcomes routed through the
+ticking weave by the scheduler), and driver state/journal persist at
+`<pod>/weaves/<weave_id>.json`. The architectural target was re-ratified
+2026-07-31 into the pod/weave/thread model below; steps 6+ have not
+started.
 
 This document records the migration from the original one-user/one-model
 agent loop to pods hosting materialized model contexts (threads) coordinated
@@ -196,9 +200,12 @@ preserve the hand-mirrored Kotlin protocol layer.
 4. Extract the current state machine as `builtin_single_agent_chat` behind
    the driver/effect contract with a durable journal. **Landed.**
 5. Introduce the weave entity: persist driver instance (program ref,
-   state, journal, thread refs, presentation) separately from threads;
-   singleton-weave migration for legacy threads; move driver state and
-   journal off `Thread`; thread refcounting via the resource-registry idiom.
+   state, journal, thread refs) separately from threads; singleton-weave
+   migration for legacy threads; move driver state and journal off
+   `Thread`; invert boundary policy so the scheduler routes
+   `StepOutcome::Boundary` through the ticking weave. **Landed.**
+   (Presentation and thread refcounting deferred to steps 6–7 with their
+   first real consumers.)
 6. Cross-thread effect vocabulary: `derive_thread`, provenance-carrying
    `append_entry`, single-ticker admission with `adopt_ticker`/
    `release_ticker`.

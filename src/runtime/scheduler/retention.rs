@@ -7,6 +7,7 @@
 /// Archive preserves the JSON under `<pod>/.archived/threads/`;
 /// Delete removes it outright. Which applies is determined by the
 /// owning behavior's `on_completion.retention` policy.
+#[derive(Clone, Copy)]
 pub(super) enum RetentionAction {
     Archive,
     Delete,
@@ -39,6 +40,42 @@ pub(super) async fn delete_thread_json(
     let path = pod_dir
         .join(crate::pod::THREADS_DIR)
         .join(format!("{thread_id}.json"));
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Move `<pod>/weaves/<wid>.json` to `<pod>/.archived/weaves/<wid>.json`.
+/// A missing source is Ok — weaves synthesized at load but never flushed
+/// have no file yet.
+pub(super) async fn archive_weave_json(
+    pod_dir: &std::path::Path,
+    weave_id: &str,
+) -> anyhow::Result<()> {
+    let src = pod_dir
+        .join(crate::pod::WEAVES_DIR)
+        .join(format!("{weave_id}.json"));
+    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let dst_dir = pod_dir.join(".archived").join(crate::pod::WEAVES_DIR);
+    tokio::fs::create_dir_all(&dst_dir).await?;
+    let dst = dst_dir.join(format!("{weave_id}.json"));
+    tokio::fs::rename(&src, &dst).await?;
+    Ok(())
+}
+
+/// Remove `<pod>/weaves/<wid>.json` outright. Idempotent for a missing
+/// file, matching `delete_thread_json`.
+pub(super) async fn delete_weave_json(
+    pod_dir: &std::path::Path,
+    weave_id: &str,
+) -> anyhow::Result<()> {
+    let path = pod_dir
+        .join(crate::pod::WEAVES_DIR)
+        .join(format!("{weave_id}.json"));
     match tokio::fs::remove_file(&path).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
