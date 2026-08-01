@@ -284,6 +284,15 @@ pub struct ToolUseReq {
     pub input: serde_json::Value,
 }
 
+/// Per-tool admission decision for [`Thread::resolve_tool_dispatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDecision {
+    pub tool_use_id: String,
+    pub allow: bool,
+    /// Denial text shown to the model as the error tool_result.
+    pub message: Option<String>,
+}
+
 /// Request for an I/O operation to be dispatched by the scheduler.
 ///
 /// Phase 3d.ii: only the per-thread, state-machine-driven ops live here.
@@ -1247,6 +1256,12 @@ impl Thread {
     /// Apply a `RunAgent` effect at the `TurnStart` boundary. `effect_id`
     /// is the pending `RunAgent` record the scheduler journaled on the
     /// weave before calling this.
+    ///
+    /// Also applies from `Idle` / `Completed`: a scripted driver may run
+    /// a turn on a thread that has no queued input — a freshly derived
+    /// thread whose context is its seed, or a finished checker being
+    /// reused after a new question was appended. The request is built
+    /// from the thread's current log either way.
     pub fn begin_model_call(
         &mut self,
         op_id: OpId,
@@ -1255,7 +1270,12 @@ impl Thread {
         turn: u32,
         events: &mut Vec<ThreadEvent>,
     ) -> Option<IoRequest> {
-        if !matches!(self.internal, ThreadInternalState::NeedsModelCall) {
+        if !matches!(
+            self.internal,
+            ThreadInternalState::NeedsModelCall
+                | ThreadInternalState::Idle
+                | ThreadInternalState::Completed
+        ) {
             return None;
         }
         events.push(ThreadEvent::AssistantBegin {
@@ -1301,6 +1321,60 @@ impl Thread {
             pending_dispatch: make_dispatch_order(pending_tool_uses),
             pending_io: HashMap::new(),
             completed: Vec::new(),
+        };
+        self.touch();
+        true
+    }
+
+    /// Apply a `ResolveTools` effect at the `AgentCompleted` boundary:
+    /// per-tool admission decided by the ticking driver. Denied requests
+    /// (and any request without a decision) are closed immediately with
+    /// synthesized error tool_results; admitted requests dispatch as
+    /// usual. With zero admissions the tool_result message flushes on
+    /// the next step and the thread surfaces `ToolsCompleted` — the
+    /// model sees every denial in one Anthropic-valid batch.
+    pub fn resolve_tool_dispatch(
+        &mut self,
+        effect_id: crate::runtime::driver::DriverEffectId,
+        decisions: &[ToolDecision],
+        events: &mut Vec<ThreadEvent>,
+    ) -> bool {
+        if !matches!(self.internal, ThreadInternalState::AgentBoundary { .. }) {
+            return false;
+        }
+        let ThreadInternalState::AgentBoundary {
+            generation,
+            pending_tool_uses,
+            ..
+        } = std::mem::replace(&mut self.internal, ThreadInternalState::Idle)
+        else {
+            unreachable!("matched guard above");
+        };
+        let mut approved = Vec::new();
+        let mut completed = Vec::new();
+        for req in pending_tool_uses {
+            let decision = decisions.iter().find(|d| d.tool_use_id == req.tool_use_id);
+            match decision {
+                Some(d) if d.allow => approved.push(req),
+                other => {
+                    let text = other
+                        .and_then(|d| d.message.clone())
+                        .unwrap_or_else(|| "tool call denied by driver".to_string());
+                    completed.push(synth_interrupted_tool_result(
+                        &req.tool_use_id,
+                        &text,
+                        &generation,
+                        events,
+                    ));
+                }
+            }
+        }
+        self.internal = ThreadInternalState::AwaitingTools {
+            generation,
+            effect_id,
+            pending_dispatch: make_dispatch_order(approved),
+            pending_io: HashMap::new(),
+            completed,
         };
         self.touch();
         true

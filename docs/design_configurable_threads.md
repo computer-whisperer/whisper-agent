@@ -1,6 +1,8 @@
 # Configurable Threads and Weaves
 
-Status: **steps 1–6 landed** — participant foundation, execution profiles,
+Status: **steps 1–6 landed, step 7 driver-half landed** (scripted Lua
+drivers with the auto-mode checker exercise case working end-to-end;
+presentation vocabulary pending) — participant foundation, execution profiles,
 the compatibility driver with its durable effect journal, the weave
 entity (singleton coordination, driver policy inverted out of `Thread`,
 persistence at `<pod>/weaves/<weave_id>.json`), and the cross-thread
@@ -234,6 +236,25 @@ preserve the hand-mirrored Kotlin protocol layer.
    curated seed, custom prompt, tools disabled, intercepting tool admission —
    chosen because it stresses exactly the cases the rejected projection
    model could not express.
+   **Driver half landed** (7a; sequencing ratified 2026-07-31: driver
+   first, presentation after, shaped by what working drivers need).
+   Contract: a program at `<pod>/drivers/<name>.lua` defines
+   `on_event(state, event) -> { effects, state }` — an event handler
+   with explicit JSON state, deliberately not a coroutine (a parked
+   coroutine can't be snapshotted or replayed after restart). Events
+   are the thread-tagged boundaries plus `input_accepted` and
+   `thread_derived`; effects are thread-targeted
+   run/dispatch/resolve/continue/finish plus the step-6 cross-thread
+   vocabulary. Each event runs in a fresh sandboxed VM (no io/os,
+   memory + instruction budgets); the weave snapshots the program's
+   sha256. Tool interception works by parking: the driver leaves the
+   primary at its agent boundary (the step loop breaks instead of
+   spinning; boundaries re-fire, so handlers are idempotent), runs the
+   checker, then emits `resolve_tools` — per-tool admission whose
+   denials become synthesized error tool_results in one batch.
+   `examples/drivers/auto_mode_checker.lua` is the working exercise
+   case, tested end-to-end (deny and allow paths) in the scheduler
+   harness. Presentation vocabulary (7b) not started.
 8. Move compaction onto weave machinery: head-advance along a `compaction`
    edge; delete the compaction-specific in-flight bit, internal originator,
    state hook, lineage field, and wire lifecycle.

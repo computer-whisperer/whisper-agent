@@ -78,6 +78,11 @@ pub struct Weave {
     /// Durable requested/completed effect history for this driver instance.
     #[serde(default)]
     pub effect_journal: DriverEffectJournal,
+    /// Content hash of the scripted driver program this weave last ran —
+    /// the snapshot that keeps persisted behavior explainable after the
+    /// program file changes. `None` for builtin drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_program_hash: Option<String>,
     /// Threads this weave references. The single-ticker invariant is
     /// enforced by the scheduler's `thread_ticker` index, not here; this
     /// list is the weave's own record of what it coordinates.
@@ -102,6 +107,7 @@ impl Weave {
             driver_state: DriverState::for_config(&driver),
             driver,
             effect_journal: DriverEffectJournal::default(),
+            driver_program_hash: None,
             threads: vec![WeaveThreadRef {
                 thread_id,
                 role: WeaveThreadRole::Primary,
@@ -283,14 +289,27 @@ impl Weave {
     }
 
     /// Resolve a pending record. Zero is the legacy sentinel for internal
-    /// state persisted before effect journaling; it is accepted and ignored.
+    /// state persisted before effect journaling; it is accepted and
+    /// ignored. An already-resolved record is tolerated too: bulk
+    /// interrupts (heal / cancel / superseding input) on a multi-thread
+    /// weave can resolve a record whose I/O still completes later.
     pub fn complete_effect(&mut self, effect_id: DriverEffectId) {
         if effect_id == 0 {
             return;
         }
         self.touch();
-        let completed = self.effect_journal.complete(effect_id);
-        debug_assert!(completed);
+        let _ = self.effect_journal.complete(effect_id);
+    }
+
+    /// Fail one specific pending record — the precise counterpart to
+    /// [`Self::fail_pending`] for multi-thread weaves, where a bulk fail
+    /// would clobber unrelated in-flight records.
+    pub fn fail_effect(&mut self, effect_id: DriverEffectId, message: impl Into<String>) {
+        if effect_id == 0 {
+            return;
+        }
+        self.touch();
+        let _ = self.effect_journal.fail(effect_id, message);
     }
 
     pub fn fail_pending(&mut self, message: impl Into<String>) {

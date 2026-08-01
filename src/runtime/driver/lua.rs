@@ -93,10 +93,14 @@ pub struct ScriptedToolCall {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScriptedEffect {
     /// Run one model turn on a ticked thread parked at a turn boundary.
-    RunAgent { thread_id: String },
+    RunAgent {
+        thread_id: String,
+    },
     /// Dispatch every tool requested by the turn parked at the agent
     /// boundary.
-    DispatchTools { thread_id: String },
+    DispatchTools {
+        thread_id: String,
+    },
     /// Resolve the parked tool requests per-tool: denied calls get
     /// synthesized error results, admitted calls dispatch. Any request
     /// without a decision is denied.
@@ -105,9 +109,13 @@ pub enum ScriptedEffect {
         decisions: Vec<ScriptedToolDecision>,
     },
     /// Take another model turn after tools completed.
-    ContinueCycle { thread_id: String },
+    ContinueCycle {
+        thread_id: String,
+    },
     /// End the thread's cycle and yield for input.
-    FinishCycle { thread_id: String },
+    FinishCycle {
+        thread_id: String,
+    },
     /// Append one authored entry into a referenced thread's transcript
     /// (pure pollution — the target is not woken).
     AppendEntry {
@@ -142,8 +150,12 @@ pub enum ScriptedEffect {
         #[serde(default)]
         source_thread_id: Option<String>,
     },
-    AdoptTicker { thread_id: String },
-    ReleaseTicker { thread_id: String },
+    AdoptTicker {
+        thread_id: String,
+    },
+    ReleaseTicker {
+        thread_id: String,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -199,7 +211,7 @@ pub fn run_event(
     lua.set_memory_limit(MEMORY_LIMIT_BYTES)
         .map_err(|e| format!("lua memory limit: {e}"))?;
     let spent = std::cell::Cell::new(0u64);
-    lua.set_hook(
+    let hook_installed = lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(HOOK_EVERY),
         move |_lua, _debug| {
             let now = spent.get() + HOOK_EVERY as u64;
@@ -213,6 +225,7 @@ pub fn run_event(
             }
         },
     );
+    hook_installed.map_err(|e| format!("lua instruction hook: {e}"))?;
 
     lua.load(source)
         .set_name(chunk_name)
@@ -423,12 +436,17 @@ mod tests {
 
     #[test]
     fn missing_handler_and_syntax_errors_are_driver_failures() {
-        let err = run_event("x = 1", "nohandler", &json!({}), &event_turn_start("t", 1))
-            .unwrap_err();
+        let err =
+            run_event("x = 1", "nohandler", &json!({}), &event_turn_start("t", 1)).unwrap_err();
         assert!(err.contains("no `on_event`"), "{err}");
 
-        let err = run_event("function on_event(", "syntax", &json!({}), &event_turn_start("t", 1))
-            .unwrap_err();
+        let err = run_event(
+            "function on_event(",
+            "syntax",
+            &json!({}),
+            &event_turn_start("t", 1),
+        )
+        .unwrap_err();
         assert!(err.contains("failed to load"), "{err}");
     }
 

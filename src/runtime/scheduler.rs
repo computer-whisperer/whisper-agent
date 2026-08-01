@@ -28,6 +28,7 @@ mod dispatch;
 mod feed_workers;
 mod functions;
 mod retention;
+mod scripted;
 mod server_config;
 #[cfg(test)]
 mod testing;
@@ -3531,6 +3532,12 @@ impl Scheduler {
             .validate()
             .map_err(|e| format!("invalid thread participants: {e}"))?;
         validate_participant_profile_requests(&config.participants, &participant_profile_requests)?;
+        // A scripted driver must load at creation time — a bad name or
+        // unreadable program should reject the create, not fail the
+        // thread at its first boundary.
+        if let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = &config.driver {
+            self.load_driver_program(&pod_id, name)?;
+        }
 
         // Resolve the binding choices (backend / sandbox / shared MCP hosts):
         // start from pod defaults, layer the request on top, validate every
@@ -4544,7 +4551,7 @@ impl Scheduler {
         // nudges the thread out via `clear_waiting_resource` as each
         // resource transitions Ready (sandbox or primary MCP).
         let pending_resources = self.pending_resources_for(thread_id);
-        self.weave_input_accepted(thread_id);
+        self.weave_input_accepted(thread_id, pending_io);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_user_message(text.clone(), attachments.clone(), pending_resources);
@@ -4602,7 +4609,7 @@ impl Scheduler {
         // Deliberately don't derive a title from this text — a
         // machine-rendered notification isn't a useful thread title.
         let pending_resources = self.pending_resources_for(thread_id);
-        self.weave_input_accepted(thread_id);
+        self.weave_input_accepted(thread_id, pending_io);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_tool_result_text(text.clone(), pending_resources);
@@ -4997,8 +5004,16 @@ impl Scheduler {
                 }
                 StepOutcome::Continue => continue,
                 StepOutcome::Boundary(boundary) => {
-                    self.apply_thread_boundary(thread_id, boundary, pending_io);
-                    continue;
+                    if self.apply_thread_boundary(thread_id, boundary, pending_io) {
+                        continue;
+                    }
+                    // Parked: a scripted driver consumed the boundary
+                    // without moving this thread (it is orchestrating
+                    // other threads first). Stepping again would only
+                    // re-emit the same boundary — stop here; the
+                    // boundary re-fires when the thread is next
+                    // stepped.
+                    break;
                 }
                 StepOutcome::Paused => {
                     // Idle turn boundary. If this thread has queued
@@ -5057,9 +5072,13 @@ impl Scheduler {
     }
 
     /// Route a [`ThreadBoundary`] through the thread's ticking weave and
-    /// apply the driver's decision back onto the thread. Every path either
-    /// changes the thread's state or fails the thread — the step loop
-    /// re-enters after this, and an unchanged boundary state would spin.
+    /// apply the driver's decision back onto the thread. Returns whether
+    /// the thread's state advanced: builtin-driver paths always either
+    /// change the thread's state or fail the thread (an unchanged
+    /// boundary would spin the step loop); a scripted driver may
+    /// legitimately park the thread at the boundary while it
+    /// orchestrates other threads, reported as `false` so the step loop
+    /// breaks.
     ///
     /// Journal choreography: pending records (`RunAgent`,
     /// `DispatchTools`) are written to the weave before the matching
@@ -5072,7 +5091,7 @@ impl Scheduler {
         thread_id: &str,
         boundary: crate::runtime::thread::ThreadBoundary,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
+    ) -> bool {
         use crate::runtime::driver::{DriverEffect, DriverFinishReason, PersistedDriverEffect};
         use crate::runtime::thread::ThreadBoundary;
 
@@ -5081,17 +5100,23 @@ impl Scheduler {
             .get(thread_id)
             .map(|task| (task.config.participants.clone(), task.config.max_turns))
         else {
-            return;
+            return true;
         };
         let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
             self.fail_thread_at_boundary(thread_id, "weave", "no ticking weave for thread");
-            return;
+            return true;
         };
         if !self.weaves.contains_key(&weave_id) {
             self.fail_thread_at_boundary(thread_id, "weave", "ticking weave is not registered");
-            return;
+            return true;
         }
         self.mark_weave_dirty(&weave_id);
+        if matches!(
+            self.weaves[&weave_id].driver,
+            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+        ) {
+            return self.apply_scripted_boundary(&weave_id, thread_id, boundary, pending_io);
+        }
 
         match boundary {
             ThreadBoundary::TurnStart => {
@@ -5274,6 +5299,7 @@ impl Scheduler {
                 }
             }
         }
+        true
     }
 
     /// Record a synchronously-completed effect on a weave that is known
@@ -5291,17 +5317,30 @@ impl Scheduler {
     /// Reset the ticking weave's driver cycle state after external input
     /// was accepted into `thread_id`. The ratified input path: input
     /// arrives at the weave, which resets its cycle and routes the
-    /// append to its primary thread.
-    fn weave_input_accepted(&mut self, thread_id: &str) {
+    /// append to its primary thread. Scripted weaves additionally get an
+    /// `input_accepted` driver event (whose effects may need I/O).
+    fn weave_input_accepted(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
         let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
             return;
         };
-        if let Some(weave) = self.weaves.get_mut(&weave_id) {
-            if let Err(error) = weave.input_accepted() {
-                warn!(%thread_id, weave_id = %weave_id, %error, "weave rejected input");
-            }
-            self.mark_weave_dirty(&weave_id);
+        let Some(weave) = self.weaves.get_mut(&weave_id) else {
+            return;
+        };
+        if matches!(
+            weave.driver,
+            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+        ) {
+            self.scripted_input_accepted(&weave_id, thread_id, pending_io);
+            return;
         }
+        if let Err(error) = weave.input_accepted() {
+            warn!(%thread_id, weave_id = %weave_id, %error, "weave rejected input");
+        }
+        self.mark_weave_dirty(&weave_id);
     }
 
     /// Interrupt any pending journal records on `thread_id`'s ticking

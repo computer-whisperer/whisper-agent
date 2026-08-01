@@ -134,6 +134,16 @@ pub enum PersistedDriverEffect {
         generation: Option<GenerationContext>,
         reason: DriverFinishReason,
     },
+    /// Per-tool admission at an agent boundary (scripted drivers): the
+    /// approved subset dispatched, the denied subset closed with
+    /// synthesized error tool_results.
+    ResolveTools {
+        generation: GenerationContext,
+        #[serde(default)]
+        approved: Vec<String>,
+        #[serde(default)]
+        denied: Vec<String>,
+    },
     /// Cross-thread pollution: one entry appended into a referenced
     /// thread's transcript. The content lives in the target thread's log
     /// (rendered per-participant by the projection machinery at request
@@ -176,6 +186,8 @@ pub enum DriverFinishReason {
     AgentCompleted,
     ToolsCompleted,
     TurnLimit,
+    /// A scripted driver's own `finish_cycle` effect.
+    DriverChoice,
 }
 
 /// Terminal state is kept on the record rather than deleting it. That makes a

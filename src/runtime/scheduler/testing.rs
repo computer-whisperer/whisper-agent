@@ -17,12 +17,15 @@ use super::*;
 use crate::runtime::driver::{
     DriverEffectOutcome, EntryRef, PersistedDriverEffect, ThreadRelationship,
 };
+use crate::runtime::thread::{IoResult, ThreadInternalState};
 use crate::runtime::weave::WeaveThreadRole;
 use std::sync::atomic::{AtomicU64, Ordering};
 use whisper_agent_protocol::{
-    AllowMap, GenerationContext, Message, PodAllow, PodConfig, PodLimits, PodModifyCap,
-    ThreadDefaultCaps, ThreadDefaults,
+    AllowMap, ContentBlock, GenerationContext, Message, PodAllow, PodConfig, PodLimits,
+    PodModifyCap, ThreadConfigOverride, ThreadDefaultCaps, ThreadDefaults, ThreadDriverConfig,
 };
+
+const CHECKER_DRIVER: &str = include_str!("../../../examples/drivers/auto_mode_checker.lua");
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -175,6 +178,80 @@ impl Harness {
             },
             &mut pending_io,
         )
+    }
+
+    /// Install a scripted driver program into the default pod.
+    fn install_driver(&self, name: &str, source: &str) {
+        let drivers_dir = self.dir.join(TEST_POD).join("drivers");
+        std::fs::create_dir_all(&drivers_dir).expect("create drivers dir");
+        std::fs::write(drivers_dir.join(format!("{name}.lua")), source).expect("write driver");
+    }
+
+    /// Create a thread coordinated by the named scripted driver.
+    fn create_scripted_thread(&mut self, driver: &str) -> Result<String, String> {
+        let mut pending_io = FuturesUnordered::new();
+        self.sched.create_task(
+            None,
+            None,
+            None,
+            Some(ThreadConfigOverride {
+                driver: Some(ThreadDriverConfig::Scripted {
+                    name: driver.into(),
+                }),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut pending_io,
+        )
+    }
+
+    fn internal_of(&self, thread_id: &str) -> &ThreadInternalState {
+        &self.sched.tasks[thread_id].internal
+    }
+
+    /// Complete the thread's in-flight model call with a synthetic
+    /// response and pump its step loop — the test-side stand-in for a
+    /// provider round trip.
+    fn respond_model(
+        &mut self,
+        thread_id: &str,
+        content: Vec<ContentBlock>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let op_id = match self.internal_of(thread_id) {
+            ThreadInternalState::AwaitingModel { op_id, .. } => *op_id,
+            other => panic!("thread `{thread_id}` is not awaiting a model call: {other:?}"),
+        };
+        let response = crate::providers::model::ModelResponse {
+            content,
+            stop_reason: Some("end_turn".into()),
+            usage: Default::default(),
+        };
+        let mut events = Vec::new();
+        self.sched
+            .tasks
+            .get_mut(thread_id)
+            .unwrap()
+            .apply_io_result(op_id, IoResult::ModelCall(Ok(response)), &mut events);
+        self.sched.step_until_blocked(thread_id, pending_io);
+    }
+}
+
+fn text_block(text: &str) -> ContentBlock {
+    ContentBlock::Text { text: text.into() }
+}
+
+fn tool_use_block(id: &str, name: &str) -> ContentBlock {
+    ContentBlock::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input: serde_json::json!({}),
+        replay: None,
     }
 }
 
@@ -538,6 +615,226 @@ async fn sweep_unreferences_from_every_weave_and_retires_emptied_ones() {
     assert!(!h.sched.weaves.contains_key(&weave_id));
     assert!(!h.sched.dirty_weaves.contains(&weave_id));
     assert!(h.sched.thread_ticker.is_empty());
+}
+
+// ---------- scripted drivers ----------
+
+#[tokio::test]
+async fn scripted_driver_must_load_at_creation() {
+    let mut h = harness().await;
+    let err = h
+        .create_scripted_thread("no_such_driver")
+        .expect_err("missing program rejects creation");
+    assert!(err.contains("unreadable"), "{err}");
+
+    let err = h
+        .create_scripted_thread("../escape")
+        .expect_err("path traversal rejected");
+    assert!(err.contains("invalid driver program name"), "{err}");
+}
+
+#[tokio::test]
+async fn scripted_driver_error_fails_the_thread_not_the_scheduler() {
+    let mut h = harness().await;
+    h.install_driver("broken", "function on_event(s, e) error('boom') end");
+    let thread = h.create_scripted_thread("broken").unwrap();
+
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&thread, "hello".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&thread, &mut pending_io);
+
+    assert!(matches!(
+        h.internal_of(&thread),
+        ThreadInternalState::Failed { .. }
+    ));
+    assert!(
+        h.sched.tasks[&thread]
+            .failure_detail()
+            .unwrap_or_default()
+            .contains("boom")
+    );
+}
+
+#[tokio::test]
+async fn checker_driver_denies_tools_and_the_cycle_continues() {
+    let mut h = harness().await;
+    h.install_driver("auto_mode_checker", CHECKER_DRIVER);
+    let primary = h.create_scripted_thread("auto_mode_checker").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    // Turn 1: the driver runs the primary.
+    h.sched.send_user_message(
+        &primary,
+        "please delete everything".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // The model requests a tool — the driver must intercept: primary
+    // parks at its boundary, a checker thread is derived (custom
+    // prompt, no tools) and set running.
+    h.respond_model(
+        &primary,
+        vec![
+            text_block("I'll delete it now."),
+            tool_use_block("toolu-1", "delete_everything"),
+        ],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AgentBoundary { .. }
+    ));
+    let weave = &h.sched.weaves[&weave_id];
+    assert_eq!(weave.threads.len(), 2, "checker referenced by the weave");
+    let checker = weave
+        .threads
+        .iter()
+        .find(|r| r.thread_id != primary)
+        .expect("checker ref")
+        .thread_id
+        .clone();
+    assert_eq!(
+        weave
+            .threads
+            .iter()
+            .find(|r| r.thread_id == checker)
+            .unwrap()
+            .relationship
+            .as_ref()
+            .unwrap()
+            .kind,
+        "check"
+    );
+    assert!(matches!(
+        h.internal_of(&checker),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    let checker_conv = h.sched.tasks[&checker].conversation.messages();
+    assert!(
+        checker_conv[0].content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("permission checker"))
+        ),
+        "checker got its custom system prompt"
+    );
+    assert!(
+        checker_conv
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("toolu-1"))),
+        "checker was asked about the requested call"
+    );
+
+    // The checker denies. The checker finishes; the primary's tool
+    // request is closed with a synthesized error result and the cycle
+    // continues into turn 2 without executing anything.
+    h.respond_model(&checker, vec![text_block("DENY")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&checker),
+        ThreadInternalState::Completed
+    ));
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    let primary_conv = h.sched.tasks[&primary].conversation.messages();
+    assert!(
+        primary_conv
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                    if tool_use_id == "toolu-1"
+            ))),
+        "denied call closed with an error tool_result"
+    );
+    let journal = h.sched.weaves[&weave_id].effect_journal.records();
+    assert!(journal.iter().any(|r| matches!(
+        &r.effect,
+        PersistedDriverEffect::ResolveTools { approved, denied, .. }
+            if approved.is_empty() && denied == &vec!["toolu-1".to_string()]
+    )));
+    assert!(
+        journal
+            .iter()
+            .any(|r| matches!(&r.effect, PersistedDriverEffect::DeriveThread { .. }))
+    );
+
+    // Turn 2 responds without tools: the driver finishes the cycle.
+    h.respond_model(
+        &primary,
+        vec![text_block("Understood, I won't.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert_eq!(
+        h.sched.weaves[&weave_id].driver_program_hash.as_deref(),
+        Some(crate::runtime::driver::lua::program_hash(CHECKER_DRIVER).as_str()),
+        "weave snapshots the program it ran"
+    );
+}
+
+#[tokio::test]
+async fn checker_driver_allows_tools_and_they_dispatch() {
+    let mut h = harness().await;
+    h.install_driver("auto_mode_checker", CHECKER_DRIVER);
+    let primary = h.create_scripted_thread("auto_mode_checker").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "look around".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block("toolu-9", "list_images")],
+        &mut pending_io,
+    );
+    let checker = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| r.thread_id != primary)
+        .expect("checker derived")
+        .thread_id
+        .clone();
+
+    h.respond_model(&checker, vec![text_block("ALLOW ALL")], &mut pending_io);
+
+    // Approved: the primary is executing (or has executed) its tool
+    // batch — not failed, not denied.
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingTools { .. } | ThreadInternalState::AwaitingModel { .. }
+    ));
+    let primary_conv = h.sched.tasks[&primary].conversation.messages();
+    assert!(
+        !primary_conv
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { content, .. }
+                    if format!("{content:?}").contains("denied by permission checker")
+            ))),
+        "no denial result on the allow path"
+    );
+    let journal = h.sched.weaves[&weave_id].effect_journal.records();
+    assert!(journal.iter().any(|r| matches!(
+        &r.effect,
+        PersistedDriverEffect::ResolveTools { approved, denied, .. }
+            if approved == &vec!["toolu-9".to_string()] && denied.is_empty()
+    )));
 }
 
 // ---------- dormant queue preservation ----------
