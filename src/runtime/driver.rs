@@ -4,6 +4,8 @@
 //! This module owns only conversational policy: which participant runs next,
 //! whether a model response enters the tool loop, and when a cycle finishes.
 
+pub mod lua;
+
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
     GenerationContext, GenerationRunId, ParticipantId, ThreadDriverConfig, ThreadParticipants,
@@ -47,6 +49,22 @@ pub enum DriverState {
         #[serde(default)]
         turns_in_cycle: u32,
     },
+    Scripted {
+        /// The script's own state table, opaque to the runtime. Passed
+        /// to `on_event` and replaced by what it returns.
+        #[serde(default = "empty_object")]
+        data: serde_json::Value,
+        /// Mechanical per-thread model-turn counters since the last
+        /// external input — scheduler-maintained, outside the opaque
+        /// script state so the `max_turns` safety ceiling can't be
+        /// bypassed by driver code.
+        #[serde(default)]
+        turns: std::collections::BTreeMap<String, u32>,
+    },
+}
+
+fn empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 impl Default for DriverState {
@@ -66,8 +84,19 @@ impl DriverState {
     pub fn for_config(config: &ThreadDriverConfig) -> Self {
         match config {
             ThreadDriverConfig::BuiltinSingleAgentChat => Self::default(),
+            ThreadDriverConfig::Scripted { .. } => Self::Scripted {
+                data: empty_object(),
+                turns: Default::default(),
+            },
         }
     }
+}
+
+/// Error for builtin policy functions invoked against a scripted weave —
+/// the scheduler routes scripted drivers through the event/effect loop,
+/// never through these.
+fn scripted_misroute(site: &str) -> String {
+    format!("scripted driver routed to builtin policy ({site}); this is a scheduler bug")
 }
 
 /// Effect vocabulary currently consumed by `Thread`. These are requests, not
@@ -291,6 +320,9 @@ pub fn input_accepted(config: &ThreadDriverConfig, state: &mut DriverState) -> R
             *turns_in_cycle = 0;
             Ok(())
         }
+        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
+            Err(scripted_misroute("input_accepted"))
+        }
     }
 }
 
@@ -314,6 +346,9 @@ pub fn next_effect(
                 participant_id: participants.default_responder.clone(),
                 turn: *turns_in_cycle,
             })
+        }
+        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
+            Err(scripted_misroute("next_effect"))
         }
     }
 }
@@ -344,6 +379,9 @@ pub fn agent_completed(
                 DriverEffect::Finish
             })
         }
+        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
+            Err(scripted_misroute("agent_completed"))
+        }
     }
 }
 
@@ -367,12 +405,16 @@ pub fn tools_completed(
             }
             Ok(DriverEffect::Continue)
         }
+        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
+            Err(scripted_misroute("tools_completed"))
+        }
     }
 }
 
 pub fn turns_in_cycle(state: &DriverState) -> u32 {
     match state {
         DriverState::BuiltinSingleAgentChat { turns_in_cycle, .. } => *turns_in_cycle,
+        DriverState::Scripted { .. } => 0,
     }
 }
 
@@ -385,7 +427,7 @@ pub fn import_legacy_turn_count(state: &mut DriverState, legacy_turns: u32) {
         DriverState::BuiltinSingleAgentChat { turns_in_cycle, .. } if *turns_in_cycle == 0 => {
             *turns_in_cycle = legacy_turns;
         }
-        DriverState::BuiltinSingleAgentChat { .. } => {}
+        DriverState::BuiltinSingleAgentChat { .. } | DriverState::Scripted { .. } => {}
     }
 }
 

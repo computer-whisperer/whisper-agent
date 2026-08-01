@@ -333,6 +333,11 @@ impl ThreadConfig {
 pub enum ThreadDriverConfig {
     #[default]
     BuiltinSingleAgentChat,
+    /// A scripted (Lua) driver loaded from `<pod>/drivers/<name>.lua`.
+    /// The weave snapshots the program's content hash when it starts
+    /// coordinating, so persisted behavior stays explainable after the
+    /// program file changes.
+    Scripted { name: String },
 }
 
 /// Creation-time, inheritable execution choices for one model participant.
