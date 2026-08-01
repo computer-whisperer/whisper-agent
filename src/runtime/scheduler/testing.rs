@@ -1488,3 +1488,246 @@ async fn load_clears_a_persisted_compacting_marker() {
         }
     ));
 }
+
+// ---------- multi-agent enablers: participant selection + concurrency ----------
+
+/// Two model participants alternate in ONE thread: the driver runs the
+/// default responder, then (on its completion) finishes the cycle and
+/// runs the `critic` participant on the same transcript. The
+/// participant-selectable `run_agent` is the single-thread
+/// multi-voice conversation primitive.
+#[tokio::test]
+async fn scripted_driver_alternates_participants_in_one_thread() {
+    const DIALOGUE: &str = r#"
+function on_event(state, event)
+  local k = event.kind
+  if k == "turn_start" then
+    return { effects = { { kind = "run_agent", thread_id = event.thread_id } }, state = state }
+  end
+  if k == "agent_completed" then
+    if event.participant_id == "agent" then
+      return { effects = {
+        { kind = "finish_cycle", thread_id = event.thread_id },
+        { kind = "run_agent", thread_id = event.thread_id, participant = "critic" },
+      }, state = state }
+    end
+    return { effects = { { kind = "finish_cycle", thread_id = event.thread_id } }, state = state }
+  end
+  return { state = state }
+end
+"#;
+    use whisper_agent_protocol::{
+        ParticipantExecutionProfileRequest, ParticipantId, SystemPromptChoice, ThreadParticipant,
+        ThreadParticipantKind, ThreadParticipants,
+    };
+    let mut h = harness().await;
+    h.install_driver("dialogue", DIALOGUE);
+
+    let mut participants = ThreadParticipants::single_agent();
+    participants.members.push(ThreadParticipant {
+        id: "critic".into(),
+        kind: ThreadParticipantKind::Model,
+        display_name: Some("Critic".into()),
+    });
+    let mut profiles = std::collections::BTreeMap::new();
+    profiles.insert(
+        ParticipantId::new("critic"),
+        ParticipantExecutionProfileRequest {
+            system_prompt: Some(SystemPromptChoice::Text {
+                text: "You are a harsh critic.".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    let mut pending_io = FuturesUnordered::new();
+    let t1 = h
+        .sched
+        .create_task(
+            None,
+            None,
+            None,
+            Some(ThreadConfigOverride {
+                driver: Some(ThreadDriverConfig::Scripted {
+                    name: "dialogue".into(),
+                }),
+                participants: Some(participants),
+                participant_profiles: Some(profiles),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut pending_io,
+        )
+        .expect("multi-participant scripted thread creates");
+    let weave_id = h.weave_of(&t1);
+
+    h.sched
+        .send_user_message(&t1, "draft something".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    match h.internal_of(&t1) {
+        ThreadInternalState::AwaitingModel { generation, .. } => {
+            assert_eq!(generation.participant_id.as_str(), "agent");
+        }
+        other => panic!("expected default responder in flight, got {other:?}"),
+    }
+
+    h.respond_model(&t1, vec![text_block("here is my draft")], &mut pending_io);
+    // The driver finished the agent's cycle and started the critic on
+    // the same thread.
+    match h.internal_of(&t1) {
+        ThreadInternalState::AwaitingModel { generation, .. } => {
+            assert_eq!(generation.participant_id.as_str(), "critic");
+        }
+        other => panic!("expected critic turn in flight, got {other:?}"),
+    }
+
+    h.respond_model(&t1, vec![text_block("the draft is weak")], &mut pending_io);
+    assert!(matches!(h.internal_of(&t1), ThreadInternalState::Completed));
+
+    // Journal explains both voices: RunAgent records carry the two
+    // participant ids, in order, both completed.
+    let voices: Vec<String> = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .filter_map(|r| match &r.effect {
+            PersistedDriverEffect::RunAgent { generation, .. }
+                if r.outcome == DriverEffectOutcome::Completed =>
+            {
+                Some(generation.participant_id.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(voices, vec!["agent".to_string(), "critic".to_string()]);
+}
+
+/// An unregistered participant id is refused at admission and the
+/// refusal journals — profile resolution silently falls back for
+/// unknown ids, so a wrong-voice driver bug must not silently run.
+#[tokio::test]
+async fn run_agent_refuses_unregistered_participant() {
+    const GHOST: &str = r#"
+function on_event(state, event)
+  if event.kind == "turn_start" then
+    return { effects = { { kind = "run_agent", thread_id = event.thread_id, participant = "ghost" } }, state = state }
+  end
+  return { state = state }
+end
+"#;
+    let mut h = harness().await;
+    h.install_driver("ghost", GHOST);
+    let t1 = h.create_scripted_thread("ghost").unwrap();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&t1, "speak".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                &r.outcome,
+                DriverEffectOutcome::Failed { message } if message.contains("not registered")
+            )),
+        "refusal must journal"
+    );
+}
+
+/// One weave drives two derived worker threads whose model calls are in
+/// flight SIMULTANEOUSLY, and their out-of-order completions resolve
+/// the right journal records — the tangled-threads multi-agent
+/// substrate.
+#[tokio::test]
+async fn weave_runs_two_worker_threads_concurrently() {
+    const FANOUT: &str = r#"
+function on_event(state, event)
+  local k = event.kind
+  if k == "input_accepted" then
+    return { effects = {
+      { kind = "derive_thread", relationship = "worker",
+        seed = { { author = "user", text = "task A" } }, source_thread_id = event.thread_id },
+      { kind = "derive_thread", relationship = "worker",
+        seed = { { author = "user", text = "task B" } }, source_thread_id = event.thread_id },
+    }, state = state }
+  end
+  if k == "thread_derived" then
+    return { effects = { { kind = "run_agent", thread_id = event.thread_id } }, state = state }
+  end
+  if k == "agent_completed" then
+    return { effects = { { kind = "finish_cycle", thread_id = event.thread_id } }, state = state }
+  end
+  return { state = state }
+end
+"#;
+    let mut h = harness().await;
+    h.install_driver("fanout", FANOUT);
+    let primary = h.create_scripted_thread("fanout").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "fan out".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let workers: Vec<String> = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .filter(|r| r.thread_id != primary)
+        .map(|r| r.thread_id.clone())
+        .collect();
+    assert_eq!(workers.len(), 2, "two workers derived");
+    // The concurrency claim itself: both workers' model calls are in
+    // flight at the same time.
+    for worker in &workers {
+        assert!(
+            matches!(
+                h.internal_of(worker),
+                ThreadInternalState::AwaitingModel { .. }
+            ),
+            "worker `{worker}` should be awaiting its model call"
+        );
+    }
+
+    // Complete them OUT OF ORDER (B first) — each completion must
+    // resolve its own journal record and cycle, untouched by the
+    // other's in-flight state.
+    h.respond_model(&workers[1], vec![text_block("done B")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&workers[1]),
+        ThreadInternalState::Completed
+    ));
+    assert!(
+        matches!(
+            h.internal_of(&workers[0]),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "worker A must stay in flight while B completes"
+    );
+    h.respond_model(&workers[0], vec![text_block("done A")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&workers[0]),
+        ThreadInternalState::Completed
+    ));
+
+    let records = h.sched.weaves[&weave_id].effect_journal.records();
+    let run_agents: Vec<_> = records
+        .iter()
+        .filter(|r| matches!(&r.effect, PersistedDriverEffect::RunAgent { .. }))
+        .collect();
+    assert_eq!(run_agents.len(), 2);
+    assert!(
+        run_agents
+            .iter()
+            .all(|r| r.outcome == DriverEffectOutcome::Completed),
+        "both RunAgent records resolve precisely despite interleaving"
+    );
+}

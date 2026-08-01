@@ -305,9 +305,10 @@ impl Scheduler {
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), String> {
         match effect {
-            ScriptedEffect::RunAgent { thread_id } => {
-                self.scripted_run_agent(weave_id, &thread_id, pending_io)
-            }
+            ScriptedEffect::RunAgent {
+                thread_id,
+                participant,
+            } => self.scripted_run_agent(weave_id, &thread_id, participant, pending_io),
             ScriptedEffect::DispatchTools { thread_id } => {
                 self.scripted_dispatch_tools(weave_id, &thread_id, origin_thread, None, pending_io)
             }
@@ -417,17 +418,31 @@ impl Scheduler {
         &mut self,
         weave_id: &str,
         thread_id: &str,
+        participant: Option<String>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), String> {
         let Some(task) = self.tasks.get(thread_id) else {
             return Err(format!("run_agent: unknown thread `{thread_id}`"));
         };
         let max_turns = task.config.max_turns;
-        let participant = task.config.participants.default_responder.clone();
+        // Which registered participant speaks. `None` runs the default
+        // responder; an explicit id must name a Model member — profile
+        // resolution silently falls back to thread defaults for unknown
+        // ids, and a wrong-voice driver bug should journal, not
+        // silently run.
+        let requested = participant
+            .map(whisper_agent_protocol::ParticipantId::new)
+            .unwrap_or_else(|| task.config.participants.default_responder.clone());
+        let member_kind = task
+            .config
+            .participants
+            .member(&requested)
+            .map(|member| member.kind);
         let turn = self.scripted_turn_count(weave_id, thread_id) + 1;
         // Journal before admission so every refusal resolves the same
         // record precisely (auditable driver bugs, not silent drops).
-        let generation = GenerationContext::new(uuid::Uuid::new_v4().to_string(), participant);
+        let generation =
+            GenerationContext::new(uuid::Uuid::new_v4().to_string(), requested.clone());
         let effect_id = self
             .weaves
             .get_mut(weave_id)
@@ -437,6 +452,23 @@ impl Scheduler {
                 turn,
             });
         self.mark_weave_dirty(weave_id);
+        match member_kind {
+            Some(whisper_agent_protocol::ThreadParticipantKind::Model) => {}
+            Some(_) => {
+                let message =
+                    format!("run_agent: participant `{requested}` is not a model participant");
+                self.fail_weave_effect(weave_id, effect_id, &message);
+                return Err(message);
+            }
+            None => {
+                let message = format!(
+                    "run_agent: participant `{requested}` is not registered on thread \
+                     `{thread_id}`"
+                );
+                self.fail_weave_effect(weave_id, effect_id, &message);
+                return Err(message);
+            }
+        }
         if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
             let message = format!("run_agent: weave does not tick thread `{thread_id}`");
             self.fail_weave_effect(weave_id, effect_id, &message);

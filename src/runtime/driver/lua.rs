@@ -97,8 +97,14 @@ pub struct ScriptedToolCall {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScriptedEffect {
     /// Run one model turn on a ticked thread parked at a turn boundary.
+    /// `participant` selects which registered Model participant speaks
+    /// (its frozen execution profile — model, system prompt, tools —
+    /// shapes the request); omitted, the thread's default responder
+    /// runs. Unknown or non-Model ids are refused and journaled.
     RunAgent {
         thread_id: String,
+        #[serde(default)]
+        participant: Option<String>,
     },
     /// Dispatch every tool requested by the turn parked at the agent
     /// boundary.
@@ -387,7 +393,8 @@ mod tests {
         assert_eq!(
             out.effects,
             vec![ScriptedEffect::RunAgent {
-                thread_id: "t-1".into()
+                thread_id: "t-1".into(),
+                participant: None,
             }]
         );
         assert_eq!(out.state, json!({"seen": 1}));

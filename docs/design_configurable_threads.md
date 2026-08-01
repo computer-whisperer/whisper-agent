@@ -152,7 +152,10 @@ Target effect vocabulary (supersedes the earlier single-thread list):
 
 ```text
 append_entry(thread, author, content, provenance)   -- pollution included
-run_agent(thread, limits)                           -- tick one turn
+run_agent(thread, participant?, limits)             -- tick one turn; which
+                                                    -- registered Model voice
+                                                    -- speaks (default: the
+                                                    -- thread's responder)
 call_tool(thread, tool, arguments)
 derive_thread(definition, seed, relationship)       -- fork/compact/check/...
 advance_head(thread)                                -- promote to primary (step 8)
