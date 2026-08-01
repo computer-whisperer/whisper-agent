@@ -228,6 +228,13 @@ impl Scheduler {
                         detail: "thread is dormant (no weave ticks it)".into(),
                     });
                 }
+                if self.has_scripted_ticker(thread_id) {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: "scripted-driven threads compact via weave machinery \
+                                 (migration step 8)"
+                            .into(),
+                    });
+                }
                 Ok(())
             }
             Function::CreateThread { pod_id, parent, .. } => {

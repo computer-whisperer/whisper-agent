@@ -190,6 +190,9 @@ impl Weave {
         self.threads.retain(|r| r.thread_id != thread_id);
         let removed = self.threads.len() != before;
         if removed {
+            if let DriverState::Scripted { turns, .. } = &mut self.driver_state {
+                turns.remove(thread_id);
+            }
             self.touch();
         }
         removed

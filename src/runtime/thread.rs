@@ -1278,6 +1278,7 @@ impl Thread {
         ) {
             return None;
         }
+        let prev_public = self.public_state();
         events.push(ThreadEvent::AssistantBegin {
             generation: generation.clone(),
             turn,
@@ -1289,6 +1290,13 @@ impl Thread {
             effect_id,
         };
         self.touch();
+        // Driver-run turns start from Idle/Completed, a public-state
+        // flip the step loop never sees — emit it here so clients don't
+        // show a generating thread as finished.
+        let new_public = self.public_state();
+        if prev_public != new_public {
+            events.push(ThreadEvent::StateChanged { state: new_public });
+        }
         Some(IoRequest::ModelCall { op_id, generation })
     }
 

@@ -14,8 +14,6 @@
 //! again the next time the thread is stepped, so handlers are written
 //! idempotent (see the contract notes in `driver/lua.rs`).
 
-use std::collections::VecDeque;
-
 use tracing::warn;
 
 use super::{Scheduler, SchedulerFuture, io_dispatch};
@@ -145,8 +143,15 @@ impl Scheduler {
     /// Feed events through the driver program until the queue drains,
     /// executing each returned effect in order. Any driver error —
     /// unreadable program, VM failure, malformed outcome, refused
-    /// effect — fails the origin thread with the message; the journal
-    /// holds the refused effect's record.
+    /// effect — fails the origin thread with the message; refusals of
+    /// journal-bearing effects (run_agent, dispatch/resolve_tools, the
+    /// cross-thread executors) additionally resolve their journal
+    /// record as Failed.
+    ///
+    /// One activation per weave at a time: an event arriving while the
+    /// weave is already draining (a step tail hook feeding input back
+    /// in) is queued for the active drain, attributed to that
+    /// activation's origin thread.
     fn run_scripted_driver(
         &mut self,
         weave_id: &str,
@@ -154,32 +159,37 @@ impl Scheduler {
         event: ScriptedEvent,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
-        let mut queue: VecDeque<ScriptedEvent> = VecDeque::from([event]);
+        self.scripted_events
+            .entry(weave_id.to_string())
+            .or_default()
+            .push_back(event);
+        if !self.scripted_active.insert(weave_id.to_string()) {
+            return;
+        }
         let mut vm_calls = 0usize;
-        while let Some(event) = queue.pop_front() {
+        let mut failure: Option<String> = None;
+        'drain: while let Some(event) = self
+            .scripted_events
+            .get_mut(weave_id)
+            .and_then(|queue| queue.pop_front())
+        {
             vm_calls += 1;
             if vm_calls > MAX_VM_CALLS_PER_ACTIVATION {
-                self.fail_scripted(
-                    weave_id,
-                    origin_thread,
-                    &format!(
-                        "driver event cascade exceeded {MAX_VM_CALLS_PER_ACTIVATION} VM calls in one activation"
-                    ),
-                );
-                return;
+                failure = Some(format!(
+                    "driver event cascade exceeded {MAX_VM_CALLS_PER_ACTIVATION} VM calls in one activation"
+                ));
+                break;
             }
             let Some(weave) = self.weaves.get(weave_id) else {
-                return;
+                break;
             };
             let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } =
                 weave.driver.clone()
             else {
-                self.fail_scripted(
-                    weave_id,
-                    origin_thread,
-                    "non-scripted weave routed to the scripted executor (scheduler bug)",
+                failure = Some(
+                    "non-scripted weave routed to the scripted executor (scheduler bug)".into(),
                 );
-                return;
+                break;
             };
             let pod_id = weave.pod_id.clone();
             let data = match &weave.driver_state {
@@ -191,8 +201,8 @@ impl Scheduler {
             let source = match self.load_driver_program(&pod_id, &name) {
                 Ok(source) => source,
                 Err(error) => {
-                    self.fail_scripted(weave_id, origin_thread, &error);
-                    return;
+                    failure = Some(error);
+                    break;
                 }
             };
             let hash = lua::program_hash(&source);
@@ -206,8 +216,8 @@ impl Scheduler {
             let outcome = match lua::run_event(&source, &name, &data, &event) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.fail_scripted(weave_id, origin_thread, &error);
-                    return;
+                    failure = Some(error);
+                    break;
                 }
             };
             {
@@ -225,17 +235,21 @@ impl Scheduler {
                 self.mark_weave_dirty(weave_id);
             }
             for effect in outcome.effects {
-                if let Err(error) = self.apply_scripted_effect(
-                    weave_id,
-                    origin_thread,
-                    effect,
-                    &mut queue,
-                    pending_io,
-                ) {
-                    self.fail_scripted(weave_id, origin_thread, &error);
-                    return;
+                if let Err(error) =
+                    self.apply_scripted_effect(weave_id, origin_thread, effect, pending_io)
+                {
+                    failure = Some(error);
+                    break 'drain;
                 }
             }
+        }
+        self.scripted_active.remove(weave_id);
+        // Queued leftovers are dropped: after a failure they would run
+        // against a failed origin, and a clean drain leaves the queue
+        // empty anyway.
+        self.scripted_events.remove(weave_id);
+        if let Some(message) = failure {
+            self.fail_scripted(weave_id, origin_thread, &message);
         }
     }
 
@@ -244,7 +258,6 @@ impl Scheduler {
         weave_id: &str,
         origin_thread: &str,
         effect: ScriptedEffect,
-        queue: &mut VecDeque<ScriptedEvent>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), String> {
         match effect {
@@ -330,10 +343,13 @@ impl Scheduler {
                     relationship_meta,
                     pending_io,
                 )?;
-                queue.push_back(ScriptedEvent::ThreadDerived {
-                    thread_id: new_id,
-                    relationship,
-                });
+                self.scripted_events
+                    .entry(weave_id.to_string())
+                    .or_default()
+                    .push_back(ScriptedEvent::ThreadDerived {
+                        thread_id: new_id,
+                        relationship,
+                    });
                 Ok(())
             }
             ScriptedEffect::AdoptTicker { thread_id } => {
@@ -355,35 +371,61 @@ impl Scheduler {
         thread_id: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), String> {
-        if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
-            return Err(format!(
-                "run_agent: weave does not tick thread `{thread_id}`"
-            ));
-        }
         let Some(task) = self.tasks.get(thread_id) else {
             return Err(format!("run_agent: unknown thread `{thread_id}`"));
         };
         let max_turns = task.config.max_turns;
         let participant = task.config.participants.default_responder.clone();
         let turn = self.scripted_turn_count(weave_id, thread_id) + 1;
-        if turn > max_turns {
-            return Err(format!(
-                "run_agent: thread `{thread_id}` exceeded max_turns ({max_turns}) this cycle"
-            ));
-        }
+        // Journal before admission so every refusal resolves the same
+        // record precisely (auditable driver bugs, not silent drops).
         let generation = GenerationContext::new(uuid::Uuid::new_v4().to_string(), participant);
-        let effect_id = {
-            let weave = self.weaves.get_mut(weave_id).expect("caller validated");
-            let effect_id = weave.record_pending_effect(PersistedDriverEffect::RunAgent {
+        let effect_id = self
+            .weaves
+            .get_mut(weave_id)
+            .expect("caller validated")
+            .record_pending_effect(PersistedDriverEffect::RunAgent {
                 generation: generation.clone(),
                 turn,
             });
-            if let DriverState::Scripted { turns, .. } = &mut weave.driver_state {
-                turns.insert(thread_id.to_string(), turn);
-            }
-            effect_id
-        };
         self.mark_weave_dirty(weave_id);
+        if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
+            let message = format!("run_agent: weave does not tick thread `{thread_id}`");
+            self.fail_weave_effect(weave_id, effect_id, &message);
+            return Err(message);
+        }
+        if turn > max_turns {
+            // Builtin parity: the turn limit finishes the cycle, it
+            // never fails the thread. The refused RunAgent resolves
+            // Failed; a completed Finish{TurnLimit} records the
+            // decision; the counter resets with the cycle.
+            self.fail_weave_effect(weave_id, effect_id, "turn limit reached");
+            self.record_completed_weave_effect(
+                weave_id,
+                PersistedDriverEffect::Finish {
+                    generation: None,
+                    reason: DriverFinishReason::TurnLimit,
+                },
+            );
+            warn!(
+                max_turns,
+                thread_id = %thread_id,
+                "scripted driver hit the cycle turn limit"
+            );
+            let mut events = Vec::new();
+            if let Some(task) = self.tasks.get_mut(thread_id) {
+                task.finish_cycle(&mut events);
+            }
+            self.router.dispatch_events(thread_id, events);
+            self.reset_scripted_turns(weave_id, thread_id);
+            self.mark_dirty(thread_id);
+            return Ok(());
+        }
+        if let Some(weave) = self.weaves.get_mut(weave_id)
+            && let DriverState::Scripted { turns, .. } = &mut weave.driver_state
+        {
+            turns.insert(thread_id.to_string(), turn);
+        }
         let op_id = self.next_op_id;
         self.next_op_id += 1;
         let mut events = Vec::new();
@@ -567,6 +609,7 @@ impl Scheduler {
                 reason: DriverFinishReason::DriverChoice,
             },
         );
+        self.reset_scripted_turns(weave_id, thread_id);
         self.mark_weave_dirty(weave_id);
         self.mark_dirty(thread_id);
         if thread_id != origin_thread {
@@ -598,6 +641,35 @@ impl Scheduler {
             Some(DriverState::Scripted { turns, .. }) => turns.get(thread_id).copied().unwrap_or(0),
             _ => 0,
         }
+    }
+
+    /// A finished cycle resets the thread's mechanical turn counter, so
+    /// reused threads (a checker answering many questions) budget per
+    /// cycle, not per lifetime.
+    fn reset_scripted_turns(&mut self, weave_id: &str, thread_id: &str) {
+        if let Some(weave) = self.weaves.get_mut(weave_id)
+            && let DriverState::Scripted { turns, .. } = &mut weave.driver_state
+            && turns.remove(thread_id).is_some()
+        {
+            self.mark_weave_dirty(weave_id);
+        }
+    }
+
+    /// Is this thread's ticker a scripted weave? Compaction machinery
+    /// checks this: builtin-style compaction (COMPACTING bit, summary
+    /// prompt as input, continuation thread) is incoherent for
+    /// scripted-driven threads — those compact via weave machinery when
+    /// migration step 8 lands.
+    pub(super) fn has_scripted_ticker(&self, thread_id: &str) -> bool {
+        self.thread_ticker
+            .get(thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            .is_some_and(|weave| {
+                matches!(
+                    weave.driver,
+                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                )
+            })
     }
 
     fn fail_weave_effect(&mut self, weave_id: &str, effect_id: DriverEffectId, message: &str) {

@@ -845,6 +845,14 @@ pub struct Scheduler {
     /// disk before their lazy provider/tool futures are polled
     /// (write-ahead boundary).
     dirty_weaves: HashSet<String>,
+    /// Scripted-driver activation guard: weaves currently draining
+    /// their event queue. A nested activation for the same weave (a
+    /// step tail hook feeding input back into it) queues its event for
+    /// the outer drain instead of re-entering, so driver state is
+    /// never rewritten underneath an in-flight activation.
+    scripted_active: HashSet<String>,
+    scripted_events:
+        HashMap<String, std::collections::VecDeque<crate::runtime::driver::lua::ScriptedEvent>>,
     /// Behavior ids whose `state.json` needs writeback. Keyed by
     /// `(pod_id, behavior_id)`. Serialization through this set (rather
     /// than tokio::spawn per update) means two rapid state changes
@@ -1069,6 +1077,8 @@ impl Scheduler {
                 next_op_id: 1,
                 dirty: HashSet::new(),
                 dirty_weaves: HashSet::new(),
+                scripted_active: HashSet::new(),
+                scripted_events: HashMap::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
                 usage_tx,
@@ -4551,12 +4561,15 @@ impl Scheduler {
         // nudges the thread out via `clear_waiting_resource` as each
         // resource transitions Ready (sandbox or primary MCP).
         let pending_resources = self.pending_resources_for(thread_id);
-        self.weave_input_accepted(thread_id, pending_io);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_user_message(text.clone(), attachments.clone(), pending_resources);
             task.public_state()
         };
+        // AFTER the submit: a scripted driver's input_accepted handler
+        // may immediately run a turn, and the model request is built
+        // eagerly — the new message must already be in the transcript.
+        self.weave_input_accepted(thread_id, pending_io);
         // Emit the user message to subscribers BEFORE the state change
         // so the conversation view lands in order: user message first,
         // then the state flips to Working for the model turn it kicks.
@@ -4609,12 +4622,14 @@ impl Scheduler {
         // Deliberately don't derive a title from this text — a
         // machine-rendered notification isn't a useful thread title.
         let pending_resources = self.pending_resources_for(thread_id);
-        self.weave_input_accepted(thread_id, pending_io);
         let new_state = {
             let task = self.tasks.get_mut(thread_id).expect("task exists");
             task.submit_tool_result_text(text.clone(), pending_resources);
             task.public_state()
         };
+        // After the submit, same as send_user_message: the driver's
+        // input_accepted effects must see the appended notification.
+        self.weave_input_accepted(thread_id, pending_io);
         self.router.broadcast_to_subscribers(
             thread_id,
             ServerToClient::ThreadToolResultMessage {

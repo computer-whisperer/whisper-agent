@@ -136,6 +136,12 @@ impl Scheduler {
         let Some(threshold) = task.config.compaction.token_threshold else {
             return;
         };
+        // Scripted-driven threads compact via weave machinery
+        // (migration step 8); the builtin flow's summary-prompt input
+        // would re-enter the driver mid-activation.
+        if self.has_scripted_ticker(thread_id) {
+            return;
+        }
         if task.total_usage.input_tokens <= threshold {
             return;
         }

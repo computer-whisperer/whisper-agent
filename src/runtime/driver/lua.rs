@@ -24,11 +24,15 @@
 //! idempotent — return no effects when the event asks about work the
 //! state already tracks as in progress.
 //!
-//! Each event runs in a fresh, sandboxed VM: no io/os/require (only
-//! table/string/math/utf8 stdlib), a memory ceiling, and an instruction
-//! budget. Driver programs are pure policy — every side effect goes
-//! through the returned effect list, admitted and journaled by the
-//! scheduler.
+//! Each event runs in a fresh, sandboxed VM: table/string/math/utf8
+//! stdlib only, with the base-library escape hatches stripped on top
+//! (pcall/xpcall — they could swallow the instruction-budget error;
+//! load/dofile/loadfile — filesystem and stdin reach; collectgarbage,
+//! print, math.random — nondeterminism), plus a memory ceiling and an
+//! instruction budget. Driver programs are pure policy — every side
+//! effect goes through the returned effect list, admitted and
+//! journaled by the scheduler, and driver state must be a
+//! deterministic function of program + events.
 
 use mlua::{Lua, LuaSerdeExt};
 use serde::{Deserialize, Serialize};
@@ -210,6 +214,35 @@ pub fn run_event(
     .map_err(|e| format!("lua init: {e}"))?;
     lua.set_memory_limit(MEMORY_LIMIT_BYTES)
         .map_err(|e| format!("lua memory limit: {e}"))?;
+    // mlua loads the Lua base library unconditionally (before the StdLib
+    // mask applies), so strip what breaks the sandbox contract:
+    // - pcall/xpcall would let a driver catch the instruction-budget
+    //   error and loop forever, wedging the single-writer scheduler;
+    // - dofile/loadfile/load reach the filesystem (dofile() with no
+    //   argument reads the process's stdin!) outside the pod boundary;
+    // - collectgarbage and print leak allocator state / spam stdout.
+    // math.random/randomseed go too: driver state must be a
+    // deterministic function of program + events or the persisted
+    // journal stops explaining the run.
+    let globals = lua.globals();
+    for name in [
+        "pcall",
+        "xpcall",
+        "load",
+        "dofile",
+        "loadfile",
+        "collectgarbage",
+        "print",
+    ] {
+        globals
+            .set(name, mlua::Value::Nil)
+            .map_err(|e| format!("lua sandbox strip: {e}"))?;
+    }
+    if let Ok(math) = globals.get::<mlua::Table>("math") {
+        let _ = math.set("random", mlua::Value::Nil);
+        let _ = math.set("randomseed", mlua::Value::Nil);
+    }
+    drop(globals);
     let spent = std::cell::Cell::new(0u64);
     let hook_installed = lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(HOOK_EVERY),
@@ -417,21 +450,46 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_has_no_io_os_or_require() {
+    fn sandbox_has_no_io_os_require_pcall_load_or_random() {
         let src = r#"
             function on_event(state, event)
               return { effects = {}, state = {
                 has_io = io ~= nil,
                 has_os = os ~= nil,
                 has_require = require ~= nil,
+                has_pcall = pcall ~= nil,
+                has_xpcall = xpcall ~= nil,
+                has_load = load ~= nil,
+                has_dofile = dofile ~= nil,
+                has_loadfile = loadfile ~= nil,
+                has_collectgarbage = collectgarbage ~= nil,
+                has_random = math.random ~= nil,
+                has_coroutine = coroutine ~= nil,
               } }
             end
         "#;
         let out = run_event(src, "sandbox", &json!({}), &event_turn_start("t", 1)).unwrap();
-        assert_eq!(
-            out.state,
-            json!({"has_io": false, "has_os": false, "has_require": false})
-        );
+        let object = out.state.as_object().unwrap();
+        for (key, value) in object {
+            assert_eq!(value, &json!(false), "sandbox leaks {key}");
+        }
+        assert_eq!(object.len(), 11);
+    }
+
+    #[test]
+    fn instruction_budget_is_not_catchable() {
+        // pcall is stripped from the sandbox, so the budget error cannot
+        // be swallowed by a hostile driver's catch-and-retry loop — the
+        // demonstrated wedge vector against the single-writer scheduler.
+        let src = r#"
+            function on_event(state, event)
+              while true do
+                local ok = pcall and pcall(function() while true do end end)
+              end
+            end
+        "#;
+        let err = run_event(src, "hostile", &json!({}), &event_turn_start("t", 1)).unwrap_err();
+        assert!(err.contains("instruction budget"), "{err}");
     }
 
     #[test]

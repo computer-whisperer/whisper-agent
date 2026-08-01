@@ -11,6 +11,20 @@
 -- idempotent at boundaries; all mutable state lives in the returned
 -- `state` table.
 
+-- A call is approved only by a whole verdict line reading exactly
+-- "ALLOW <id>" (or "ALLOW ALL"). Substring matching would fail open:
+-- "I cannot ALLOW ALL of these" must not approve anything, and an id
+-- that prefixes another id must not approve both.
+local function verdict_allows(verdict, tool_use_id)
+  for line in string.gmatch(verdict, "[^\r\n]+") do
+    local trimmed = string.match(line, "^%s*(.-)%s*$")
+    if trimmed == "ALLOW ALL" or trimmed == "ALLOW " .. tool_use_id then
+      return true
+    end
+  end
+  return false
+end
+
 function on_event(state, event)
   local k = event.kind
 
@@ -30,11 +44,9 @@ function on_event(state, event)
     -- A checker verdict came back.
     if state.checking and event.thread_id == state.checking.checker then
       local verdict = event.text
-      local allow_all = string.find(verdict, "ALLOW ALL", 1, true) ~= nil
       local decisions = {}
       for i, call in ipairs(state.checking.calls) do
-        local allow = allow_all
-          or string.find(verdict, "ALLOW " .. call.tool_use_id, 1, true) ~= nil
+        local allow = verdict_allows(verdict, call.tool_use_id)
         local decision = { tool_use_id = call.tool_use_id, allow = allow }
         if not allow then
           decision.message = "denied by permission checker"
