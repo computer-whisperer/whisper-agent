@@ -3043,6 +3043,29 @@ impl ChatApp {
                 // for its snapshot.
                 self.subscribed.clear();
                 self.subscribed_weaves.clear();
+                // Re-arm the selected thread's subscriptions directly:
+                // `select_thread` no-ops on the already-selected
+                // thread, so without this the open thread — and its
+                // weave (coordination strip, head-follow) — would stay
+                // silent until the user switched away and back. A
+                // compaction that rolled while we were disconnected
+                // resolves as catch-up: the fresh snapshot arrives,
+                // the previous one still shows us as primary, and the
+                // head-follow jumps to the continuation.
+                if let Some(selected) = self.selected.clone() {
+                    self.send(ClientToServer::SubscribeToThread {
+                        thread_id: selected.clone(),
+                    });
+                    self.subscribed.insert(selected.clone());
+                    if let Some(weave_id) =
+                        self.threads.get(&selected).and_then(|t| t.weave_id.clone())
+                    {
+                        self.send(ClientToServer::SubscribeToWeave {
+                            weave_id: weave_id.clone(),
+                        });
+                        self.subscribed_weaves.insert(weave_id);
+                    }
+                }
                 // In-flight refresh-usage requests are lost on
                 // disconnect — their replies will never arrive — so
                 // flush the inflight set to let the user retry.

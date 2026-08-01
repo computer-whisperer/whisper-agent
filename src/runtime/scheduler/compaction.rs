@@ -23,10 +23,13 @@
 //!      auxiliary — drill-down history, no longer ticked. Fork is the
 //!      deliberate revive.
 //!
-//! The `compacting` marker lives on the weave's persisted driver state
-//! so a compaction in flight survives process restart — on the next
-//! startup the model turn still completes against the already-appended
-//! user message and the finalize runs as expected.
+//! The `compacting` marker lives on the weave's persisted driver state.
+//! A compaction does NOT survive restart: the persister heals every
+//! in-flight thread to `Failed`, so `Scheduler::load_state` clears any
+//! set marker (with a warning) rather than letting it wedge admission
+//! or mis-trigger the finalize against a later ordinary turn. (The
+//! pre-step-8 `InFlightOps::COMPACTING` bit claimed restart-resume in
+//! its docs; that claim was false for the same heal-to-Failed reason.)
 
 use futures::stream::FuturesUnordered;
 use regex::Regex;
@@ -571,9 +574,9 @@ impl Scheduler {
         self.step_until_blocked(&new_thread_id, pending_io);
 
         // Emit the CompactThread Function's success terminal. The
-        // client's visible UX already happened via the
-        // `ThreadCompacted` broadcast above; this is the registry-
-        // bookkeeping side of completion.
+        // client's visible UX already happened via the weave snapshot
+        // push and thread-list broadcast inside `weave_advance_head`;
+        // this is the registry-bookkeeping side of completion.
         if let Some(id) = compact_fn_id {
             self.complete_function(
                 id,

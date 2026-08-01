@@ -1743,9 +1743,11 @@ pub enum ClientToServer {
     },
     /// Manually compact `thread_id`. Appends the thread's configured
     /// compaction prompt as a final user message; on turn completion,
-    /// the scheduler spawns a new thread seeded with the extracted
-    /// summary and sends `ThreadCompacted` linking the two. Rejected
-    /// when the thread is mid-turn or its config has
+    /// the scheduler rolls the thread's weave onto a continuation
+    /// seeded with the extracted summary (the head-advance is visible
+    /// to weave subscribers via `WeaveSnapshot`; the old thread stays
+    /// referenced as a dormant auxiliary). Rejected when the thread is
+    /// mid-turn, isn't its weave's current primary, or its config has
     /// `compaction.enabled = false`.
     CompactThread {
         thread_id: String,

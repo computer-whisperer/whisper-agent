@@ -3073,6 +3073,27 @@ impl Scheduler {
         // but any single winner restores the invariant, and the
         // demotion is flushed so the choice sticks across restarts.
         for mut weave in state.weaves {
+            // A compacting marker can't survive restart: the persister
+            // heals every in-flight thread to Failed (the summary turn
+            // is always in flight while the marker is set) and the
+            // CompactThread Function registry is in-memory only. Left
+            // set, the marker would refuse all future compactions on
+            // this weave and mis-trigger the finalize against the
+            // first ordinary Completed turn. The compaction prompt in
+            // the transcript is inert; the user re-triggers at will.
+            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                compacting: compacting @ Some(_),
+                ..
+            } = &mut weave.driver_state
+            {
+                warn!(
+                    weave_id = %weave.id,
+                    thread_id = compacting.as_deref().unwrap_or(""),
+                    "compaction was in flight at last shutdown — abandoned"
+                );
+                *compacting = None;
+                self.dirty_weaves.insert(weave.id.clone());
+            }
             for thread_ref in &mut weave.threads {
                 if !thread_ref.ticks {
                     continue;

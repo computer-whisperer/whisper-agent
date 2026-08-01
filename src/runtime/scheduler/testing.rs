@@ -1454,3 +1454,37 @@ async fn failed_summary_turn_releases_the_compacting_marker() {
         Some(t1.as_str())
     );
 }
+
+/// A compacting marker persisted at shutdown is cleared at load: the
+/// persister heals the in-flight summary turn to Failed and the
+/// Function registry is in-memory only, so a surviving marker would
+/// wedge admission and mis-trigger the finalize on the next ordinary
+/// Completed turn.
+#[tokio::test]
+async fn load_clears_a_persisted_compacting_marker() {
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+
+    // Simulate the previous process: marker set on the persisted weave.
+    let mut weave = h.sched.weaves[&weave_id].clone();
+    if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat { compacting, .. } =
+        &mut weave.driver_state
+    {
+        *compacting = Some(t1.clone());
+    }
+
+    let mut fresh = harness().await;
+    fresh.sched.load_state(crate::pod::persist::LoadedState {
+        pods: Vec::new(),
+        threads: Vec::new(),
+        weaves: vec![weave],
+    });
+    assert!(matches!(
+        &fresh.sched.weaves[&weave_id].driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: None,
+            ..
+        }
+    ));
+}

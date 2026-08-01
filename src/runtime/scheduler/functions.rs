@@ -3304,6 +3304,20 @@ impl Scheduler {
                     );
                     self.teardown_host_env_if_terminal(child_id);
                     self.on_behavior_thread_terminal(child_id, pending_io);
+                    // Same resolution `execute_cancel_thread` performs:
+                    // if the child was mid-compaction (auto-compact can
+                    // fire on an awaited child at a cycle boundary),
+                    // `weave_cancelled` above cleared the marker but the
+                    // child's own CompactThread Function — Weave caller,
+                    // no awaiting-child link, matched by neither cascade
+                    // helper — would leak in the registry.
+                    if let Some(compact_fn) = self.find_compact_function_for(child_id) {
+                        self.complete_function(
+                            compact_fn,
+                            FunctionOutcome::Cancelled(crate::functions::CancelReason::CallerGone),
+                            pending_io,
+                        );
+                    }
                     Some(child_id.clone())
                 }
             } else {

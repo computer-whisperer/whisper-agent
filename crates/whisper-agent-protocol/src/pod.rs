@@ -272,10 +272,12 @@ where
 /// Compaction appends the `prompt_file` text (or the built-in default
 /// when empty) to the running thread as a final user message, lets the
 /// model generate a single summary response bounded by `<summary>…</summary>`,
-/// then spawns a new thread seeded with `continuation_template` with
-/// `{{summary}}` substituted in. The new thread's
-/// [`crate::ThreadSummary.continued_from`] points back at the old one so
-/// clients can render the chain.
+/// then rolls the thread's weave onto a continuation thread seeded with
+/// `continuation_template` with `{{summary}}` substituted in. The
+/// continuation carries a `compaction` relationship edge on its weave
+/// ref pointing back at the old thread, which stays referenced as a
+/// dormant auxiliary — clients render the chain from the weave
+/// snapshot.
 ///
 /// Identical shape on both sides of the inheritance chain
 /// (`ThreadDefaults` / `ThreadConfig`); [`CompactionConfigOverride`]
