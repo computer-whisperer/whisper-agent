@@ -55,6 +55,7 @@ use damascene_core::widgets::select::{SelectAction, classify_event as classify_s
 use whisper_agent_protocol::sandbox::{
     AccessMode, HostEnvSpec, Mount, NetworkPolicy, PathAccess, ResourceLimits,
 };
+use whisper_agent_protocol::weave::{PresentationBlock, WeaveSnapshot, WeaveThreadRole};
 use whisper_agent_protocol::{
     ActivationSurface, AllowMap, Attachment, BackendSummary, BackendUsage, BehaviorConfig,
     BehaviorSummary, BehaviorThreadOverride, BucketBuildOutcome, BucketBuildPhase,
@@ -1738,6 +1739,14 @@ pub struct ChatApp {
     /// connection. Cleared on reconnect (a fresh `ConnectionOpened`
     /// implies the server lost our subscriptions).
     subscribed: HashSet<String>,
+    /// Latest coordination snapshot per weave (step 7b): driver
+    /// identity, thread refs, presentation blocks. Populated by
+    /// `WeaveSnapshot` events; the server re-sends the full snapshot
+    /// on every refs/presentation change.
+    weaves: HashMap<String, WeaveSnapshot>,
+    /// Weaves we've already sent `SubscribeToWeave` for this
+    /// connection. Cleared on reconnect alongside [`subscribed`].
+    subscribed_weaves: HashSet<String>,
 
     // ----- compose -----
     /// In-progress text for the *new-thread* compose form (no thread
@@ -2932,6 +2941,8 @@ impl ChatApp {
             selected: None,
             views: HashMap::new(),
             subscribed: HashSet::new(),
+            weaves: HashMap::new(),
+            subscribed_weaves: HashSet::new(),
             compose_input: String::new(),
             compose_attachments: Vec::new(),
             next_attachment_id: 0,
@@ -3031,6 +3042,7 @@ impl ChatApp {
                 // the local mirror so re-selecting a thread re-asks
                 // for its snapshot.
                 self.subscribed.clear();
+                self.subscribed_weaves.clear();
                 // In-flight refresh-usage requests are lost on
                 // disconnect — their replies will never arrive — so
                 // flush the inflight set to let the user retry.
@@ -3410,6 +3422,13 @@ impl ChatApp {
                     .map(|t| (t.thread_id.clone(), t))
                     .collect();
                 self.views.retain(|id, _| live.contains(id));
+                // Weave snapshots for weaves no summary references any
+                // more (retired on the server) are stale — drop them.
+                self.weaves.retain(|id, _| {
+                    self.threads
+                        .values()
+                        .any(|t| t.weave_id.as_deref() == Some(id))
+                });
                 if let Some(sel) = &self.selected
                     && !live.contains(sel)
                 {
@@ -4054,6 +4073,13 @@ impl ChatApp {
                     self.drafts.remove(&thread_id);
                 }
                 self.views.insert(thread_id, view);
+            }
+            ServerToClient::WeaveSnapshot { weave_id, snapshot } => {
+                // Full coordination view (step 7b), re-sent by the
+                // server whenever refs or presentation change. Replace
+                // wholesale; thread content streams separately through
+                // the per-thread tier.
+                self.weaves.insert(weave_id, snapshot);
             }
             ServerToClient::ThreadDraftUpdated { thread_id, text } => {
                 // Broadcast from another client editing the same
@@ -8687,7 +8713,21 @@ impl ChatApp {
             self.send(ClientToServer::SubscribeToThread {
                 thread_id: thread_id.clone(),
             });
-            self.subscribed.insert(thread_id);
+            self.subscribed.insert(thread_id.clone());
+        }
+        // Same for the thread's coordination weave (step 7b): the
+        // server replies with a `WeaveSnapshot` and pushes updates on
+        // refs/presentation changes.
+        if let Some(weave_id) = self
+            .threads
+            .get(&thread_id)
+            .and_then(|t| t.weave_id.clone())
+            && !self.subscribed_weaves.contains(&weave_id)
+        {
+            self.send(ClientToServer::SubscribeToWeave {
+                weave_id: weave_id.clone(),
+            });
+            self.subscribed_weaves.insert(weave_id);
         }
     }
 
@@ -9333,6 +9373,12 @@ impl ChatApp {
         if show_via_origin && let Some(origin) = &t.origin {
             secondary.push_str(&format!(" · via {}", origin.behavior_id));
         }
+        if t.weave_role == Some(WeaveThreadRole::Auxiliary) {
+            // Weave-derived helper (checker, subagent). The
+            // relationship kind lives on the weave snapshot; the list
+            // marker stays generic so unopened weaves need no fetch.
+            secondary.push_str(" · auxiliary");
+        }
 
         let content = item_content([item_title(title), item_description(secondary)]);
         let mut row_el = item([content]).key(key);
@@ -9832,6 +9878,74 @@ impl ChatApp {
         )
     }
 
+    /// The coordination strip for the open thread's weave (step 7b):
+    /// renders the driver-composed presentation blocks. Status text
+    /// becomes a muted line; auxiliary threads become jump chips
+    /// (their `thread:` keys ride the existing sidebar click route);
+    /// a `primary_transcript` pointing at a *different* thread becomes
+    /// a "head" chip — the open pane already is the transcript when it
+    /// points here. Returns `None` when the strip would carry nothing
+    /// beyond the open transcript itself (the degenerate singleton
+    /// shape), so legacy chats stay chrome-free.
+    fn weave_strip(&self, thread_id: &str) -> Option<El> {
+        let weave_id = self.threads.get(thread_id)?.weave_id.as_deref()?;
+        let snapshot = self.weaves.get(weave_id)?;
+        let mut chips: Vec<El> = Vec::new();
+        if let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = &snapshot.driver {
+            chips.push(badge(format!("driver: {name}")).muted());
+        }
+        let relationship_of = |id: &str| -> Option<String> {
+            snapshot
+                .threads
+                .iter()
+                .find(|r| r.thread_id == id)
+                .and_then(|r| r.relationship.clone())
+        };
+        for block in &snapshot.presentation {
+            match block {
+                PresentationBlock::PrimaryTranscript { thread_id: head } => {
+                    if head != thread_id {
+                        chips.push(
+                            button(format!("head: {}", short_id(head)))
+                                .key(format!("thread:{head}"))
+                                .ghost(),
+                        );
+                    }
+                }
+                PresentationBlock::Status { text: status } => {
+                    chips.push(text(status.clone()).muted().xsmall());
+                }
+                PresentationBlock::ThreadList { thread_ids } => {
+                    for id in thread_ids {
+                        if id == thread_id {
+                            continue;
+                        }
+                        let kind = relationship_of(id).unwrap_or_else(|| "thread".into());
+                        let state = self
+                            .threads
+                            .get(id)
+                            .map(|t| format!(" · {}", state_label(t.state)))
+                            .unwrap_or_default();
+                        chips.push(
+                            button(format!("{kind}: {}{state}", short_id(id)))
+                                .key(format!("thread:{id}"))
+                                .ghost(),
+                        );
+                    }
+                }
+            }
+        }
+        if chips.is_empty() {
+            return None;
+        }
+        Some(
+            row(chips)
+                .gap(tokens::SPACE_3)
+                .align(Align::Center)
+                .width(Size::Fill(1.0)),
+        )
+    }
+
     fn thread_pane(&self, thread_id: &str, cx: &BuildCx) -> El {
         let summary = self.threads.get(thread_id);
         let view = self.views.get(thread_id);
@@ -9908,6 +10022,13 @@ impl ChatApp {
                 .align(Align::Center)
                 .width(Size::Fill(1.0)),
         ];
+        // Weave coordination strip (step 7b): the driver-composed
+        // presentation — status line, auxiliary threads, a jump chip
+        // when the conversation head lives elsewhere. Only renders
+        // when the weave has something beyond the bare transcript.
+        if let Some(strip) = self.weave_strip(thread_id) {
+            header_rows.push(strip);
+        }
         // Inspector panel — rendered between the toolbar / sub-line
         // and the prefill indicator when expanded. Stays part of the
         // header column so it shares the bottom-stroke separator
@@ -21778,13 +21899,36 @@ fn order_threads_by_dispatch<'a>(flat: &[&'a ThreadSummary]) -> Vec<(&'a ThreadS
     let by_id: HashMap<&str, &ThreadSummary> =
         flat.iter().map(|t| (t.thread_id.as_str(), *t)).collect();
 
+    // A weave's auxiliary threads (checkers, subagents — step 7b) nest
+    // under the weave's primary row. The primary is found by scanning
+    // the same list: `weave_id` tags come server-decorated on every
+    // summary, and the primary carries `WeaveThreadRole::Primary`.
+    let weave_primary: HashMap<&str, &str> = flat
+        .iter()
+        .filter(|t| t.weave_role == Some(WeaveThreadRole::Primary))
+        .filter_map(|t| {
+            t.weave_id
+                .as_deref()
+                .map(|weave| (weave, t.thread_id.as_str()))
+        })
+        .collect();
+    let parent_of = |t: &'a ThreadSummary| -> Option<&'a str> {
+        if let Some(parent) = t.dispatched_by.as_deref() {
+            return Some(parent);
+        }
+        if t.weave_role == Some(WeaveThreadRole::Auxiliary) {
+            return weave_primary.get(t.weave_id.as_deref()?).copied();
+        }
+        None
+    };
+
     // Sibling order: walk `flat` in input order so the newest-first
     // sort is preserved within each bucket.
     let mut children_of: HashMap<&str, Vec<&ThreadSummary>> = HashMap::new();
     let mut roots: Vec<&ThreadSummary> = Vec::new();
     for t in flat {
-        match t.dispatched_by.as_deref() {
-            Some(parent) if in_set.contains(parent) => {
+        match parent_of(t) {
+            Some(parent) if in_set.contains(parent) && parent != t.thread_id => {
                 children_of.entry(parent).or_default().push(t);
             }
             _ => roots.push(t),
