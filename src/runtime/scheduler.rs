@@ -29,6 +29,8 @@ mod feed_workers;
 mod functions;
 mod retention;
 mod server_config;
+#[cfg(test)]
+mod testing;
 mod thread_config;
 mod triggers;
 
