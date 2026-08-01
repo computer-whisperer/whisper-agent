@@ -3192,7 +3192,8 @@ impl ChatApp {
                     .as_ref()
                     .is_some_and(|p| self.pods.contains_key(p));
                 if !valid {
-                    self.pod_tab = self.pick_default_pod_tab();
+                    let fallback = self.pick_default_pod_tab();
+                    self.set_pod_tab(fallback);
                 }
                 // Drop any cached behavior lists for pods that are no
                 // longer in the registry, then fan out `ListBehaviors`
@@ -3293,7 +3294,8 @@ impl ChatApp {
                 let new_pod_id = pod.pod_id.clone();
                 self.pods.insert(new_pod_id.clone(), pod);
                 if self.pod_tab.is_none() {
-                    self.pod_tab = self.pick_default_pod_tab();
+                    let seeded = self.pick_default_pod_tab();
+                    self.set_pod_tab(seeded);
                 }
                 self.ensure_behaviors_requested(&new_pod_id);
 
@@ -3311,7 +3313,7 @@ impl ChatApp {
                     // pod — the user just made it, that's almost
                     // certainly where they want to land. Mirrors the
                     // egui sibling's behavior.
-                    self.pod_tab = Some(new_pod_id);
+                    self.set_pod_tab(Some(new_pod_id));
                 }
             }
             ServerToClient::BehaviorList {
@@ -5251,22 +5253,13 @@ impl App for ChatApp {
             },
         );
         if pod_tab_changed {
-            // The new-thread pane scopes its host_envs / mcp_hosts to
-            // the active tab's pod allow list. Clear them when the tab
-            // changes so the user re-picks against the right surface;
-            // partial-validity is too clever for v1. Only matters while
-            // the new-thread pane is showing — once a thread is selected
-            // the picker state is invisible.
+            // Pod-scoped compose picks (host envs / MCP hosts / driver
+            // file) are meaningless on another pod. Clear on EVERY tab
+            // change — even with a thread selected the picker state is
+            // merely invisible, and it resurfaces unreset on the next
+            // "+ New thread" otherwise.
+            self.reset_pod_scoped_picks();
             if self.selected.is_none() {
-                self.picker_host_env_mode = BindingListMode::Inherit;
-                self.picker_host_envs.clear();
-                self.picker_host_env_expanded = None;
-                self.picker_mcp_hosts_mode = BindingListMode::Inherit;
-                self.picker_mcp_hosts.clear();
-                // Driver names are pod-scoped files too — a pick from
-                // the previous pod's drivers/ may not exist here.
-                self.picker_driver = None;
-                self.picker_driver_open = false;
                 self.ensure_pod_config_for_picker();
             }
             return;
@@ -7839,6 +7832,37 @@ impl ChatApp {
         count += usize::from(self.new_thread_tool_surface.is_some());
         count += usize::from(!self.new_thread_tunables.is_empty());
         count
+    }
+
+    /// Change the create-target pod tab, clearing pod-scoped compose
+    /// picks when the value actually changes. Every mutation of
+    /// `pod_tab` outside the tab-strip widget goes through here — a
+    /// pick made against pod X (driver file, host envs, MCP hosts) is
+    /// meaningless or misleading on pod Y, and the reviewer-found
+    /// failure mode was exactly a stale `Scripted{name}` riding into a
+    /// create on a pod whose `drivers/` doesn't have (or worse, has a
+    /// different) program by that name.
+    fn set_pod_tab(&mut self, new: Option<String>) {
+        if self.pod_tab == new {
+            return;
+        }
+        self.pod_tab = new;
+        self.reset_pod_scoped_picks();
+    }
+
+    /// Clear the compose picks whose meaning is scoped to one pod.
+    /// Backend/model picks survive pod switches on purpose — backends
+    /// are server-global (the pod allow-list is validated at create).
+    fn reset_pod_scoped_picks(&mut self) {
+        self.picker_host_env_mode = BindingListMode::Inherit;
+        self.picker_host_envs.clear();
+        self.picker_host_envs_open = false;
+        self.picker_host_env_expanded = None;
+        self.picker_mcp_hosts_mode = BindingListMode::Inherit;
+        self.picker_mcp_hosts.clear();
+        self.picker_mcp_hosts_open = false;
+        self.picker_driver = None;
+        self.picker_driver_open = false;
     }
 
     fn reset_new_thread_overrides(&mut self) {

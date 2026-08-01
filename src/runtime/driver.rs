@@ -654,6 +654,7 @@ mod tests {
         assert_eq!(json["next_id"], 2);
         assert_eq!(json["records"][0]["id"], 1);
         assert_eq!(json["records"][0]["effect"]["kind"], "run_agent");
+        assert_eq!(json["records"][0]["effect"]["thread_id"], "t-1");
         assert_eq!(json["records"][0]["outcome"]["status"], "pending");
 
         let mut decoded: DriverEffectJournal = serde_json::from_value(json).unwrap();

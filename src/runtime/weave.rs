@@ -413,7 +413,7 @@ impl Weave {
     }
 
     /// Fail one specific pending record — the precise counterpart to
-    /// [`Self::fail_pending`] for multi-thread weaves, where a bulk fail
+    /// [`Self::fail_pending_for`] for multi-thread weaves, where a bulk fail
     /// would clobber unrelated in-flight records.
     pub fn fail_effect(&mut self, effect_id: DriverEffectId, message: impl Into<String>) {
         if effect_id == 0 {
