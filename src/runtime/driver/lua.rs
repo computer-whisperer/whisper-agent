@@ -154,6 +154,11 @@ pub enum ScriptedEffect {
         #[serde(default)]
         source_thread_id: Option<String>,
     },
+    /// Promote a referenced, self-ticked thread to primary; the previous
+    /// primary becomes a dormant auxiliary. The compaction-roll primitive.
+    AdvanceHead {
+        thread_id: String,
+    },
     AdoptTicker {
         thread_id: String,
     },

@@ -27,7 +27,6 @@ use whisper_agent_protocol::{
     ToolResultContent, ToolSurface, TurnEntry, TurnLog, Usage,
 };
 
-use crate::functions::InFlightOps;
 use crate::permission::Scope;
 use crate::providers::model::ModelResponse;
 use crate::tools::mcp::CallToolResult;
@@ -122,24 +121,6 @@ pub struct Thread {
     /// this on spawn and the on-completion hook reads it back.
     #[serde(default)]
     pub origin: Option<BehaviorOrigin>,
-    /// When this thread was spawned as the continuation of a compacted
-    /// thread, the id of that ancestor. Set once at spawn; never
-    /// mutated afterward. `None` for threads that weren't created by
-    /// compaction.
-    #[serde(default)]
-    pub continued_from: Option<String>,
-    /// In-flight Function flags — e.g., `COMPACTING` is set between the
-    /// moment a `/compact` command has appended the compaction prompt
-    /// and the scheduler has finalized the continuation.
-    ///
-    /// Persisted so a compaction in flight during shutdown finalizes on
-    /// the next startup when the model turn completes. Future restart
-    /// semantics may clear non-resumable bits — see the "Restart note"
-    /// in `docs/design_functions.md` — but today `COMPACTING` is
-    /// genuinely resumable (the appended user message survives; the
-    /// finalize logic is idempotent).
-    #[serde(default)]
-    pub in_flight: InFlightOps,
     /// Rendered `<dispatched-thread-notification>` envelopes queued
     /// for injection as fresh user messages once this thread reaches
     /// an idle turn boundary. Populated by
@@ -477,8 +458,6 @@ impl Thread {
             scope,
             tool_surface,
             origin: None,
-            continued_from: None,
-            in_flight: InFlightOps::empty(),
             pending_tool_result_followups: Vec::new(),
             pending_knowledge_nudges: Vec::new(),
             seen_knowledge_hits: HashSet::new(),
@@ -500,14 +479,6 @@ impl Thread {
         self
     }
 
-    /// Stamp the compaction-continuation ancestor. Called by the
-    /// scheduler when spawning the continuation thread produced by
-    /// `/compact` — never mutated after construction.
-    pub fn with_continued_from(mut self, predecessor_id: String) -> Self {
-        self.continued_from = Some(predecessor_id);
-        self
-    }
-
     /// Stamp the dispatch parent + depth. Called by the scheduler when
     /// spawning a thread from a `dispatch_thread` tool call — never
     /// mutated after construction.
@@ -526,9 +497,11 @@ impl Thread {
     /// bindings, and scope over verbatim; resets per-run state
     /// (title, origin, lineage, cycle counter, compaction flag).
     ///
-    /// Rejects mid-turn sources (working, awaiting approval,
-    /// compacting) — the in-flight operation has no meaning in the
-    /// derived conversation. Rejects non-user-role indices —
+    /// Rejects mid-turn sources (working, awaiting approval) — the
+    /// in-flight operation has no meaning in the derived conversation.
+    /// (Mid-compaction forks are refused at the scheduler level, where
+    /// the weave's compacting marker lives.) Rejects non-user-role
+    /// indices —
     /// truncating at a tool_use / tool_result boundary leaves an
     /// unanswered tool call, which the user-role restriction sidesteps
     /// in v1.
@@ -541,9 +514,6 @@ impl Thread {
             _ => {
                 return Err("cannot fork a thread that is mid-turn".into());
             }
-        }
-        if self.in_flight.contains(InFlightOps::COMPACTING) {
-            return Err("cannot fork a thread while compaction is in flight".into());
         }
         let messages = self.conversation.messages();
         if from_message_index >= messages.len() {
@@ -588,8 +558,6 @@ impl Thread {
             scope: self.scope.clone(),
             tool_surface: self.tool_surface.clone(),
             origin: None,
-            continued_from: None,
-            in_flight: InFlightOps::empty(),
             pending_tool_result_followups: Vec::new(),
             pending_knowledge_nudges: Vec::new(),
             seen_knowledge_hits: HashSet::new(),
@@ -630,7 +598,6 @@ impl Thread {
             created_at: self.created_at.to_rfc3339(),
             last_active: self.last_active.to_rfc3339(),
             origin: self.origin.clone(),
-            continued_from: self.continued_from.clone(),
             dispatched_by: self.dispatched_by.clone(),
             // A thread has no knowledge of its weave relationships; the
             // scheduler decorates these from the ticker index before
@@ -656,7 +623,6 @@ impl Thread {
             last_active: self.last_active.to_rfc3339(),
             failure: self.failure_detail(),
             origin: self.origin.clone(),
-            continued_from: self.continued_from.clone(),
             dispatched_by: self.dispatched_by.clone(),
             scope: self.scope.clone(),
         }
@@ -2362,13 +2328,6 @@ mod tests {
     fn fork_rejects_mid_turn() {
         let mut src = thread_with_two_turns();
         src.internal = ThreadInternalState::NeedsModelCall;
-        assert!(src.fork_from("new".into(), 2).is_err());
-    }
-
-    #[test]
-    fn fork_rejects_during_compaction() {
-        let mut src = thread_with_two_turns();
-        src.in_flight.insert(InFlightOps::COMPACTING);
         assert!(src.fork_from("new".into(), 2).is_err());
     }
 

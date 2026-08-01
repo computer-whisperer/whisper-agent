@@ -155,6 +155,7 @@ append_entry(thread, author, content, provenance)   -- pollution included
 run_agent(thread, limits)                           -- tick one turn
 call_tool(thread, tool, arguments)
 derive_thread(definition, seed, relationship)       -- fork/compact/check/...
+advance_head(thread)                                -- promote to primary (step 8)
 adopt_ticker(thread) / release_ticker(thread)
 emit_event(payload)
 await_input(selector)
@@ -319,6 +320,46 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
 8. Move compaction onto weave machinery: head-advance along a `compaction`
    edge; delete the compaction-specific in-flight bit, internal originator,
    state hook, lineage field, and wire lifecycle.
+   **Ratified 2026-08-01 (all four forks):**
+   - *Old head becomes a dormant auxiliary* — ref kept (drill-down
+     guaranteed), `ticks=false`; input paths refuse it like any dormant
+     thread and fork is the deliberate revive. The live-auxiliary
+     alternative (preserving the legacy you-can-keep-typing behavior)
+     was REJECTED: every compaction would permanently add another live
+     thread to the weave, and typing into compacted-away context is a
+     footgun, not a feature.
+   - *Head-advance is a journaled effect* — `advance_head(thread)`
+     promotes a referenced thread to primary and demotes the old
+     primary per the rule above. Builtin compaction journals
+     `derive_thread` + `advance_head`, the same records a scripted
+     driver would produce; Lua drivers can therefore compose their own
+     compaction from primitives. Builtin-internal ref-twiddling was
+     REJECTED because the journal must explain why the primary changed
+     (explanatory-journal invariant) and scripted drivers need the
+     same primitive.
+   - *Wire lifecycle deleted* — `ThreadCompacted`, its Function
+     terminal payload, and `ThreadSummary`/`ThreadSnapshot.continued_from`
+     are gone. The roll rides the weave tier: damascene-ui follows the
+     head (when a `WeaveSnapshot` shows the selected thread demoted
+     along a `compaction` edge, it selects the new primary); the
+     summary text is readable as the continuation's seed message. A
+     transition shim keeping `ThreadCompacted` firing was REJECTED as
+     two sources of truth for one transition.
+   - *Legacy `continued_from` is ignored, not migrated* — the field is
+     deleted from the struct; old JSON keys drop off on next save
+     (Completed threads rarely resave, so raw files keep their
+     lineage for `pod_show_thread` indefinitely). Load-time synthesis
+     of weave edges from historical chains was REJECTED: walking
+     N-length chains and reconciling both threads' existing singleton
+     weave JSONs is the fiddliest code in the slice for a display
+     nicety.
+   - Standing calls: the in-progress marker lives in builtin weave
+     driver state (not on Thread); `CompactThread` survives as the
+     manual trigger with admission "thread is its weave's current
+     primary" (which also replaces the auto-compact `continued_from`
+     scan); scripted weaves still refuse both triggers — they get the
+     primitives, and a compaction driver event waits until a real
+     driver needs one.
 9. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 

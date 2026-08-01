@@ -46,8 +46,11 @@ pub struct WeaveThreadRef {
     /// described singletons that always ticked, so the default is `true`.
     #[serde(default = "default_ticks")]
     pub ticks: bool,
-    /// Relationship metadata for derived threads (`None` on primary and
-    /// adopted refs).
+    /// Relationship metadata for derived threads (`None` on original
+    /// primaries and adopted refs). A primary promoted by `advance_head`
+    /// keeps the relationship it was derived with — for a compaction
+    /// continuation that edge (`{kind: "compaction", source: old}`) is
+    /// the durable lineage record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship: Option<ThreadRelationship>,
 }
@@ -244,6 +247,32 @@ impl Weave {
                 relationship: None,
             }),
         }
+    }
+
+    /// Head-advance: promote a referenced thread to primary, demoting the
+    /// previous primary (if any) to a dormant auxiliary (`ticks=false` —
+    /// frozen history, revivable via fork or an explicit adopt). The
+    /// promoted ref keeps its relationship metadata: that journaled edge
+    /// (e.g. `{kind: "compaction", source: old}`) is the lineage record
+    /// that replaced `Thread.continued_from`. Returns the demoted
+    /// previous primary's id. The caller is responsible for admission
+    /// (target referenced + ticked by this weave) and for the matching
+    /// `thread_ticker` index update.
+    pub fn promote_primary(&mut self, thread_id: &str) -> Option<String> {
+        let previous = self
+            .threads
+            .iter_mut()
+            .find(|r| r.role == WeaveThreadRole::Primary && r.thread_id != thread_id)
+            .map(|r| {
+                r.role = WeaveThreadRole::Auxiliary;
+                r.ticks = false;
+                r.thread_id.clone()
+            });
+        if let Some(r) = self.threads.iter_mut().find(|r| r.thread_id == thread_id) {
+            r.role = WeaveThreadRole::Primary;
+        }
+        self.touch();
+        previous
     }
 
     /// Stop ticking a thread while keeping the reference (release ≠

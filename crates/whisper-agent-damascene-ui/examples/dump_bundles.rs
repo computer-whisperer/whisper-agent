@@ -141,11 +141,10 @@ enum Scene {
     /// without a synthetic click.
     ThreadWithDiff,
     /// Subscribed thread whose summary carries every provenance
-    /// field (origin = behavior, continued_from = a previous
-    /// thread, dispatched_by = a parent thread). Verifies the
-    /// pane header's three chip slots (`via`, `forked from`,
-    /// `dispatched from`) all render. A real thread won't usually
-    /// carry all three at once — origin and dispatched_by
+    /// field (origin = behavior, dispatched_by = a parent thread).
+    /// Verifies the pane header's chip slots (`via`,
+    /// `dispatched from`) both render. A real thread won't usually
+    /// carry both at once — origin and dispatched_by
     /// typically don't co-occur — but this is the visual
     /// regression scene.
     ThreadWithProvenance,
@@ -2058,7 +2057,6 @@ fn mock_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T10:00:00Z".into(),
             last_active: "2026-05-08T11:00:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2071,7 +2069,6 @@ fn mock_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T09:00:00Z".into(),
             last_active: "2026-05-08T09:30:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2084,7 +2081,6 @@ fn mock_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-07T14:00:00Z".into(),
             last_active: "2026-05-07T14:15:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2093,10 +2089,11 @@ fn mock_threads() -> Vec<ThreadSummary> {
 }
 
 /// Same shape as [`mock_threads`] but t-1 carries every
-/// provenance field — origin (behavior-spawned), continued_from
-/// (forked), dispatched_by (parent thread). Used by the
-/// `ThreadWithProvenance` scene to validate the pane header's
-/// three chip slots.
+/// provenance field — origin (behavior-spawned), dispatched_by
+/// (parent thread). Used by the `ThreadWithProvenance` scene to
+/// validate the pane header's chip slots. (Compaction lineage
+/// stopped being a summary field at step 8; it lives on the weave
+/// refs as a `compaction` relationship edge.)
 fn mock_provenance_threads() -> Vec<ThreadSummary> {
     let mut t = mock_threads();
     t[0].origin = Some(BehaviorOrigin {
@@ -2104,7 +2101,6 @@ fn mock_provenance_threads() -> Vec<ThreadSummary> {
         fired_at: "2026-05-08T10:30:00Z".into(),
         trigger_payload: serde_json::Value::Null,
     });
-    t[0].continued_from = Some("task-7c9c8d6a4f0b1234".into());
     t[0].dispatched_by = Some("task-18abcff7ad2a29b9".into());
     t
 }
@@ -2134,7 +2130,6 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T08:00:00Z".into(),
             last_active: "2026-05-08T08:30:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2147,7 +2142,6 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T08:10:00Z".into(),
             last_active: "2026-05-08T08:20:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: Some(parent_id.clone()),
             weave_id: None,
             weave_role: None,
@@ -2160,7 +2154,6 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T08:11:00Z".into(),
             last_active: "2026-05-08T08:22:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: Some(parent_id.clone()),
             weave_id: None,
             weave_role: None,
@@ -2173,7 +2166,6 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T08:12:00Z".into(),
             last_active: "2026-05-08T08:24:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: Some(parent_id),
             weave_id: None,
             weave_role: None,
@@ -2202,7 +2194,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-09T07:00:00Z".into(),
             last_active: "2026-05-09T07:30:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2215,7 +2206,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T22:00:00Z".into(),
             last_active: "2026-05-08T22:45:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2228,7 +2218,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-08T18:00:00Z".into(),
             last_active: "2026-05-08T18:10:00Z".into(),
             origin: None,
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2242,7 +2231,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-09T02:00:00Z".into(),
             last_active: "2026-05-09T02:18:00Z".into(),
             origin: Some(mk_origin("architect", "2026-05-09T02:00:00Z")),
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2256,7 +2244,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-09T07:50:00Z".into(),
             last_active: "2026-05-09T07:55:00Z".into(),
             origin: Some(mk_origin("researcher", "2026-05-09T07:50:00Z")),
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2269,7 +2256,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-09T06:50:00Z".into(),
             last_active: "2026-05-09T06:54:00Z".into(),
             origin: Some(mk_origin("researcher", "2026-05-09T06:50:00Z")),
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2285,7 +2271,6 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             created_at: "2026-05-01T10:00:00Z".into(),
             last_active: "2026-05-01T10:05:00Z".into(),
             origin: Some(mk_origin("old-greeter", "2026-05-01T10:00:00Z")),
-            continued_from: None,
             dispatched_by: None,
             weave_id: None,
             weave_role: None,
@@ -2641,7 +2626,6 @@ fn mock_many_threads(n: usize) -> Vec<ThreadSummary> {
                 created_at: last.to_rfc3339(),
                 last_active: last.to_rfc3339(),
                 origin: None,
-                continued_from: None,
                 dispatched_by: None,
                 weave_id: None,
                 weave_role: None,
@@ -2748,7 +2732,6 @@ fn mock_snapshot() -> ThreadSnapshot {
         last_active: "2026-05-08T11:00:00Z".into(),
         failure: None,
         origin: None,
-        continued_from: None,
         dispatched_by: None,
         scope: Scope::default(),
     }
@@ -2880,7 +2863,6 @@ fn base_snapshot(
         last_active: "2026-05-08T11:00:00Z".into(),
         failure: None,
         origin: None,
-        continued_from: None,
         dispatched_by: None,
         scope: Scope::default(),
     }
@@ -3276,7 +3258,6 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         last_active: "2026-05-08T11:00:00Z".into(),
         failure: None,
         origin: None,
-        continued_from: None,
         dispatched_by: None,
         scope: Scope::default(),
     }

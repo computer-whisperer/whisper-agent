@@ -1,25 +1,29 @@
 //! Compaction — appending a summarize-yourself prompt to an overlong
-//! thread, then spawning a fresh continuation thread seeded with the
-//! extracted summary.
+//! thread, then rolling the weave's head onto a fresh continuation
+//! thread seeded with the extracted summary.
 //!
-//! The mechanism follows the Claude Code pattern documented in
-//! `docs/research/compaction_claude_code.md`:
+//! Weave-native since migration step 8 (prompt mechanics still follow
+//! the Claude Code pattern in `docs/research/compaction_claude_code.md`):
 //!
-//!   1. Client sends `CompactThread { thread_id }`.
-//!   2. [`Scheduler::begin_compaction`] validates, flips
-//!      `thread.compacting = true`, and appends the thread's configured
-//!      compaction prompt as a final user message.
+//!   1. Client sends `CompactThread { thread_id }` (or the auto-trigger
+//!      fires with a `CallerLink::Weave` caller). Admission requires the
+//!      thread to be its ticking weave's current primary.
+//!   2. [`Scheduler::launch_compact_thread`] stamps the weave's builtin
+//!      driver state (`compacting = Some(thread_id)`) and appends the
+//!      thread's configured compaction prompt as a final user message.
 //!   3. The normal step loop runs the model turn.
-//!   4. When the turn ends on `end_turn`,
-//!      [`Scheduler::finalize_pending_compaction`] fires: it parses the
-//!      `<summary>` out of the assistant's response, spawns a new
-//!      thread inheriting the same config with
-//!      `continued_from = Some(old_thread_id)`, and seeds it by sending
-//!      the continuation-template user message.
-//!   5. The old thread is left `Completed` in-place (compaction boundary
-//!      preserved as history); the new thread becomes the active one.
+//!   4. When the builtin driver finishes the cycle,
+//!      [`Scheduler::finalize_builtin_compaction`] fires from the
+//!      boundary path: it parses the `<summary>` out of the assistant's
+//!      response, derives a continuation thread into the same weave
+//!      (journaled `derive_thread` with a `{kind: "compaction"}`
+//!      relationship edge), and advances the head (journaled
+//!      `advance_head`) so the continuation becomes the primary.
+//!   5. The old thread is left `Completed` in-place as a dormant
+//!      auxiliary — drill-down history, no longer ticked. Fork is the
+//!      deliberate revive.
 //!
-//! The `compacting` flag lives on `Thread` (not a scheduler side-map)
+//! The `compacting` marker lives on the weave's persisted driver state
 //! so a compaction in flight survives process restart — on the next
 //! startup the model turn still completes against the already-appended
 //! user message and the finalize runs as expected.
@@ -27,7 +31,7 @@
 use futures::stream::FuturesUnordered;
 use regex::Regex;
 use tracing::{debug, warn};
-use whisper_agent_protocol::{ContentBlock, Role, ServerToClient, ThreadConfigOverride};
+use whisper_agent_protocol::{ContentBlock, Role, ThreadConfigOverride};
 
 use super::Scheduler;
 use crate::runtime::io_dispatch::SchedulerFuture;
@@ -53,15 +57,16 @@ Do not preface your response. Do not call tools. End after the closing </summary
 
 /// Execution body for `Function::CompactThread`. Called by the Function
 /// registry's `launch_function` after the synchronous precondition
-/// check has already verified `compaction.enabled`, idle state, and
-/// the `COMPACTING` in-flight bit being unset.
+/// check has already verified `compaction.enabled`, idle state, the
+/// thread being its weave's current primary, and no compaction already
+/// running on the weave.
 ///
-/// Resolves the thread's compaction prompt, flips the `COMPACTING`
-/// bit, and appends the prompt as a user message — the same path as
-/// `SendUserMessage`, reusing its state transitions and broadcasts.
-/// The Function stays in `active_functions` until
-/// [`Scheduler::finalize_pending_compaction`] fires `complete_function`
-/// when the model turn completes.
+/// Resolves the thread's compaction prompt, stamps the weave's builtin
+/// driver state with the compacting marker, and appends the prompt as a
+/// user message — the same path as `SendUserMessage`, reusing its state
+/// transitions and broadcasts. The Function stays in `active_functions`
+/// until [`Scheduler::finalize_builtin_compaction`] fires
+/// `complete_function` when the builtin driver finishes the cycle.
 impl Scheduler {
     pub(super) fn launch_compact_thread(
         &mut self,
@@ -94,11 +99,21 @@ impl Scheduler {
             }
         };
 
-        // Flip the flag first so the finalize hook can see it when the
-        // turn completes below.
-        if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.in_flight
-                .insert(crate::functions::InFlightOps::COMPACTING);
+        // Stamp the marker first so the finalize hook can see it when
+        // the builtin driver finishes the cycle below.
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            // Admission verified a ticking weave exists; defensive.
+            warn!(%thread_id, "compact launch: thread has no ticking weave");
+            return;
+        };
+        if let Some(weave) = self.weaves.get_mut(&weave_id) {
+            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                compacting, ..
+            } = &mut weave.driver_state
+            {
+                *compacting = Some(thread_id.to_string());
+            }
+            self.mark_weave_dirty(&weave_id);
         }
         // Reuse send_user_message so title/state broadcasts and dirty
         // tracking run the same as any user follow-up.
@@ -108,22 +123,23 @@ impl Scheduler {
 
     /// Auto-trigger hook. Checks whether the given thread has crossed
     /// its compaction `token_threshold` and, if so, registers a
-    /// `Function::CompactThread` with a `SchedulerInternal(AutoCompact)`
-    /// caller-link.
+    /// `Function::CompactThread` with a `CallerLink::Weave` caller —
+    /// the weave noticing its primary outgrew its context is the true
+    /// originator.
     ///
     /// No-ops when:
     ///   - the thread has no threshold configured,
-    ///   - the thread has already been compacted once (detected by
-    ///     the existence of a sibling thread with
-    ///     `continued_from == Some(thread_id)`), or
-    ///   - `register_function` rejects (e.g., already compacting, not
-    ///     idle — the precondition checks inside the Function registry
-    ///     cover the same conditions the old `begin_compaction` did).
+    ///   - the thread is not its ticking weave's current primary (a
+    ///     compacted-away head is a dormant auxiliary and never
+    ///     re-triggers; the promoted continuation triggers its own
+    ///     compaction when it crosses the threshold), or
+    ///   - `register_function` rejects (already compacting, not idle —
+    ///     the precondition checks inside the Function registry cover
+    ///     the same conditions).
     ///
-    /// Fires from `step_until_blocked` after the finalize hook, so
-    /// trigger-cycle ordering is: finalize the old compaction first,
-    /// then consider a fresh auto-trigger. A freshly compacted parent
-    /// will be gated off by the child-thread check.
+    /// Fires from `step_until_blocked` after the boundary path has
+    /// finalized any completed compaction, so a freshly demoted head is
+    /// already non-primary when this runs.
     pub(super) fn maybe_auto_compact(
         &mut self,
         thread_id: &str,
@@ -136,23 +152,26 @@ impl Scheduler {
         let Some(threshold) = task.config.compaction.token_threshold else {
             return;
         };
-        // Scripted-driven threads compact via weave machinery
-        // (migration step 8); the builtin flow's summary-prompt input
-        // would re-enter the driver mid-activation.
+        // Scripted-driven threads own their lifecycle; the builtin
+        // flow's summary-prompt input would re-enter the driver
+        // mid-activation. They get the `advance_head` primitive
+        // instead; a compaction driver event waits until a real driver
+        // needs one.
         if self.has_scripted_ticker(thread_id) {
             return;
         }
         if task.total_usage.input_tokens <= threshold {
             return;
         }
-        // Already compacted once: a continuation thread exists
-        // pointing back at us. Scan is O(tasks) but only runs when
-        // the cheaper threshold check has passed.
-        let already_compacted = self
-            .tasks
-            .values()
-            .any(|t| t.continued_from.as_deref() == Some(thread_id));
-        if already_compacted {
+        // Only the weave's current primary compacts. Replaces the old
+        // O(tasks) `continued_from` scan: a head that was compacted
+        // away is no longer primary.
+        let is_primary = self
+            .thread_ticker
+            .get(thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            .is_some_and(|weave| weave.primary_thread_id() == Some(thread_id));
+        if !is_primary {
             return;
         }
         debug!(
@@ -165,11 +184,13 @@ impl Scheduler {
             thread_id: thread_id.to_string(),
         };
 
-        let caller = crate::functions::CallerLink::SchedulerInternal(
-            crate::functions::InternalOriginator::AutoCompact {
-                thread_id: thread_id.to_string(),
-            },
-        );
+        let caller = crate::functions::CallerLink::Weave {
+            weave_id: self
+                .thread_ticker
+                .get(thread_id)
+                .cloned()
+                .expect("primary check above requires a ticking weave"),
+        };
         match self.register_function(spec, caller) {
             Ok(fn_id) => self.launch_function(fn_id, pending_io),
             Err(e) => {
@@ -183,29 +204,40 @@ impl Scheduler {
         }
     }
 
-    /// Hook called after `step_until_blocked` returns. When the given
-    /// thread is mid-compaction and has reached `Completed`, parse the
-    /// `<summary>` from its most recent assistant message, spawn a
-    /// continuation thread inheriting the same config, seed it, and
-    /// broadcast `ThreadCompacted`.
+    /// Hook called from the builtin boundary path when the driver
+    /// finishes a cycle on `thread_id`. When the weave's builtin driver
+    /// state carries a compacting marker for this thread and the thread
+    /// has reached `Completed`, parse the `<summary>` from its most
+    /// recent assistant message, derive a continuation thread into the
+    /// same weave (journaled `derive_thread` with a
+    /// `{kind: "compaction"}` edge), advance the head (journaled
+    /// `advance_head` — the old head becomes a dormant auxiliary), and
+    /// seed the continuation.
     ///
-    /// No-op when the thread isn't compacting or isn't terminal yet.
-    /// Safe to call unconditionally from `step_until_blocked`.
-    pub(super) fn finalize_pending_compaction(
+    /// No-op when no compaction is marked for this thread. Safe to call
+    /// after every builtin cycle finish.
+    pub(super) fn finalize_builtin_compaction(
         &mut self,
+        weave_id: &str,
         thread_id: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
+        let marked = self.weaves.get(weave_id).is_some_and(|weave| {
+            matches!(
+                &weave.driver_state,
+                crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                    compacting: Some(t),
+                    ..
+                } if t == thread_id
+            )
+        });
+        if !marked {
+            return;
+        }
         let task = match self.tasks.get(thread_id) {
             Some(t) => t,
             None => return,
         };
-        if !task
-            .in_flight
-            .contains(crate::functions::InFlightOps::COMPACTING)
-        {
-            return;
-        }
         if !matches!(
             task.public_state(),
             whisper_agent_protocol::ThreadStateLabel::Completed
@@ -221,7 +253,6 @@ impl Scheduler {
         let assistant_text = extract_last_assistant_text(task);
         let regex_src = task.config.compaction.summary_regex.clone();
         let continuation_template = task.config.compaction.continuation_template.clone();
-        let pod_id = task.pod_id.clone();
         let old_bindings = task.bindings.clone();
         let old_config = task.config.clone();
         let old_origin = task.origin.clone();
@@ -239,12 +270,16 @@ impl Scheduler {
         let parent_setup: Vec<whisper_agent_protocol::Message> =
             task.conversation.messages()[..setup_end].to_vec();
 
-        // Always clear the flag so a failed parse doesn't re-trigger
-        // the finalize on every subsequent step.
-        if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.in_flight
-                .remove(crate::functions::InFlightOps::COMPACTING);
-            self.mark_dirty(thread_id);
+        // Always clear the marker so a failed parse doesn't re-trigger
+        // the finalize on every subsequent cycle finish.
+        if let Some(weave) = self.weaves.get_mut(weave_id) {
+            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                compacting, ..
+            } = &mut weave.driver_state
+            {
+                *compacting = None;
+            }
+            self.mark_weave_dirty(weave_id);
         }
 
         // Locate the in-flight CompactThread Function so we can emit
@@ -272,10 +307,13 @@ impl Scheduler {
             return;
         };
 
-        // Spawn the continuation. We route through `create_task` so
-        // bindings are re-resolved (same backend / sandbox / shared
-        // MCPs, but the registry sees a fresh user) and the usual
-        // `ThreadCreated` broadcast fires.
+        // Derive the continuation into the same weave. Routing through
+        // `weave_derive_thread` journals the `derive_thread` record with
+        // the `compaction` relationship edge (the durable lineage that
+        // replaced `Thread.continued_from`), re-resolves bindings, and
+        // fires the usual `ThreadCreated` broadcast. Base scope comes
+        // from the current primary — a narrowed parent doesn't widen at
+        // the compaction boundary.
         let config_override = Some(ThreadConfigOverride {
             // Carry the participant registry verbatim. The compatibility
             // driver will invoke the same default responder, while future
@@ -354,31 +392,34 @@ impl Scheduler {
             host_env: Some(inherited_host_env),
             mcp_hosts: Some(old_bindings.mcp_hosts.clone()),
         });
-        let new_thread_id = match self.create_task(
-            None,
-            None,
-            Some(pod_id.clone()),
+        let relationship = crate::runtime::driver::ThreadRelationship {
+            kind: "compaction".to_string(),
+            source: Some(crate::runtime::driver::EntryRef {
+                thread_id: thread_id.to_string(),
+                entry_index: None,
+            }),
+        };
+        let new_thread_id = match self.weave_derive_thread(
+            weave_id,
             config_override,
             bindings_request,
+            Vec::new(),
+            relationship,
             old_origin,
-            None,
-            None,
-            None,
-            None,
             pending_io,
         ) {
             Ok(id) => id,
             Err(e) => {
                 warn!(
                     %thread_id, error = %e,
-                    "compaction finalize: create_task for continuation failed"
+                    "compaction finalize: deriving continuation failed"
                 );
                 if let Some(id) = compact_fn_id {
                     self.complete_function(
                         id,
                         crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
                             kind: crate::functions::FunctionErrorKind::Execution,
-                            detail: format!("continuation create_task failed: {e}"),
+                            detail: format!("continuation derive failed: {e}"),
                         }),
                         pending_io,
                     );
@@ -387,23 +428,15 @@ impl Scheduler {
             }
         };
 
-        // Stamp the continuation linkage. `create_task` has already
-        // broadcast `ThreadCreated` for this thread with
-        // `continued_from = None` in its summary — the authoritative
-        // linkage arrives via the `ThreadCompacted` broadcast below,
-        // and any newly-joining client gets the stamped field from
-        // `ThreadSnapshot` / `ThreadList`.
-        //
-        // Same pass overwrites the continuation's fresh setup prefix
-        // (seeded by `seed_thread_setup` inside `create_task` from
-        // current pod state) with the parent's snapshot. Copying
-        // verbatim keeps the continuation's system prompt and tool
-        // manifest identical to what the parent was running under —
-        // behaviors, custom-prompted threads, and mid-life pod edits
-        // all settle out the same way (continuation inherits, pod
-        // drift doesn't leak across the compaction boundary).
+        // Overwrite the continuation's fresh setup prefix (seeded by
+        // `seed_thread_setup` inside `create_task` from current pod
+        // state) with the parent's snapshot. Copying verbatim keeps the
+        // continuation's system prompt and tool manifest identical to
+        // what the parent was running under — behaviors, custom-prompted
+        // threads, and mid-life pod edits all settle out the same way
+        // (continuation inherits, pod drift doesn't leak across the
+        // compaction boundary).
         if let Some(new_task) = self.tasks.get_mut(&new_thread_id) {
-            new_task.continued_from = Some(thread_id.to_string());
             let tail: Vec<whisper_agent_protocol::Message> = new_task
                 .conversation
                 .messages()
@@ -461,13 +494,23 @@ impl Scheduler {
             }
         }
         self.mark_dirty(&new_thread_id);
-        self.router
-            .broadcast_task_list(ServerToClient::ThreadCompacted {
-                thread_id: thread_id.to_string(),
-                new_thread_id: new_thread_id.clone(),
-                summary_text: summary_text.clone(),
-                correlation_id: None,
-            });
+
+        // Advance the head: the continuation becomes the weave's
+        // primary; the old head is demoted to a dormant auxiliary
+        // (frozen history, drill-down guaranteed). Journals the
+        // `advance_head` record, pushes fresh weave snapshots to
+        // subscribers, and broadcasts a decorated thread list so
+        // client-side weave tags stay coherent.
+        if let Err(e) = self.weave_advance_head(weave_id, &new_thread_id) {
+            // Admission can't reasonably fail here (the continuation
+            // was just derived into this weave, ticked), but if it
+            // does, surface it rather than silently leaving two live
+            // threads.
+            warn!(
+                %weave_id, %new_thread_id, error = %e,
+                "compaction finalize: advance_head refused"
+            );
+        }
 
         // Seed the continuation with the filled-in template. This
         // kicks the thread's first model call.

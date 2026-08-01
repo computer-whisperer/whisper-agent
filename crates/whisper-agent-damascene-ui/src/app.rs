@@ -4083,11 +4083,43 @@ impl ChatApp {
                 self.views.insert(thread_id, view);
             }
             ServerToClient::WeaveSnapshot { weave_id, snapshot } => {
+                // Head-follow (step 8): when the thread we're viewing
+                // was this weave's primary and the new snapshot shows
+                // it demoted by a `compaction`-tagged promotion, jump
+                // to the new primary — the roll reads as one continuous
+                // conversation, with the old context a click away in
+                // the sidebar. Requires the previous snapshot to prove
+                // the demotion actually happened now: a user deliberately
+                // reading an old auxiliary is never hijacked, and
+                // scripted-driver role churn without a compaction edge
+                // doesn't move selection either.
+                let follow = self.selected.as_deref().and_then(|selected| {
+                    let was_primary = self.weaves.get(&weave_id).is_some_and(|prev| {
+                        prev.threads
+                            .iter()
+                            .any(|r| r.thread_id == selected && r.role == WeaveThreadRole::Primary)
+                    });
+                    if !was_primary {
+                        return None;
+                    }
+                    snapshot
+                        .threads
+                        .iter()
+                        .find(|r| {
+                            r.thread_id != selected
+                                && r.role == WeaveThreadRole::Primary
+                                && r.relationship.as_deref() == Some("compaction")
+                        })
+                        .map(|r| r.thread_id.clone())
+                });
                 // Full coordination view (step 7b), re-sent by the
                 // server whenever refs or presentation change. Replace
                 // wholesale; thread content streams separately through
                 // the per-thread tier.
                 self.weaves.insert(weave_id, snapshot);
+                if let Some(new_primary) = follow {
+                    self.select_thread(new_primary);
+                }
             }
             ServerToClient::ThreadDraftUpdated { thread_id, text } => {
                 // Broadcast from another client editing the same
@@ -4450,7 +4482,7 @@ impl ChatApp {
                 }
             }
             // Per-turn append events not yet surfaced.
-            ServerToClient::ThreadLoopComplete { .. } | ServerToClient::ThreadCompacted { .. } => {}
+            ServerToClient::ThreadLoopComplete { .. } => {}
             // Model called `sudo(...)` — surface as an approval
             // banner above the matching thread's chat log. Stay
             // mounted until either `SudoResolved` echoes or the user
@@ -9979,9 +10011,6 @@ impl ChatApp {
         if let Some(s) = summary {
             if let Some(origin) = &s.origin {
                 toolbar_children.push(badge(format!("via {}", origin.behavior_id)).muted());
-            }
-            if let Some(prev) = &s.continued_from {
-                toolbar_children.push(badge(format!("forked from {}", short_id(prev))).muted());
             }
             if let Some(parent) = &s.dispatched_by {
                 toolbar_children

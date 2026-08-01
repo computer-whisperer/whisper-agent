@@ -962,12 +962,6 @@ pub struct ThreadSummary {
     /// without fetching the full snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<BehaviorOrigin>,
-    /// When this thread was spawned as the continuation of a compacted
-    /// thread, the id of that ancestor. `None` for threads that weren't
-    /// created by compaction. Exposed on the list tier so the UI can
-    /// badge "continued from …" without fetching the full snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continued_from: Option<String>,
     /// When this thread was spawned by a parent thread's `dispatch_thread`
     /// tool call, the id of the parent. `None` for top-level threads.
     /// Exposed on the list tier so the UI can nest dispatched children
@@ -1316,10 +1310,6 @@ pub struct ThreadSnapshot {
     /// but payload-size concerns may trim it there later).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<BehaviorOrigin>,
-    /// Ancestor thread id when this thread is a compaction continuation.
-    /// `None` for threads that weren't created by compaction.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continued_from: Option<String>,
     /// Parent thread id when this thread was spawned by a
     /// `dispatch_thread` tool call. `None` for top-level threads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2395,22 +2385,10 @@ pub enum ServerToClient {
         thread_id: String,
         text: String,
     },
-    /// Compaction finished on `thread_id`: the scheduler spawned
-    /// `new_thread_id` seeded with the extracted summary, and
-    /// `new_thread_id.continued_from == thread_id`. The original thread
-    /// is left in-place (Completed) so clients can still render its
-    /// history — a deliberate choice to preserve the compaction
-    /// boundary as a historical artifact rather than rewrite the past.
-    /// `summary_text` is the body that was extracted and used to seed
-    /// the continuation; clients may render it inline without having
-    /// to re-parse the old thread.
-    ThreadCompacted {
-        thread_id: String,
-        new_thread_id: String,
-        summary_text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        correlation_id: Option<String>,
-    },
+    // (A `ThreadCompacted` broadcast lived here until migration step 8.
+    // A compaction roll is now a weave head-advance: subscribers watch
+    // the `WeaveSnapshot` primary move along a `compaction` edge, and
+    // the summary text is readable as the continuation's seed message.)
 
     // --- Request / response ---
     ThreadList {

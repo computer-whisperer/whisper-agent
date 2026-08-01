@@ -25,7 +25,7 @@ use whisper_agent_protocol::{
 
 use super::{ConnId, Scheduler};
 use crate::functions::{
-    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, InFlightOps, RejectReason,
+    CallerLink, Function, FunctionId, FunctionOutcome, FunctionTerminal, RejectReason,
 };
 use crate::runtime::io_dispatch::SchedulerFuture;
 
@@ -209,30 +209,52 @@ impl Scheduler {
                         detail: "compaction is disabled on this thread".into(),
                     });
                 }
-                if task.in_flight.contains(InFlightOps::COMPACTING) {
-                    return Err(RejectReason::ResourceBusy {
-                        detail: "compaction already in progress".into(),
-                    });
-                }
                 if !task.is_idle() {
                     return Err(RejectReason::PreconditionFailed {
                         detail: "thread is not at a clean turn boundary".into(),
                     });
                 }
                 // Compaction runs a turn on the thread; a dormant one
-                // (no ticking weave) can't run it, and the COMPACTING
-                // bit would wedge set when the input guard rejects the
-                // summary prompt.
-                if !self.thread_ticker.contains_key(thread_id) {
+                // (no ticking weave) can't run it, and the weave's
+                // compacting marker would wedge set when the input
+                // guard rejects the summary prompt.
+                let Some(weave) = self
+                    .thread_ticker
+                    .get(thread_id)
+                    .and_then(|weave_id| self.weaves.get(weave_id))
+                else {
                     return Err(RejectReason::PreconditionFailed {
                         detail: "thread is dormant (no weave ticks it)".into(),
                     });
-                }
-                if self.has_scripted_ticker(thread_id) {
+                };
+                if matches!(
+                    weave.driver,
+                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                ) {
                     return Err(RejectReason::PreconditionFailed {
-                        detail: "scripted-driven threads compact via weave machinery \
-                                 (migration step 8)"
+                        detail: "scripted-driven threads own their lifecycle; a driver \
+                                 composes compaction from weave primitives"
                             .into(),
+                    });
+                }
+                if matches!(
+                    &weave.driver_state,
+                    crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                        compacting: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(RejectReason::ResourceBusy {
+                        detail: "compaction already in progress on this weave".into(),
+                    });
+                }
+                // Only the weave's current head compacts: a compacted-
+                // away thread is a dormant auxiliary (caught above),
+                // but guard explicitly so role drift can never launch a
+                // summary turn on a non-primary.
+                if weave.primary_thread_id() != Some(thread_id.as_str()) {
+                    return Err(RejectReason::PreconditionFailed {
+                        detail: "thread is not its weave's primary; only the head compacts".into(),
                     });
                 }
                 Ok(())
@@ -3353,6 +3375,16 @@ impl Scheduler {
         // them via caller-gone cascade.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
+        // A compaction in flight on this thread was abandoned by the
+        // cancel (the weave's marker was cleared in `weave_cancelled`);
+        // resolve its Function so the registry doesn't leak the entry.
+        if let Some(fn_id) = self.find_compact_function_for(thread_id) {
+            self.complete_function(
+                fn_id,
+                FunctionOutcome::Cancelled(crate::functions::CancelReason::ExplicitCancel),
+                pending_io,
+            );
+        }
     }
 }
 

@@ -3354,10 +3354,25 @@ impl Scheduler {
     /// empty — a thread has no knowledge of its relationships — so
     /// every summary that ships over the wire passes through here,
     /// picking up the ticking weave from the scheduler's index.
-    /// Dormant threads (no ticker) stay untagged.
+    ///
+    /// A dormant thread that some weave still *references* (step 8's
+    /// compacted-away head) is tagged from that ref instead, so the
+    /// sidebar keeps it nested under the weave's primary and the pane
+    /// swaps the compose box for the frozen-history hint. A thread
+    /// referenced by several weaves tags with the first found —
+    /// arbitrary but stable within a listing; unreferenced dormant
+    /// threads stay untagged.
     pub(super) fn decorate_summary(&self, mut summary: ThreadSummary) -> ThreadSummary {
-        if let Some(weave_id) = self.thread_ticker.get(&summary.thread_id)
-            && let Some(weave) = self.weaves.get(weave_id)
+        let referencing = self
+            .thread_ticker
+            .get(&summary.thread_id)
+            .and_then(|weave_id| self.weaves.get_key_value(weave_id))
+            .or_else(|| {
+                self.weaves
+                    .iter()
+                    .find(|(_, weave)| weave.references(&summary.thread_id))
+            });
+        if let Some((weave_id, weave)) = referencing
             && let Some(thread_ref) = weave
                 .threads
                 .iter()
@@ -4378,6 +4393,26 @@ impl Scheduler {
         reset_capabilities: bool,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
+        // Mid-compaction forks are refused here (the marker lives on
+        // the weave, which `Thread::fork_from` can't see): the summary
+        // turn is about to demote this thread, and the fork would copy
+        // the appended compaction prompt as ordinary history.
+        let compacting = self
+            .thread_ticker
+            .get(source_thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            .is_some_and(|weave| {
+                matches!(
+                    &weave.driver_state,
+                    crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                        compacting: Some(t),
+                        ..
+                    } if t == source_thread_id
+                )
+            });
+        if compacting {
+            return Err("cannot fork a thread while compaction is in flight".into());
+        }
         let new_id = crate::runtime::thread::new_task_id();
         let mut task = {
             let source = self
@@ -5163,16 +5198,11 @@ impl Scheduler {
         // hook directly. Passes `pending_io` through so the hook can
         // re-fire on a queued QueueOne payload.
         self.on_behavior_thread_terminal(thread_id, pending_io);
-        // If the thread was mid-compaction and has just reached
-        // Completed, parse the summary and spawn a continuation.
-        // No-op otherwise. Runs after the behavior hook so a
-        // compacted-then-continued behavior thread records the
-        // Completed outcome on its original thread first.
-        self.finalize_pending_compaction(thread_id, pending_io);
-        // Then check whether this (or a freshly spawned continuation)
-        // has crossed its auto-compaction token threshold. The
-        // already-compacted gate inside the hook keeps the just-
-        // -finalized parent from retriggering.
+        // Check whether this thread has crossed its auto-compaction
+        // token threshold. (Compaction finalize itself fires from the
+        // builtin boundary path when the summary cycle finishes — a
+        // freshly demoted head is no longer its weave's primary, so
+        // the gate inside the hook keeps it from retriggering.)
         self.maybe_auto_compact(thread_id, pending_io);
         // Dispatched-child terminal-state fan-out: if this thread is
         // a child awaited by a `Function::CreateThread{ThreadTerminal}`,
@@ -5290,6 +5320,10 @@ impl Scheduler {
                             "driver finished cycle at turn limit"
                         );
                         self.finish_thread_cycle(thread_id);
+                        // A finished builtin cycle may be the compaction
+                        // summary turn — finalize rolls the weave's head
+                        // onto the continuation. No-op otherwise.
+                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
                     }
                     Ok(other) => self.fail_thread_at_boundary(
                         thread_id,
@@ -5357,6 +5391,10 @@ impl Scheduler {
                             },
                         );
                         self.finish_thread_cycle(thread_id);
+                        // A finished builtin cycle may be the compaction
+                        // summary turn — finalize rolls the weave's head
+                        // onto the continuation. No-op otherwise.
+                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
                     }
                     Ok(other) => self.fail_thread_at_boundary(
                         thread_id,
@@ -5403,6 +5441,10 @@ impl Scheduler {
                             },
                         );
                         self.finish_thread_cycle(thread_id);
+                        // A finished builtin cycle may be the compaction
+                        // summary turn — finalize rolls the weave's head
+                        // onto the continuation. No-op otherwise.
+                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
                     }
                     Ok(other) => self.fail_thread_at_boundary(
                         thread_id,
@@ -5487,6 +5529,24 @@ impl Scheduler {
     /// `scheduler/functions.rs`.
     pub(super) fn weave_cancelled(&mut self, thread_id: &str) {
         self.weave_interrupt_pending(thread_id, "cancelled");
+        // Cancelling the thread mid-compaction abandons the summary
+        // turn: clear the weave's marker so a later ordinary turn on
+        // this thread can't trip the finalize into deriving a
+        // continuation from a non-summary response (and so admission
+        // doesn't report the weave busy forever). The in-flight
+        // CompactThread Function completes as Cancelled in
+        // `execute_cancel_thread`, which owns `pending_io`.
+        if let Some(weave_id) = self.thread_ticker.get(thread_id).cloned()
+            && let Some(weave) = self.weaves.get_mut(&weave_id)
+            && let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                compacting: compacting @ Some(_),
+                ..
+            } = &mut weave.driver_state
+            && compacting.as_deref() == Some(thread_id)
+        {
+            *compacting = None;
+            self.mark_weave_dirty(&weave_id);
+        }
     }
 
     // ---------- cross-thread effect executors (migration step 6) ----------
@@ -5595,6 +5655,7 @@ impl Scheduler {
     /// authority of the context it coordinates — narrowed further by the
     /// definition override; absent a live primary, the pod ceiling.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn weave_derive_thread(
         &mut self,
         weave_id: &str,
@@ -5602,6 +5663,7 @@ impl Scheduler {
         bindings_request: Option<ThreadBindingsRequest>,
         seed: Vec<whisper_agent_protocol::Message>,
         relationship: crate::runtime::driver::ThreadRelationship,
+        origin: Option<whisper_agent_protocol::BehaviorOrigin>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         use crate::runtime::driver::PersistedDriverEffect;
@@ -5626,7 +5688,7 @@ impl Scheduler {
                 Some(pod_id),
                 config_override,
                 bindings_request,
-                None,
+                origin,
                 None,
                 base_scope_override,
                 None,
@@ -5659,6 +5721,103 @@ impl Scheduler {
             self.mark_weave_dirty(weave_id);
         }
         created
+    }
+
+    /// Execute an `advance_head` effect: promote a referenced thread this
+    /// weave ticks to primary; the previous primary becomes a dormant
+    /// auxiliary (`ticks=false`, dropped from the ticker index — frozen
+    /// history, revivable via fork or a future adopt). Journaled either
+    /// way; refusals journal as Failed records. Broadcasts a decorated
+    /// thread list afterwards so client-side weave tags (sidebar nesting,
+    /// compose-box gating) don't go stale on the role change.
+    pub(super) fn weave_advance_head(
+        &mut self,
+        weave_id: &str,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        if !self.weaves.contains_key(weave_id) {
+            return Err(format!("unknown weave `{weave_id}`"));
+        }
+        let admission = (|| -> Result<(), String> {
+            let weave = &self.weaves[weave_id];
+            if !weave.references(thread_id) {
+                return Err(format!("weave does not reference thread `{thread_id}`"));
+            }
+            if weave.primary_thread_id() == Some(thread_id) {
+                return Err(format!("thread `{thread_id}` is already the primary"));
+            }
+            if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
+                return Err(format!(
+                    "weave does not tick thread `{thread_id}`; only a self-ticked \
+                     thread can become the head"
+                ));
+            }
+            // Demoting a primary with an active cycle would orphan its
+            // next boundary (the ticker entry goes away with the
+            // demotion) — same at-idle rule as `release_ticker`.
+            if let Some(primary) = weave.primary_thread_id()
+                && self
+                    .tasks
+                    .get(primary)
+                    .is_some_and(|task| task.is_in_flight())
+            {
+                return Err(format!(
+                    "current primary `{primary}` has an active cycle; advance at idle"
+                ));
+            }
+            Ok(())
+        })();
+
+        let result = match admission {
+            Ok(()) => {
+                let weave = self.weaves.get_mut(weave_id).expect("checked above");
+                let previous = weave.promote_primary(thread_id);
+                weave.record_completed_effect(PersistedDriverEffect::AdvanceHead {
+                    thread_id: thread_id.to_string(),
+                    previous: previous.clone(),
+                });
+                if let Some(prev) = &previous {
+                    if self.thread_ticker.get(prev).map(String::as_str) == Some(weave_id) {
+                        self.thread_ticker.remove(prev);
+                    }
+                    // A scripted weave's mechanical turn counters track
+                    // ticked threads; the demoted head no longer turns.
+                    if let Some(weave) = self.weaves.get_mut(weave_id)
+                        && let crate::runtime::driver::DriverState::Scripted { turns, .. } =
+                            &mut weave.driver_state
+                    {
+                        turns.remove(prev);
+                    }
+                }
+                Ok(())
+            }
+            Err(message) => {
+                let weave = self.weaves.get_mut(weave_id).expect("checked above");
+                weave.record_failed_effect(
+                    PersistedDriverEffect::AdvanceHead {
+                        thread_id: thread_id.to_string(),
+                        previous: None,
+                    },
+                    message.clone(),
+                );
+                Err(message)
+            }
+        };
+        self.mark_weave_dirty(weave_id);
+        if result.is_ok() {
+            self.notify_weave_subscribers(weave_id);
+            let tasks = self
+                .tasks
+                .values()
+                .map(|t| self.decorate_summary(t.summary()))
+                .collect();
+            self.router.broadcast_task_list(ServerToClient::ThreadList {
+                correlation_id: None,
+                tasks,
+            });
+        }
+        result
     }
 
     /// Execute an `adopt_ticker` effect: take over driving a dormant

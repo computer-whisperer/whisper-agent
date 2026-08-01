@@ -177,6 +177,7 @@ impl Harness {
                 kind: kind.into(),
                 source: None,
             },
+            None,
             &mut pending_io,
         )
     }
@@ -376,6 +377,7 @@ async fn derived_scope_inherits_primary_and_caps_narrow_not_assign() {
                 kind: "check".into(),
                 source: None,
             },
+            None,
             &mut pending_io,
         )
         .expect("override within pod ceiling is admitted");
@@ -954,5 +956,441 @@ async fn dormant_thread_keeps_nudges_and_followups_queued() {
         task.pending_tool_result_followups.len(),
         1,
         "follow-up stays queued until a weave adopts the thread"
+    );
+}
+
+// ---------- step 8: compaction as a weave head-advance ----------
+
+/// Full builtin compaction lifecycle on weave machinery: the summary
+/// turn runs under the weave's compacting marker; on cycle finish the
+/// scheduler derives a continuation along a `compaction` edge, advances
+/// the head (journaled), demotes the old thread to a dormant auxiliary,
+/// and seeds the continuation from the extracted summary.
+#[tokio::test]
+async fn builtin_compaction_rolls_the_weave_head() {
+    use crate::functions::{CallerLink, Function};
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    // An ordinary turn first, so the thread has history worth rolling.
+    h.sched
+        .send_user_message(&t1, "hello there".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    h.respond_model(&t1, vec![text_block("hi — done")], &mut pending_io);
+
+    // Launch the compaction Function with the weave as caller (the
+    // auto-trigger's shape).
+    let fn_id = h
+        .sched
+        .register_function(
+            Function::CompactThread {
+                thread_id: t1.clone(),
+            },
+            CallerLink::Weave {
+                weave_id: weave_id.clone(),
+            },
+        )
+        .expect("primary idle builtin thread admits compaction");
+    h.sched.launch_function(fn_id, &mut pending_io);
+
+    // The summary turn is in flight and the weave carries the marker.
+    assert!(matches!(
+        h.internal_of(&t1),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(matches!(
+        &h.sched.weaves[&weave_id].driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: Some(t),
+            ..
+        } if t == &t1
+    ));
+    // Forks are refused mid-compaction at the scheduler level.
+    assert!(
+        h.sched
+            .fork_task(None, None, &t1, 2, false, &mut pending_io)
+            .is_err(),
+        "fork during compaction must be refused"
+    );
+    // A second compaction is refused while one is running.
+    assert!(matches!(
+        h.sched.register_function(
+            Function::CompactThread {
+                thread_id: t1.clone(),
+            },
+            CallerLink::Weave {
+                weave_id: weave_id.clone(),
+            },
+        ),
+        Err(crate::functions::RejectReason::PreconditionFailed { .. })
+    ));
+
+    // The model returns the summary; the finalize rolls the head.
+    h.respond_model(
+        &t1,
+        vec![text_block("<summary>\nthe distilled past\n</summary>")],
+        &mut pending_io,
+    );
+
+    let weave = &h.sched.weaves[&weave_id];
+    assert_eq!(weave.threads.len(), 2, "old head + continuation");
+    let old_ref = weave
+        .threads
+        .iter()
+        .find(|r| r.thread_id == t1)
+        .expect("old head stays referenced");
+    assert_eq!(old_ref.role, WeaveThreadRole::Auxiliary);
+    assert!(!old_ref.ticks, "old head is dormant — frozen history");
+    let new_ref = weave
+        .threads
+        .iter()
+        .find(|r| r.thread_id != t1)
+        .expect("continuation referenced");
+    let t2 = new_ref.thread_id.clone();
+    assert_eq!(new_ref.role, WeaveThreadRole::Primary);
+    assert!(new_ref.ticks);
+    let rel = new_ref
+        .relationship
+        .as_ref()
+        .expect("promoted head keeps its lineage edge");
+    assert_eq!(rel.kind, "compaction");
+    assert_eq!(
+        rel.source,
+        Some(EntryRef {
+            thread_id: t1.clone(),
+            entry_index: None
+        })
+    );
+
+    // Ticker index followed the head.
+    assert!(!h.sched.thread_ticker.contains_key(&t1));
+    assert_eq!(h.sched.thread_ticker.get(&t2), Some(&weave_id));
+
+    // The marker cleared and the Function completed.
+    assert!(matches!(
+        &h.sched.weaves[&weave_id].driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: None,
+            ..
+        }
+    ));
+    assert!(
+        !h.sched.active_functions.contains_key(&fn_id),
+        "CompactThread Function reached its terminal"
+    );
+
+    // Journal explains the roll: a derive along the compaction edge,
+    // then the head-advance naming both threads.
+    let records = h.sched.weaves[&weave_id].effect_journal.records();
+    assert!(records.iter().any(|r| matches!(
+        &r.effect,
+        PersistedDriverEffect::DeriveThread {
+            thread_id: Some(t),
+            relationship,
+            ..
+        } if t == &t2 && relationship.kind == "compaction"
+    )));
+    assert!(
+        records
+            .iter()
+            .any(|r| r.outcome == DriverEffectOutcome::Completed
+                && matches!(
+                    &r.effect,
+                    PersistedDriverEffect::AdvanceHead {
+                        thread_id,
+                        previous: Some(prev)
+                    } if thread_id == &t2 && prev == &t1
+                ))
+    );
+
+    // The continuation inherited the parent's setup and got the summary
+    // seed; its first model turn is already in flight.
+    let t2_task = &h.sched.tasks[&t2];
+    assert!(
+        t2_task
+            .conversation
+            .messages()
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("the distilled past")
+            ))),
+        "continuation seeded with the extracted summary"
+    );
+    assert!(matches!(
+        h.internal_of(&t2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // Summaries stay coherent: the dormant old head is tagged from the
+    // weave ref (sidebar nesting + compose-box gating), the new head is
+    // primary.
+    let old_summary = h.sched.decorate_summary(h.sched.tasks[&t1].summary());
+    assert_eq!(old_summary.weave_id.as_deref(), Some(weave_id.as_str()));
+    assert_eq!(
+        old_summary.weave_role,
+        Some(whisper_agent_protocol::weave::WeaveThreadRole::Auxiliary)
+    );
+    let new_summary = h.sched.decorate_summary(h.sched.tasks[&t2].summary());
+    assert_eq!(
+        new_summary.weave_role,
+        Some(whisper_agent_protocol::weave::WeaveThreadRole::Primary)
+    );
+
+    // Input to the demoted head is refused (dormant), and it can never
+    // compact again (not primary).
+    let before = h.sched.tasks[&t1].conversation.messages().len();
+    h.sched
+        .send_user_message(&t1, "keep talking?".into(), Vec::new(), &mut pending_io);
+    assert_eq!(
+        h.sched.tasks[&t1].conversation.messages().len(),
+        before,
+        "dormant old head rejects input"
+    );
+    assert!(
+        h.sched
+            .register_function(
+                Function::CompactThread {
+                    thread_id: t1.clone(),
+                },
+                CallerLink::Weave {
+                    weave_id: weave_id.clone(),
+                },
+            )
+            .is_err()
+    );
+
+    // The degenerate presentation now shows the new head with the old
+    // context in the drill-down list.
+    assert_eq!(
+        h.sched.weaves[&weave_id].wire_snapshot().presentation,
+        vec![
+            PresentationBlock::PrimaryTranscript {
+                thread_id: t2.clone()
+            },
+            PresentationBlock::ThreadList {
+                thread_ids: vec![t1.clone()]
+            }
+        ]
+    );
+}
+
+/// A summary turn that yields no `<summary>` block clears the marker,
+/// completes the Function as an error, and leaves the weave unrolled.
+#[tokio::test]
+async fn compaction_without_summary_errors_and_leaves_head_in_place() {
+    use crate::functions::{CallerLink, Function};
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&t1, "hello".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    h.respond_model(&t1, vec![text_block("hi")], &mut pending_io);
+
+    let fn_id = h
+        .sched
+        .register_function(
+            Function::CompactThread {
+                thread_id: t1.clone(),
+            },
+            CallerLink::Weave {
+                weave_id: weave_id.clone(),
+            },
+        )
+        .unwrap();
+    h.sched.launch_function(fn_id, &mut pending_io);
+    h.respond_model(
+        &t1,
+        vec![text_block("I would rather chat than summarize.")],
+        &mut pending_io,
+    );
+
+    let weave = &h.sched.weaves[&weave_id];
+    assert_eq!(weave.threads.len(), 1, "no continuation was derived");
+    assert_eq!(weave.primary_thread_id(), Some(t1.as_str()));
+    assert!(matches!(
+        &weave.driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: None,
+            ..
+        }
+    ));
+    assert!(!h.sched.active_functions.contains_key(&fn_id));
+    assert_eq!(h.sched.thread_ticker.get(&t1), Some(&weave_id));
+}
+
+/// Cancelling the thread mid-summary-turn abandons the compaction
+/// precisely: marker cleared, Function resolved, no continuation — and
+/// the thread is a normal cancelled thread afterwards.
+#[tokio::test]
+async fn cancel_mid_compaction_clears_marker_and_resolves_function() {
+    use crate::functions::{CallerLink, Function};
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&t1, "hello".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    h.respond_model(&t1, vec![text_block("hi")], &mut pending_io);
+
+    let fn_id = h
+        .sched
+        .register_function(
+            Function::CompactThread {
+                thread_id: t1.clone(),
+            },
+            CallerLink::Weave {
+                weave_id: weave_id.clone(),
+            },
+        )
+        .unwrap();
+    h.sched.launch_function(fn_id, &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&t1),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    h.sched.execute_cancel_thread(&t1, &mut pending_io);
+
+    assert!(matches!(
+        &h.sched.weaves[&weave_id].driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: None,
+            ..
+        }
+    ));
+    assert!(
+        !h.sched.active_functions.contains_key(&fn_id),
+        "abandoned CompactThread Function resolved as Cancelled"
+    );
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        1,
+        "no continuation from a cancelled summary turn"
+    );
+}
+
+/// `advance_head` executor admissions: promotion works for a
+/// self-ticked reference and refuses (journaling the refusal) for
+/// unreferenced threads, the current primary, and a mid-cycle primary.
+#[tokio::test]
+async fn advance_head_promotes_and_refuses_with_journaled_records() {
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+    let aux = h
+        .derive(&weave_id, Vec::new(), "helper")
+        .expect("derive an auxiliary");
+
+    // Refusal: unreferenced thread.
+    let err = h
+        .sched
+        .weave_advance_head(&weave_id, "task-not-referenced")
+        .unwrap_err();
+    assert!(err.contains("does not reference"), "got: {err}");
+    assert!(matches!(
+        &h.last_record(&weave_id).outcome,
+        DriverEffectOutcome::Failed { message } if message.contains("does not reference")
+    ));
+
+    // Refusal: mid-cycle primary. Park t1 in an active turn first.
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&t1, "working...".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    let err = h.sched.weave_advance_head(&weave_id, &aux).unwrap_err();
+    assert!(err.contains("active cycle"), "got: {err}");
+    h.respond_model(&t1, vec![text_block("done")], &mut pending_io);
+
+    // Promotion: aux becomes the head, t1 a dormant auxiliary.
+    h.sched
+        .weave_advance_head(&weave_id, &aux)
+        .expect("idle primary advances");
+    let weave = &h.sched.weaves[&weave_id];
+    assert_eq!(weave.primary_thread_id(), Some(aux.as_str()));
+    let old_ref = weave.threads.iter().find(|r| r.thread_id == t1).unwrap();
+    assert_eq!(old_ref.role, WeaveThreadRole::Auxiliary);
+    assert!(!old_ref.ticks);
+    assert!(!h.sched.thread_ticker.contains_key(&t1));
+    assert_eq!(h.sched.thread_ticker.get(&aux), Some(&weave_id));
+
+    // Refusal: promoting the current primary is a driver bug.
+    let err = h.sched.weave_advance_head(&weave_id, &aux).unwrap_err();
+    assert!(err.contains("already the primary"), "got: {err}");
+}
+
+/// A scripted driver composes a compaction-shaped roll from primitives:
+/// finish the cycle, derive along a `compaction` edge, advance the head.
+#[tokio::test]
+async fn scripted_driver_advances_head_via_effect() {
+    const ROLLER: &str = r#"
+function on_event(state, event)
+  local k = event.kind
+  if k == "turn_start" then
+    return { effects = { { kind = "run_agent", thread_id = event.thread_id } }, state = state }
+  end
+  if k == "agent_completed" then
+    if state.rolled then
+      return { effects = { { kind = "finish_cycle", thread_id = event.thread_id } }, state = state }
+    end
+    state.rolled = true
+    return { effects = {
+      { kind = "finish_cycle", thread_id = event.thread_id },
+      { kind = "derive_thread", relationship = "compaction", source_thread_id = event.thread_id },
+    }, state = state }
+  end
+  if k == "thread_derived" then
+    return { effects = { { kind = "advance_head", thread_id = event.thread_id } }, state = state }
+  end
+  return { state = state }
+end
+"#;
+    let mut h = harness().await;
+    h.install_driver("roller", ROLLER);
+    let t1 = h.create_scripted_thread("roller").unwrap();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&t1, "roll me".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    h.respond_model(
+        &t1,
+        vec![text_block("summary of everything")],
+        &mut pending_io,
+    );
+
+    let weave = &h.sched.weaves[&weave_id];
+    assert_eq!(weave.threads.len(), 2);
+    let new_head = weave
+        .primary_thread_id()
+        .expect("weave has a promoted head")
+        .to_string();
+    assert_ne!(new_head, t1);
+    let old_ref = weave.threads.iter().find(|r| r.thread_id == t1).unwrap();
+    assert_eq!(old_ref.role, WeaveThreadRole::Auxiliary);
+    assert!(
+        !old_ref.ticks,
+        "scripted roll also leaves the old head dormant"
+    );
+    assert_eq!(h.sched.thread_ticker.get(&new_head), Some(&weave_id));
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| r.outcome == DriverEffectOutcome::Completed
+                && matches!(
+                    &r.effect,
+                    PersistedDriverEffect::AdvanceHead { thread_id, previous: Some(p) }
+                        if thread_id == &new_head && p == &t1
+                ))
     );
 }

@@ -16,8 +16,6 @@
 //! the scheduler. Registry, routing, and operation migration follow in later
 //! phases.
 
-use bitflags::bitflags;
-use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{ThreadBindingsRequest, ThreadConfigOverride};
 
 use crate::permission::{HostName, PodId, ToolName};
@@ -239,6 +237,14 @@ pub enum CallerLink {
         hook_id: HookId,
         delivery: LuaChannelId,
     },
+    /// A weave decided to run this Function against its own threads —
+    /// e.g. the builtin driver noticing its primary crossed the
+    /// auto-compaction token threshold. Replaces the old
+    /// `InternalOriginator::AutoCompact` (step 8): the weave is the true
+    /// caller, and the spec's own thread_id carries the target.
+    Weave {
+        weave_id: String,
+    },
     SchedulerInternal(InternalOriginator),
 }
 
@@ -255,9 +261,6 @@ pub enum InternalOriginator {
         pod_id: PodId,
         behavior_id: BehaviorId,
         source: TriggerSource,
-    },
-    AutoCompact {
-        thread_id: ThreadId,
     },
 }
 
@@ -293,17 +296,13 @@ impl CallerLink {
     /// the affected thread and applies per-variant cancel-on-caller-gone
     /// policy.
     ///
-    /// This must peer into `SchedulerInternal` payloads too — an
-    /// `AutoCompact { thread_id: T }` Function logically targets T even
-    /// though its direct caller-link variant is `SchedulerInternal`.
+    /// Weave callers don't match here: the sweep resolves a weave-run
+    /// Function's target from the spec's own thread_id, not the link.
     pub fn targets_thread(&self, id: &str) -> bool {
         match self {
             Self::ThreadToolCall { thread_id, .. } => thread_id == id,
-            Self::SchedulerInternal(orig) => match orig {
-                InternalOriginator::AutoCompact { thread_id } => thread_id == id,
-                InternalOriginator::BehaviorFire { .. } => false,
-            },
-            Self::WsClient { .. } | Self::Lua { .. } => false,
+            Self::WsClient { .. } | Self::Lua { .. } | Self::Weave { .. } => false,
+            Self::SchedulerInternal(InternalOriginator::BehaviorFire { .. }) => false,
         }
     }
 
@@ -323,10 +322,8 @@ impl CallerLink {
                     behavior_id,
                     source,
                 } => format!("behavior_fire:{}:{pod_id}/{behavior_id}", source.as_str()),
-                InternalOriginator::AutoCompact { thread_id } => {
-                    format!("auto_compact:{thread_id}")
-                }
             },
+            Self::Weave { weave_id } => format!("weave:{weave_id}"),
         }
     }
 }
@@ -501,25 +498,10 @@ pub enum StatusKind {
     Other(String),
 }
 
-// ---------------------------------------------------------------------------
-// Thread in-flight flags
-// ---------------------------------------------------------------------------
-
-bitflags! {
-    /// Per-thread "is an exclusivity-requiring Function currently running
-    /// targeting this thread?" flags. Functions that need exclusivity set
-    /// their bit on start and clear it on terminal; preconditions check by
-    /// reading the bit rather than scanning the `active_functions` registry.
-    ///
-    /// Cleared on scheduler restart as part of the thread's resume-flip
-    /// handling — Functions are non-persistent, so a bit set at crash time
-    /// represents a Function that no longer exists.
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct InFlightOps: u32 {
-        const COMPACTING = 1 << 0;
-        // New bits as operations are migrated that need exclusivity.
-    }
-}
+// (An `InFlightOps` bitflags struct lived here until migration step 8 —
+// `COMPACTING` was its only bit. Compaction's in-flight marker now lives
+// in the builtin weave's driver state; if a future Function needs
+// per-thread exclusivity bits, re-introduce the mechanism then.)
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -540,15 +522,6 @@ mod tests {
     }
 
     #[test]
-    fn caller_link_targets_thread_through_auto_compact() {
-        let l = CallerLink::SchedulerInternal(InternalOriginator::AutoCompact {
-            thread_id: "t1".into(),
-        });
-        assert!(l.targets_thread("t1"));
-        assert!(!l.targets_thread("t2"));
-    }
-
-    #[test]
     fn caller_link_targets_thread_ignores_unrelated_variants() {
         let ws = CallerLink::WsClient {
             conn_id: 42,
@@ -562,6 +535,11 @@ mod tests {
             source: TriggerSource::Cron,
         });
         assert!(!cron.targets_thread("t1"));
+
+        let weave = CallerLink::Weave {
+            weave_id: "w1".into(),
+        };
+        assert!(!weave.targets_thread("t1"));
     }
 
     #[test]
@@ -578,19 +556,10 @@ mod tests {
         };
         assert_eq!(thread.audit_tag(), "thread:t/tool:u");
 
-        let ac = CallerLink::SchedulerInternal(InternalOriginator::AutoCompact {
-            thread_id: "t".into(),
-        });
-        assert_eq!(ac.audit_tag(), "auto_compact:t");
-    }
-
-    #[test]
-    fn in_flight_ops_set_and_check() {
-        let mut ops = InFlightOps::empty();
-        ops.insert(InFlightOps::COMPACTING);
-        assert!(ops.contains(InFlightOps::COMPACTING));
-        ops.remove(InFlightOps::COMPACTING);
-        assert!(ops.is_empty());
+        let weave = CallerLink::Weave {
+            weave_id: "w".into(),
+        };
+        assert_eq!(weave.audit_tag(), "weave:w");
     }
 
     // Silence unused-variant warnings on types that are declared here for

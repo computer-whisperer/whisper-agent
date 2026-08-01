@@ -48,6 +48,16 @@ pub enum DriverState {
         cycles_started: u64,
         #[serde(default)]
         turns_in_cycle: u32,
+        /// Set while a compaction summary turn is running on the named
+        /// thread (the weave's primary at launch). Weave-persisted so a
+        /// compaction in flight during shutdown finalizes on restart —
+        /// the summary prompt is already in the transcript, the turn
+        /// completes, and the finalize hook sees this marker. Replaces
+        /// the old `InFlightOps::COMPACTING` bit on `Thread` (step 8):
+        /// coordination state belongs to the weave, threads stay
+        /// policy-free.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacting: Option<String>,
     },
     Scripted {
         /// The script's own state table, opaque to the runtime. Passed
@@ -72,6 +82,7 @@ impl Default for DriverState {
         Self::BuiltinSingleAgentChat {
             cycles_started: 0,
             turns_in_cycle: 0,
+            compacting: None,
         }
     }
 }
@@ -167,6 +178,15 @@ pub enum PersistedDriverEffect {
         relationship: ThreadRelationship,
         #[serde(default)]
         seed_entries: usize,
+    },
+    /// Head-advance: a referenced thread this weave ticks was promoted to
+    /// primary; the previous primary (if any) was demoted to a dormant
+    /// auxiliary. This is the journaled `compaction`-roll primitive —
+    /// the record explains why the weave's head moved.
+    AdvanceHead {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous: Option<String>,
     },
     /// Ticker admission: this weave took over driving a dormant thread's
     /// turns.
@@ -326,6 +346,7 @@ pub fn input_accepted(config: &ThreadDriverConfig, state: &mut DriverState) -> R
             DriverState::BuiltinSingleAgentChat {
                 cycles_started,
                 turns_in_cycle,
+                ..
             },
         ) => {
             *cycles_started = cycles_started.saturating_add(1);

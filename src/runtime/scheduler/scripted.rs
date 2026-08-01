@@ -385,6 +385,7 @@ impl Scheduler {
                     None,
                     seed_messages,
                     relationship_meta,
+                    None,
                     pending_io,
                 )?;
                 self.scripted_events
@@ -395,6 +396,9 @@ impl Scheduler {
                         relationship,
                     });
                 Ok(())
+            }
+            ScriptedEffect::AdvanceHead { thread_id } => {
+                self.weave_advance_head(weave_id, &thread_id)
             }
             ScriptedEffect::AdoptTicker { thread_id } => {
                 self.weave_adopt_ticker(weave_id, &thread_id)
