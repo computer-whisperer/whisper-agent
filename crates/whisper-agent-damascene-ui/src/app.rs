@@ -1823,6 +1823,14 @@ pub struct ChatApp {
     /// the backend's `/models` returns).
     picker_model: Option<String>,
     picker_model_open: bool,
+    /// Scripted driver picked for the next `CreateThread`. `None`
+    /// means the builtin single-agent chat driver; `Some(name)` sends
+    /// `config_override.driver = Scripted { name }` — the server
+    /// validates that `<pod>/drivers/<name>.lua` loads at creation.
+    /// Options derive from the pod file tree's `drivers/` listing
+    /// (lazily fetched on first open), so no dedicated wire query.
+    picker_driver: Option<String>,
+    picker_driver_open: bool,
     /// Host-env bindings picked for the next `CreateThread`. Empty
     /// is interpreted through `picker_host_env_mode`: inherit ignores
     /// this vec, none sends an explicit empty override, custom sends
@@ -2956,6 +2964,8 @@ impl ChatApp {
             picker_backend_open: false,
             picker_model: None,
             picker_model_open: false,
+            picker_driver: None,
+            picker_driver_open: false,
             picker_host_env_mode: BindingListMode::Inherit,
             picker_host_envs: Vec::new(),
             picker_host_envs_open: false,
@@ -3931,7 +3941,21 @@ impl ChatApp {
             } => {
                 let key = (pod_id, path);
                 self.pod_files_requested.remove(&key);
+                // Driver-picker chain: if this is the root listing of
+                // the pod whose driver menu is open and it shows a
+                // `drivers/` dir, fetch that dir now so the open menu
+                // fills in without a close-and-reopen. (The picker
+                // can't fetch it blindly — `list_pod_dir` errors on a
+                // missing directory.)
+                let chain_drivers = self.picker_driver_open
+                    && key.1.is_empty()
+                    && self.picker_effective_pod_id() == Some(key.0.as_str())
+                    && entries.iter().any(|e| e.is_dir && e.name == "drivers");
+                let pod = key.0.clone();
                 self.pod_files.insert(key, entries);
+                if chain_drivers {
+                    self.ensure_pod_dir_fetched(&pod, "drivers");
+                }
             }
             ServerToClient::PodFileContent {
                 pod_id,
@@ -5239,6 +5263,10 @@ impl App for ChatApp {
                 self.picker_host_env_expanded = None;
                 self.picker_mcp_hosts_mode = BindingListMode::Inherit;
                 self.picker_mcp_hosts.clear();
+                // Driver names are pod-scoped files too — a pick from
+                // the previous pod's drivers/ may not exist here.
+                self.picker_driver = None;
+                self.picker_driver_open = false;
                 self.ensure_pod_config_for_picker();
             }
             return;
@@ -5764,6 +5792,10 @@ impl App for ChatApp {
         }
         if let Some(action) = classify_select_event(&event, PICKER_MODEL) {
             self.handle_model_pick(action);
+            return;
+        }
+        if let Some(action) = classify_select_event(&event, PICKER_DRIVER) {
+            self.handle_driver_pick(action);
             return;
         }
         if let Some(action) = classify_select_event(&event, PICKER_HOST_ENVS) {
@@ -7317,6 +7349,7 @@ fn retention_kind_label(p: &RetentionPolicy) -> &'static str {
 // classify on in `on_event`.
 const PICKER_BACKEND: &str = "picker:backend";
 const PICKER_MODEL: &str = "picker:model";
+const PICKER_DRIVER: &str = "picker:driver";
 
 /// Routed keys for the multi-select chip pickers — host envs and MCP
 /// hosts. `*_TRIGGER` is the "+ Add" button at the end of the chip
@@ -7719,7 +7752,10 @@ impl ChatApp {
         });
         let config_override = ThreadConfigOverride {
             participants: None,
-            driver: None,
+            driver: self
+                .picker_driver
+                .clone()
+                .map(|name| whisper_agent_protocol::ThreadDriverConfig::Scripted { name }),
             participant_profiles: None,
             model,
             max_tokens: self.new_thread_max_tokens,
@@ -7789,6 +7825,7 @@ impl ChatApp {
         let mut count = 0;
         count += usize::from(self.picker_backend.is_some());
         count += usize::from(self.picker_model.is_some());
+        count += usize::from(self.picker_driver.is_some());
         count += usize::from(self.picker_host_env_mode != BindingListMode::Inherit);
         count += usize::from(self.picker_mcp_hosts_mode != BindingListMode::Inherit);
         count += usize::from(self.new_thread_max_tokens.is_some());
@@ -7809,6 +7846,8 @@ impl ChatApp {
         self.picker_backend_open = false;
         self.picker_model = None;
         self.picker_model_open = false;
+        self.picker_driver = None;
+        self.picker_driver_open = false;
         self.picker_host_env_mode = BindingListMode::Inherit;
         self.picker_host_envs.clear();
         self.picker_host_envs_open = false;
@@ -8600,6 +8639,45 @@ impl ChatApp {
         }
     }
 
+    fn handle_driver_pick(&mut self, action: SelectAction) {
+        match action {
+            SelectAction::Toggle => {
+                self.close_other_pickers(PICKER_DRIVER);
+                self.picker_driver_open = !self.picker_driver_open;
+                // Options derive from the pod's `drivers/` directory.
+                // `list_pod_dir` errors on a missing directory and most
+                // pods have none, so fetch the pod ROOT first (always
+                // valid) and only chain the `drivers/` fetch once the
+                // root listing proves the dir exists — either here
+                // (root already cached) or in the `PodDirListing`
+                // arrival arm (root fetch kicked just now). The open
+                // menu fills in live as listings land.
+                if self.picker_driver_open
+                    && let Some(pod) = self.picker_effective_pod_id().map(str::to_owned)
+                {
+                    self.ensure_pod_dir_fetched(&pod, "");
+                    let root_key = (pod.clone(), String::new());
+                    let has_drivers_dir = self.pod_files.get(&root_key).is_some_and(|entries| {
+                        entries.iter().any(|e| e.is_dir && e.name == "drivers")
+                    });
+                    if has_drivers_dir {
+                        self.ensure_pod_dir_fetched(&pod, "drivers");
+                    }
+                }
+            }
+            SelectAction::Dismiss => self.picker_driver_open = false,
+            SelectAction::Pick(value) => {
+                self.picker_driver = if value == PICKER_INHERIT {
+                    None
+                } else {
+                    Some(value)
+                };
+                self.picker_driver_open = false;
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle handler for the host_envs popover. `Pick` *adds* the
     /// option to `picker_host_envs` (multi-select semantics) rather
     /// than replacing — that's the difference between this and the
@@ -8692,6 +8770,9 @@ impl ChatApp {
         }
         if keep_open != PICKER_MODEL {
             self.picker_model_open = false;
+        }
+        if keep_open != PICKER_DRIVER {
+            self.picker_driver_open = false;
         }
         if keep_open != PICKER_HOST_ENVS {
             self.picker_host_envs_open = false;
@@ -10244,6 +10325,7 @@ impl ChatApp {
     fn new_thread_pane(&self) -> El {
         let backend_trigger = select_trigger(PICKER_BACKEND, self.backend_label());
         let model_trigger = select_trigger(PICKER_MODEL, self.model_label());
+        let driver_trigger = select_trigger(PICKER_DRIVER, self.driver_label());
 
         let buf = self.active_compose_text();
         let editor = text_area(COMPOSE_KEY, buf, &self.selection).height(Size::Fixed(140.0));
@@ -10284,6 +10366,11 @@ impl ChatApp {
                 form_label("Model"),
                 form_control(model_trigger),
                 form_description(self.model_hint()),
+            ]),
+            form_item([
+                form_label("Driver"),
+                form_control(driver_trigger),
+                form_description(self.driver_hint()),
             ]),
         ])
         .gap(tokens::SPACE_4)
@@ -11720,6 +11807,9 @@ impl ChatApp {
         }
         if self.picker_model_open {
             out.push(Some(self.model_menu()));
+        }
+        if self.picker_driver_open {
+            out.push(Some(self.driver_menu()));
         }
         if self.picker_host_envs_open {
             out.push(Some(self.host_envs_menu()));
@@ -21348,6 +21438,47 @@ impl ChatApp {
             options.push((b.name.clone(), format!("{} — {}", b.name, b.kind)));
         }
         select_menu(PICKER_BACKEND, options)
+    }
+
+    /// Driver options: the builtin chat driver plus every `*.lua` in
+    /// the pod's `drivers/` directory. The listing is fetched lazily
+    /// on first open (`handle_driver_pick`); until it lands only the
+    /// builtin row shows, and the open menu fills in live when the
+    /// `PodDirListing` arrives. A missing `drivers/` dir lists as
+    /// empty — builtin-only is the correct read of that pod.
+    fn driver_menu(&self) -> El {
+        let mut options: Vec<(String, String)> = vec![(
+            PICKER_INHERIT.to_string(),
+            "Builtin single-agent chat".to_string(),
+        )];
+        if let Some(pod) = self.picker_effective_pod_id() {
+            let key = (pod.to_string(), "drivers".to_string());
+            if let Some(entries) = self.pod_files.get(&key) {
+                for entry in entries {
+                    if entry.is_dir {
+                        continue;
+                    }
+                    if let Some(name) = entry.name.strip_suffix(".lua") {
+                        options.push((name.to_string(), format!("{name} — scripted")));
+                    }
+                }
+            }
+        }
+        select_menu(PICKER_DRIVER, options)
+    }
+
+    fn driver_label(&self) -> String {
+        match self.picker_driver.as_deref() {
+            Some(name) => name.to_string(),
+            None => "Builtin chat".to_string(),
+        }
+    }
+
+    fn driver_hint(&self) -> String {
+        match self.picker_driver.as_deref() {
+            Some(_) => "scripted (Lua) driver from the pod's drivers/ directory".to_string(),
+            None => "how turns are driven".to_string(),
+        }
     }
 
     fn model_menu(&self) -> El {
