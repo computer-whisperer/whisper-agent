@@ -788,6 +788,22 @@ async fn checker_driver_denies_tools_and_the_cycle_continues() {
         Some(whisper_agent_protocol::weave::WeaveThreadRole::Primary)
     );
 
+    // Typing into the checker (its drill-down view is one click away
+    // via the weave strip) is refused at the input path: auxiliary
+    // threads of a scripted weave aren't externally writable. The
+    // check stays in flight, the primary stays parked, and no journal
+    // record was interrupted.
+    h.sched
+        .send_user_message(&checker, "let me help".into(), Vec::new(), &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&checker),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AgentBoundary { .. }
+    ));
+
     // The checker denies. The checker finishes; the primary's tool
     // request is closed with a synthesized error result and the cycle
     // continues into turn 2 without executing anything.

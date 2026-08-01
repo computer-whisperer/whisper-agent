@@ -1,8 +1,9 @@
 # Configurable Threads and Weaves
 
-Status: **steps 1–6 landed, step 7 driver-half landed** (scripted Lua
-drivers with the auto-mode checker exercise case working end-to-end;
-presentation vocabulary pending) — participant foundation, execution profiles,
+Status: **steps 1–7 landed** (scripted Lua drivers with the auto-mode
+checker exercise case working end-to-end, plus the 7b presentation
+vocabulary, weave wire tier, and damascene-ui weave view) —
+participant foundation, execution profiles,
 the compatibility driver with its durable effect journal, the weave
 entity (singleton coordination, driver policy inverted out of `Thread`,
 persistence at `<pod>/weaves/<weave_id>.json`), and the cross-thread
@@ -294,12 +295,27 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    `examples/drivers/auto_mode_checker.lua` is the working exercise
    case, tested end-to-end (deny and allow paths) in the scheduler
    harness.
-   **Presentation half (7b) ratified 2026-08-01, in progress:** pure
+   **Presentation half (7b) ratified and landed 2026-08-01:** pure
    `present(state)` (see Presentation), additive wire tier with
    client-side composition (see Clients), `ThreadSummary` weave tags for
-   list nesting, and scope through a minimal damascene-ui weave view
-   (primary transcript + status + auxiliary thread list) so the
-   vocabulary is shaped by a real renderer.
+   list nesting, and a minimal damascene-ui weave view (coordination
+   strip with driver badge / status / auxiliary jump chips, sidebar
+   nesting of auxiliaries) so the vocabulary is shaped by a real
+   renderer. External input is admitted only to non-auxiliary threads
+   of a scripted weave — input targets the presentation head; an
+   auxiliary is the driver's workspace, and input landing there would
+   bulk-interrupt in-flight coordination (refused at the input path,
+   compose box replaced by a hint in the drill-down view).
+   Known gaps accepted at 7b close: a driver has no thread-removed
+   event, so archiving a live multi-thread weave's primary leaves
+   `state.primary` naming a gone thread — validation drops the head
+   block and the display runs headless until the next cycle (display
+   only; revisit when the event vocabulary next grows). The Kotlin
+   codec would mis-decode `WeaveSnapshot` (its `snapshot` key
+   collides with `ThreadSnapshot`'s discriminator heuristic) — 
+   unreachable today since Android cannot subscribe to weaves, and
+   the client is deprecated; do not route weave messages onto
+   broadcast tiers while any Kotlin client lives.
 8. Move compaction onto weave machinery: head-advance along a `compaction`
    edge; delete the compaction-specific in-flight bit, internal originator,
    state hook, lineage field, and wire lifecycle.

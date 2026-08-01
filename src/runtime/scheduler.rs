@@ -4544,6 +4544,37 @@ impl Scheduler {
             );
             return;
         }
+        // External input targets the presentation head (ratified 7b
+        // input rule). A scripted weave's auxiliary thread is the
+        // driver's workspace: input landing there would heal it
+        // mid-coordination and bulk-interrupt the shared weave's
+        // pending records, silently voiding an in-flight check and
+        // orphaning the parked primary. Refuse; the primary stays the
+        // one externally writable thread until a driver vocabulary
+        // (await_input) says otherwise.
+        if let Some(weave) = self
+            .thread_ticker
+            .get(thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            && matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            )
+            && weave.threads.iter().any(|r| {
+                r.thread_id == thread_id
+                    && r.role == crate::runtime::weave::WeaveThreadRole::Auxiliary
+            })
+        {
+            self.router.dispatch_events(
+                thread_id,
+                vec![crate::runtime::thread::ThreadEvent::Error {
+                    message:
+                        "auxiliary thread of a scripted weave; input targets the primary thread"
+                            .into(),
+                }],
+            );
+            return;
+        }
         self.mark_dirty(thread_id);
         let _ = pending_io;
         // If the thread was mid tool-call-cycle (AwaitingTools) when
@@ -4650,6 +4681,37 @@ impl Scheduler {
                 thread_id,
                 vec![crate::runtime::thread::ThreadEvent::Error {
                     message: "thread is dormant (no weave ticks it); input rejected".into(),
+                }],
+            );
+            return;
+        }
+        // External input targets the presentation head (ratified 7b
+        // input rule). A scripted weave's auxiliary thread is the
+        // driver's workspace: input landing there would heal it
+        // mid-coordination and bulk-interrupt the shared weave's
+        // pending records, silently voiding an in-flight check and
+        // orphaning the parked primary. Refuse; the primary stays the
+        // one externally writable thread until a driver vocabulary
+        // (await_input) says otherwise.
+        if let Some(weave) = self
+            .thread_ticker
+            .get(thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            && matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            )
+            && weave.threads.iter().any(|r| {
+                r.thread_id == thread_id
+                    && r.role == crate::runtime::weave::WeaveThreadRole::Auxiliary
+            })
+        {
+            self.router.dispatch_events(
+                thread_id,
+                vec![crate::runtime::thread::ThreadEvent::Error {
+                    message:
+                        "auxiliary thread of a scripted weave; input targets the primary thread"
+                            .into(),
                 }],
             );
             return;

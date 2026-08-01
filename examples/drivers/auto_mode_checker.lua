@@ -29,10 +29,16 @@ function on_event(state, event)
   local k = event.kind
 
   if k == "input_accepted" then
-    -- Fresh cycle. Any in-flight interception is void — the scheduler
-    -- heals the primary out of its parked boundary on superseding
-    -- input. `primary` survives for present().
-    return { state = { primary = event.thread_id } }
+    -- The scheduler only routes external input to the primary (an
+    -- auxiliary's input is refused at the input path), but guard
+    -- anyway: only input on the head voids an in-flight check.
+    if state.primary == nil or event.thread_id == state.primary then
+      -- Fresh cycle. Any in-flight interception is void — the
+      -- scheduler heals the primary out of its parked boundary on
+      -- superseding input. `primary` survives for present().
+      return { state = { primary = event.thread_id } }
+    end
+    return { state = state }
   end
 
   if k == "turn_start" then

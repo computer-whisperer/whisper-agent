@@ -3968,6 +3968,14 @@ impl ChatApp {
             ServerToClient::ThreadArchived { thread_id } => {
                 self.threads.remove(&thread_id);
                 self.views.remove(&thread_id);
+                // Same weave-snapshot pruning as the ThreadList arm:
+                // dropping the last summary referencing a weave means
+                // the server retired it (no further pushes will come).
+                self.weaves.retain(|id, _| {
+                    self.threads
+                        .values()
+                        .any(|t| t.weave_id.as_deref() == Some(id))
+                });
                 if self.selected.as_deref() == Some(&thread_id) {
                     self.selected = None;
                 }
@@ -10131,7 +10139,23 @@ impl ChatApp {
             layers.push(banners);
         }
         layers.push(body);
-        layers.push(self.compose_box());
+        // A scripted weave's auxiliary thread refuses external input
+        // server-side (input targets the presentation head), so don't
+        // offer a compose box that can only error — a muted hint keeps
+        // the drill-down view honest about being read-along.
+        if summary.and_then(|s| s.weave_role) == Some(WeaveThreadRole::Auxiliary) {
+            layers.push(
+                row(vec![
+                    text("auxiliary thread — driven by its weave; input goes to the primary")
+                        .muted()
+                        .xsmall(),
+                ])
+                .padding(tokens::SPACE_4)
+                .width(Size::Fill(1.0)),
+            );
+        } else {
+            layers.push(self.compose_box());
+        }
         column(layers)
             .gap(0.0)
             .width(Size::Fill(1.0))
