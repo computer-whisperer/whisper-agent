@@ -707,6 +707,7 @@ const MAX_FIRST_EVENT_RETRIES: u32 = 3;
 /// `ModelError::is_transient()` (transport glitch, 408, or 5xx). The
 /// retry budget is shared; transient errors use a fixed exponential
 /// backoff (1s, 2s, 4s).
+#[allow(clippy::too_many_arguments)]
 async fn stream_with_retry(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
@@ -821,6 +822,7 @@ impl FirstEventError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn consume_stream(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,

@@ -1047,9 +1047,9 @@ mod tests {
         // Partial index over the first `split`, dumped so the sidecar
         // reports snapshot == split (< n).
         let partial = DenseIndex::empty(DenseQuant::F32, HnswParams::default(), n);
-        for pos in 0..split {
+        for (pos, &chunk_id) in by_position.iter().enumerate().take(split) {
             let v = vectors.read_at_position(pos as u64).unwrap();
-            partial.insert(by_position[pos], pos as u64, &v);
+            partial.insert(chunk_id, pos as u64, &v);
         }
         partial.dump_to(tmp.path()).unwrap();
         assert_eq!(read_dump_snapshot(tmp.path()).unwrap(), Some(split as u64));
@@ -1064,21 +1064,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.len(), split);
-        for pos in split..n {
+        for (pos, &chunk_id) in by_position.iter().enumerate().skip(split) {
             let v = vectors.read_at_position(pos as u64).unwrap();
-            resumed.insert(by_position[pos], pos as u64, &v);
+            resumed.insert(chunk_id, pos as u64, &v);
         }
         assert_eq!(resumed.len(), full.len());
 
         // Each appended tail vector is findable as its own nearest
         // neighbour — i.e. it really made it into the graph.
-        for pos in split..n {
+        for (pos, &chunk_id) in by_position.iter().enumerate().skip(split) {
             let v = vectors.read_at_position(pos as u64).unwrap();
             let hit = resumed.search(&v, 1);
-            assert_eq!(
-                hit[0].0, by_position[pos],
-                "tail vec at pos {pos} not found"
-            );
+            assert_eq!(hit[0].0, chunk_id, "tail vec at pos {pos} not found");
         }
     }
 
