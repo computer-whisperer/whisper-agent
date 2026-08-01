@@ -1761,6 +1761,7 @@ mod tests {
                             );
                             let effect_id =
                                 weave.record_pending_effect(PersistedDriverEffect::RunAgent {
+                                    thread_id: task.id.clone(),
                                     generation: generation.clone(),
                                     turn,
                                 });
@@ -1772,6 +1773,7 @@ mod tests {
                         }
                         DriverEffect::Finish => {
                             weave.record_completed_effect(PersistedDriverEffect::Finish {
+                                thread_id: task.id.clone(),
                                 generation: None,
                                 reason: DriverFinishReason::TurnLimit,
                             });
@@ -1806,6 +1808,7 @@ mod tests {
                             };
                             let dispatch_id =
                                 weave.record_pending_effect(PersistedDriverEffect::DispatchTools {
+                                    thread_id: task.id.clone(),
                                     generation,
                                     tool_use_ids,
                                 });
@@ -1813,6 +1816,7 @@ mod tests {
                         }
                         DriverEffect::Finish => {
                             weave.record_completed_effect(PersistedDriverEffect::Finish {
+                                thread_id: task.id.clone(),
                                 generation: Some(generation),
                                 reason: DriverFinishReason::AgentCompleted,
                             });
@@ -1832,12 +1836,14 @@ mod tests {
                     match effect {
                         DriverEffect::Continue => {
                             weave.record_completed_effect(PersistedDriverEffect::Continue {
+                                thread_id: task.id.clone(),
                                 generation,
                             });
                             assert!(task.continue_cycle());
                         }
                         DriverEffect::Finish => {
                             weave.record_completed_effect(PersistedDriverEffect::Finish {
+                                thread_id: task.id.clone(),
                                 generation: Some(generation),
                                 reason: DriverFinishReason::ToolsCompleted,
                             });
@@ -2109,6 +2115,7 @@ mod tests {
             PersistedDriverEffect::RunAgent {
                 generation: recorded,
                 turn: 1,
+                ..
             } if recorded == generation
         ));
         assert_eq!(
@@ -2458,7 +2465,7 @@ mod tests {
         // (persist load / scheduler) interrupts the ticking weave's
         // pending records with the same reason.
         task.heal_to_idle("task was in-flight at last shutdown", &mut events);
-        weave.interrupt_pending("task was in-flight at last shutdown");
+        weave.interrupt_all_pending("task was in-flight at last shutdown");
         assert!(matches!(task.internal, ThreadInternalState::Idle));
         assert!(!weave.effect_journal.has_pending());
         assert!(matches!(

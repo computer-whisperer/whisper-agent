@@ -423,14 +423,26 @@ impl Weave {
         let _ = self.effect_journal.fail(effect_id, message);
     }
 
-    pub fn fail_pending(&mut self, message: impl Into<String>) {
+    /// Interrupt every pending record regardless of attribution —
+    /// load-path only (every thread was healed at startup); runtime
+    /// paths use the thread-scoped forms.
+    pub fn interrupt_all_pending(&mut self, reason: impl Into<String>) {
         self.touch();
-        self.effect_journal.fail_pending(message);
+        self.effect_journal.interrupt_all_pending(reason);
     }
 
-    pub fn interrupt_pending(&mut self, reason: impl Into<String>) {
+    /// Fail the pending records attributed to one thread's cycle;
+    /// siblings' in-flight records are untouched (step 8 precision).
+    pub fn fail_pending_for(&mut self, thread_id: &str, message: impl Into<String>) {
         self.touch();
-        self.effect_journal.interrupt_pending(reason);
+        self.effect_journal.fail_pending_for(thread_id, message);
+    }
+
+    /// Interrupt the pending records attributed to one thread's cycle;
+    /// siblings' in-flight records are untouched (step 8 precision).
+    pub fn interrupt_pending_for(&mut self, thread_id: &str, reason: impl Into<String>) {
+        self.touch();
+        self.effect_journal.interrupt_pending_for(thread_id, reason);
     }
 
     /// One-time bridge for state migrated off pre-weave thread JSON.
@@ -494,6 +506,7 @@ mod tests {
         let mut weave =
             Weave::singleton_for_thread("t-1", "pod", ThreadDriverConfig::BuiltinSingleAgentChat);
         let id = weave.record_pending_effect(PersistedDriverEffect::RunAgent {
+            thread_id: "t-1".into(),
             generation: GenerationContext::new("run-1", "agent"),
             turn: 1,
         });
@@ -504,6 +517,7 @@ mod tests {
         assert!(!weave.effect_journal.has_pending());
 
         weave.record_completed_effect(PersistedDriverEffect::Finish {
+            thread_id: "t-1".into(),
             generation: None,
             reason: DriverFinishReason::AgentCompleted,
         });

@@ -791,7 +791,7 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>, Vec
     }
     for weave in &mut weaves {
         if weave.effect_journal.has_pending() {
-            weave.interrupt_pending("task was in-flight at last shutdown");
+            weave.interrupt_all_pending("task was in-flight at last shutdown");
         }
     }
 
@@ -1212,6 +1212,7 @@ mod tests {
         let generation = GenerationContext::new("run-restart", "agent");
         let effect_id =
             weave.record_pending_effect(crate::runtime::driver::PersistedDriverEffect::RunAgent {
+                thread_id: task.id.clone(),
                 generation: generation.clone(),
                 turn: 1,
             });

@@ -363,6 +363,21 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
      scan); scripted weaves still refuse both triggers — they get the
      primitives, and a compaction driver event waits until a real
      driver needs one.
+   **Multi-agent enablers landed post-8 (2026-08-01):** `run_agent`
+   takes an optional `participant` (which registered Model member
+   speaks; unknown/non-Model ids refuse and journal — profile
+   resolution would otherwise silently fall back). Harness proofs:
+   two threads of one weave await models concurrently with
+   out-of-order completions resolving their own records, and two
+   participants alternate voices in one thread (`finish_cycle` +
+   `run_agent(participant)` — `begin_model_call` admits Idle/Completed,
+   not a parked boundary). **Journal per-thread precision** (the gap
+   accepted since step 6) is retired: cycle records (`run_agent`,
+   `dispatch_tools`, `resolve_tools`, `continue`, `finish`) carry the
+   thread they ran on, and interrupt/fail resolution is thread-scoped
+   (`*_pending_for`); records persisted before the attribution match
+   any thread, and the load path's interrupt-everything remains the
+   one legitimate bulk form (every thread heals at startup).
 9. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 

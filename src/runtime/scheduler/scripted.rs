@@ -448,6 +448,7 @@ impl Scheduler {
             .get_mut(weave_id)
             .expect("caller validated")
             .record_pending_effect(PersistedDriverEffect::RunAgent {
+                thread_id: thread_id.to_string(),
                 generation: generation.clone(),
                 turn,
             });
@@ -483,6 +484,7 @@ impl Scheduler {
             self.record_completed_weave_effect(
                 weave_id,
                 PersistedDriverEffect::Finish {
+                    thread_id: thread_id.to_string(),
                     generation: None,
                     reason: DriverFinishReason::TurnLimit,
                 },
@@ -568,6 +570,7 @@ impl Scheduler {
         };
         let effect = match &decisions {
             None => PersistedDriverEffect::DispatchTools {
+                thread_id: thread_id.to_string(),
                 generation: generation.clone(),
                 tool_use_ids: requested.clone(),
             },
@@ -583,6 +586,7 @@ impl Scheduler {
                     .cloned()
                     .collect();
                 PersistedDriverEffect::ResolveTools {
+                    thread_id: thread_id.to_string(),
                     generation: generation.clone(),
                     approved,
                     denied,
@@ -648,7 +652,10 @@ impl Scheduler {
         }
         self.record_completed_weave_effect(
             weave_id,
-            PersistedDriverEffect::Continue { generation },
+            PersistedDriverEffect::Continue {
+                thread_id: thread_id.to_string(),
+                generation,
+            },
         );
         self.mark_weave_dirty(weave_id);
         self.mark_dirty(thread_id);
@@ -685,6 +692,7 @@ impl Scheduler {
         self.record_completed_weave_effect(
             weave_id,
             PersistedDriverEffect::Finish {
+                thread_id: thread_id.to_string(),
                 generation: None,
                 reason: DriverFinishReason::DriverChoice,
             },

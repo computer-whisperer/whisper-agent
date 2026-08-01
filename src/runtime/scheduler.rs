@@ -5308,6 +5308,7 @@ impl Scheduler {
                             .get_mut(&weave_id)
                             .expect("checked above")
                             .record_pending_effect(PersistedDriverEffect::RunAgent {
+                                thread_id: thread_id.to_string(),
                                 generation: generation.clone(),
                                 turn,
                             });
@@ -5335,6 +5336,7 @@ impl Scheduler {
                         self.record_completed_weave_effect(
                             &weave_id,
                             PersistedDriverEffect::Finish {
+                                thread_id: thread_id.to_string(),
                                 generation: None,
                                 reason: DriverFinishReason::TurnLimit,
                             },
@@ -5391,6 +5393,7 @@ impl Scheduler {
                             .get_mut(&weave_id)
                             .expect("checked above")
                             .record_pending_effect(PersistedDriverEffect::DispatchTools {
+                                thread_id: thread_id.to_string(),
                                 generation,
                                 tool_use_ids,
                             });
@@ -5411,6 +5414,7 @@ impl Scheduler {
                         self.record_completed_weave_effect(
                             &weave_id,
                             PersistedDriverEffect::Finish {
+                                thread_id: thread_id.to_string(),
                                 generation: Some(generation),
                                 reason: DriverFinishReason::AgentCompleted,
                             },
@@ -5442,7 +5446,10 @@ impl Scheduler {
                     Ok(DriverEffect::Continue) => {
                         self.record_completed_weave_effect(
                             &weave_id,
-                            PersistedDriverEffect::Continue { generation },
+                            PersistedDriverEffect::Continue {
+                                thread_id: thread_id.to_string(),
+                                generation,
+                            },
                         );
                         let applied = self
                             .tasks
@@ -5461,6 +5468,7 @@ impl Scheduler {
                         self.record_completed_weave_effect(
                             &weave_id,
                             PersistedDriverEffect::Finish {
+                                thread_id: thread_id.to_string(),
                                 generation: Some(generation),
                                 reason: DriverFinishReason::ToolsCompleted,
                             },
@@ -5531,7 +5539,7 @@ impl Scheduler {
             return;
         };
         if let Some(weave) = self.weaves.get_mut(&weave_id) {
-            weave.interrupt_pending(reason);
+            weave.interrupt_pending_for(thread_id, reason);
             self.mark_weave_dirty(&weave_id);
         }
     }
@@ -5544,7 +5552,7 @@ impl Scheduler {
             return;
         };
         if let Some(weave) = self.weaves.get_mut(&weave_id) {
-            weave.fail_pending(message);
+            weave.fail_pending_for(thread_id, message);
             self.mark_weave_dirty(&weave_id);
         }
     }
@@ -5965,13 +5973,14 @@ impl Scheduler {
         self.mark_dirty(thread_id);
     }
 
-    /// Fail a thread at a weave boundary, resolving any pending journal
-    /// records with the same message and broadcasting the error.
+    /// Fail a thread at a weave boundary, resolving the thread's own
+    /// pending journal records with the same message and broadcasting
+    /// the error. Sibling threads' in-flight records are untouched.
     fn fail_thread_at_boundary(&mut self, thread_id: &str, phase: &str, message: &str) {
         if let Some(weave_id) = self.thread_ticker.get(thread_id).cloned()
             && let Some(weave) = self.weaves.get_mut(&weave_id)
         {
-            weave.fail_pending(message);
+            weave.fail_pending_for(thread_id, message);
             self.mark_weave_dirty(&weave_id);
         }
         let mut events = vec![crate::runtime::thread::ThreadEvent::Error {

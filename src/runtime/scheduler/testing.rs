@@ -1731,3 +1731,88 @@ end
         "both RunAgent records resolve precisely despite interleaving"
     );
 }
+
+/// Journal precision (the step-8 gap, retired): cancelling one worker
+/// of a multi-thread weave interrupts only THAT thread's pending
+/// record; the sibling's in-flight record stays pending and resolves
+/// Completed when its own model call lands.
+#[tokio::test]
+async fn interrupting_one_worker_leaves_the_siblings_records_pending() {
+    const FANOUT: &str = r#"
+function on_event(state, event)
+  local k = event.kind
+  if k == "input_accepted" then
+    return { effects = {
+      { kind = "derive_thread", relationship = "worker",
+        seed = { { author = "user", text = "task A" } }, source_thread_id = event.thread_id },
+      { kind = "derive_thread", relationship = "worker",
+        seed = { { author = "user", text = "task B" } }, source_thread_id = event.thread_id },
+    }, state = state }
+  end
+  if k == "thread_derived" then
+    return { effects = { { kind = "run_agent", thread_id = event.thread_id } }, state = state }
+  end
+  if k == "agent_completed" then
+    return { effects = { { kind = "finish_cycle", thread_id = event.thread_id } }, state = state }
+  end
+  return { state = state }
+end
+"#;
+    let mut h = harness().await;
+    h.install_driver("fanout2", FANOUT);
+    let primary = h.create_scripted_thread("fanout2").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "fan out".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let workers: Vec<String> = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .filter(|r| r.thread_id != primary)
+        .map(|r| r.thread_id.clone())
+        .collect();
+    assert_eq!(workers.len(), 2);
+
+    // Cancel worker B mid-flight.
+    h.sched.execute_cancel_thread(&workers[1], &mut pending_io);
+
+    let outcome_for = |h: &Harness, thread: &str| -> Vec<DriverEffectOutcome> {
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.effect,
+                    PersistedDriverEffect::RunAgent { thread_id, .. } if thread_id == thread
+                )
+            })
+            .map(|r| r.outcome.clone())
+            .collect()
+    };
+    assert!(
+        matches!(
+            outcome_for(&h, &workers[1]).as_slice(),
+            [DriverEffectOutcome::Interrupted { .. }]
+        ),
+        "cancelled worker's record interrupted"
+    );
+    assert!(
+        matches!(
+            outcome_for(&h, &workers[0]).as_slice(),
+            [DriverEffectOutcome::Pending]
+        ),
+        "sibling's in-flight record must stay pending — the old bulk \
+         interrupt clobbered it"
+    );
+
+    // The survivor completes normally and resolves its own record.
+    h.respond_model(&workers[0], vec![text_block("done A")], &mut pending_io);
+    assert!(matches!(
+        outcome_for(&h, &workers[0]).as_slice(),
+        [DriverEffectOutcome::Completed]
+    ));
+}

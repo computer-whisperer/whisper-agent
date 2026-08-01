@@ -129,18 +129,31 @@ pub enum DriverEffect {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PersistedDriverEffect {
+    /// One model turn. `thread_id` names the thread the cycle ran on —
+    /// multi-thread weaves need it both for the journal to explain
+    /// itself and for interrupt/fail resolution to touch only the
+    /// affected thread's records. Empty on records persisted before
+    /// step 8's precision pass (those match any thread at resolution).
     RunAgent {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thread_id: String,
         generation: GenerationContext,
         turn: u32,
     },
     DispatchTools {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thread_id: String,
         generation: GenerationContext,
         tool_use_ids: Vec<String>,
     },
     Continue {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thread_id: String,
         generation: GenerationContext,
     },
     Finish {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thread_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation: Option<GenerationContext>,
         reason: DriverFinishReason,
@@ -149,6 +162,8 @@ pub enum PersistedDriverEffect {
     /// approved subset dispatched, the denied subset closed with
     /// synthesized error tool_results.
     ResolveTools {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thread_id: String,
         generation: GenerationContext,
         #[serde(default)]
         approved: Vec<String>,
@@ -190,14 +205,30 @@ pub enum PersistedDriverEffect {
     },
     /// Ticker admission: this weave took over driving a dormant thread's
     /// turns.
-    AdoptTicker {
-        thread_id: String,
-    },
+    AdoptTicker { thread_id: String },
     /// Ticker admission: this weave stopped driving a thread's turns,
     /// leaving it dormant (still referenced, readable, not running).
-    ReleaseTicker {
-        thread_id: String,
-    },
+    ReleaseTicker { thread_id: String },
+}
+
+impl PersistedDriverEffect {
+    /// The thread a cycle effect is attributed to, when it carries an
+    /// attribution. `None` for non-cycle effects (which are never
+    /// journaled pending) and for cycle records persisted before the
+    /// attribution existed — callers treat `None` as matching any
+    /// thread when resolving pending records.
+    pub fn cycle_thread(&self) -> Option<&str> {
+        match self {
+            Self::RunAgent { thread_id, .. }
+            | Self::DispatchTools { thread_id, .. }
+            | Self::ResolveTools { thread_id, .. }
+            | Self::Continue { thread_id, .. }
+            | Self::Finish { thread_id, .. } => {
+                (!thread_id.is_empty()).then_some(thread_id.as_str())
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,10 +329,18 @@ impl DriverEffectJournal {
         )
     }
 
-    pub fn fail_pending(&mut self, message: impl Into<String>) {
+    /// Fail every pending record attributed to `thread_id`. Records
+    /// with no attribution (persisted before step 8's precision pass)
+    /// match any thread — the pre-precision behavior for legacy data.
+    /// Pending records on OTHER threads of the weave are untouched:
+    /// interrupting one agent of a multi-thread weave must not clobber
+    /// its siblings' in-flight cycles.
+    pub fn fail_pending_for(&mut self, thread_id: &str, message: impl Into<String>) {
         let message = message.into();
         for record in &mut self.records {
-            if record.outcome == DriverEffectOutcome::Pending {
+            if record.outcome == DriverEffectOutcome::Pending
+                && record.effect.cycle_thread().is_none_or(|t| t == thread_id)
+            {
                 record.outcome = DriverEffectOutcome::Failed {
                     message: message.clone(),
                 };
@@ -309,10 +348,30 @@ impl DriverEffectJournal {
         }
     }
 
-    pub fn interrupt_pending(&mut self, reason: impl Into<String>) {
+    /// Interrupt EVERY pending record regardless of attribution.
+    /// Load-path only: at startup the persister has healed every
+    /// in-flight thread to Failed, so every pending record is stale —
+    /// the one situation where bulk resolution is the truth. Runtime
+    /// paths must use the thread-scoped forms.
+    pub fn interrupt_all_pending(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         for record in &mut self.records {
             if record.outcome == DriverEffectOutcome::Pending {
+                record.outcome = DriverEffectOutcome::Interrupted {
+                    reason: reason.clone(),
+                };
+            }
+        }
+    }
+
+    /// Interrupt every pending record attributed to `thread_id`; same
+    /// matching rule as [`Self::fail_pending_for`].
+    pub fn interrupt_pending_for(&mut self, thread_id: &str, reason: impl Into<String>) {
+        let reason = reason.into();
+        for record in &mut self.records {
+            if record.outcome == DriverEffectOutcome::Pending
+                && record.effect.cycle_thread().is_none_or(|t| t == thread_id)
+            {
                 record.outcome = DriverEffectOutcome::Interrupted {
                     reason: reason.clone(),
                 };
@@ -560,6 +619,7 @@ mod tests {
         let generation = GenerationContext::new("run-1", "agent");
         let mut journal = DriverEffectJournal::default();
         let run_id = journal.record(PersistedDriverEffect::RunAgent {
+            thread_id: "t-1".into(),
             generation: generation.clone(),
             turn: 1,
         });
@@ -569,6 +629,7 @@ mod tests {
         assert!(!journal.fail(run_id, "too late"));
 
         let tools_id = journal.record(PersistedDriverEffect::DispatchTools {
+            thread_id: "t-1".into(),
             generation,
             tool_use_ids: vec!["toolu-1".into()],
         });
@@ -585,6 +646,7 @@ mod tests {
     fn effect_journal_round_trip_preserves_pending_request_and_next_id() {
         let mut journal = DriverEffectJournal::default();
         journal.record(PersistedDriverEffect::RunAgent {
+            thread_id: "t-1".into(),
             generation: GenerationContext::new("run-1", "reviewer"),
             turn: 2,
         });
@@ -597,6 +659,7 @@ mod tests {
         let mut decoded: DriverEffectJournal = serde_json::from_value(json).unwrap();
         assert_eq!(
             decoded.record(PersistedDriverEffect::Finish {
+                thread_id: "t-1".into(),
                 generation: None,
                 reason: DriverFinishReason::TurnLimit,
             }),
@@ -678,6 +741,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             journal.record(PersistedDriverEffect::Finish {
+                thread_id: "t-1".into(),
                 generation: None,
                 reason: DriverFinishReason::TurnLimit,
             }),
