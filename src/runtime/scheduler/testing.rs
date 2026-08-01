@@ -1394,3 +1394,63 @@ end
                 ))
     );
 }
+
+/// A summary turn that fails (provider error) releases the weave's
+/// compacting marker and errors the Function — the weave doesn't stay
+/// "busy" until some unrelated Completed turn trips the finalize.
+#[tokio::test]
+async fn failed_summary_turn_releases_the_compacting_marker() {
+    use crate::functions::{CallerLink, Function};
+    let mut h = harness().await;
+    let t1 = h.create_thread();
+    let weave_id = h.weave_of(&t1);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&t1, "hello".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+    h.respond_model(&t1, vec![text_block("hi")], &mut pending_io);
+
+    let fn_id = h
+        .sched
+        .register_function(
+            Function::CompactThread {
+                thread_id: t1.clone(),
+            },
+            CallerLink::Weave {
+                weave_id: weave_id.clone(),
+            },
+        )
+        .unwrap();
+    h.sched.launch_function(fn_id, &mut pending_io);
+
+    // Provider dies mid-summary-turn.
+    let op_id = match h.internal_of(&t1) {
+        ThreadInternalState::AwaitingModel { op_id, .. } => *op_id,
+        other => panic!("expected summary turn in flight, got {other:?}"),
+    };
+    let mut events = Vec::new();
+    h.sched.tasks.get_mut(&t1).unwrap().apply_io_result(
+        op_id,
+        IoResult::ModelCall(Err("provider exploded".into())),
+        &mut events,
+    );
+    h.sched.step_until_blocked(&t1, &mut pending_io);
+
+    assert!(matches!(
+        &h.sched.weaves[&weave_id].driver_state,
+        crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+            compacting: None,
+            ..
+        }
+    ));
+    assert!(
+        !h.sched.active_functions.contains_key(&fn_id),
+        "Function resolved as execution error"
+    );
+    assert_eq!(h.sched.weaves[&weave_id].threads.len(), 1);
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(t1.as_str())
+    );
+}

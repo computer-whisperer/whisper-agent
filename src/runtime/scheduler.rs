@@ -5198,6 +5198,10 @@ impl Scheduler {
         // hook directly. Passes `pending_io` through so the hook can
         // re-fire on a queued QueueOne payload.
         self.on_behavior_thread_terminal(thread_id, pending_io);
+        // A summary turn that failed must release the weave's
+        // compacting marker (and error its Function) — no-op unless
+        // this thread is Failed while marked.
+        self.abort_builtin_compaction_if_failed(thread_id, pending_io);
         // Check whether this thread has crossed its auto-compaction
         // token threshold. (Compaction finalize itself fires from the
         // builtin boundary path when the summary cycle finishes — a

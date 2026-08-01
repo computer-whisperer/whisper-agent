@@ -121,6 +121,58 @@ impl Scheduler {
         self.step_until_blocked(thread_id, pending_io);
     }
 
+    /// Failure cleanup, called from `step_until_blocked` next to the
+    /// other terminal hooks. A summary turn that died (provider error,
+    /// tool failure) must not leave the weave's compacting marker set:
+    /// the weave would refuse future compactions until an unrelated
+    /// Completed turn tripped the finalize against an ordinary
+    /// response. Clears the marker and completes the CompactThread
+    /// Function as an execution error. No-op unless the thread is
+    /// Failed and marked. (Cancellation is handled in
+    /// `weave_cancelled` / `execute_cancel_thread`.)
+    pub(super) fn abort_builtin_compaction_if_failed(
+        &mut self,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let failed = self.tasks.get(thread_id).is_some_and(|task| {
+            matches!(
+                task.public_state(),
+                whisper_agent_protocol::ThreadStateLabel::Failed
+            )
+        });
+        if !failed {
+            return;
+        }
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            return;
+        };
+        let Some(weave) = self.weaves.get_mut(&weave_id) else {
+            return;
+        };
+        let crate::runtime::driver::DriverState::BuiltinSingleAgentChat { compacting, .. } =
+            &mut weave.driver_state
+        else {
+            return;
+        };
+        if compacting.as_deref() != Some(thread_id) {
+            return;
+        }
+        *compacting = None;
+        self.mark_weave_dirty(&weave_id);
+        warn!(%thread_id, "compaction summary turn failed — marker cleared");
+        if let Some(id) = self.find_compact_function_for(thread_id) {
+            self.complete_function(
+                id,
+                crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
+                    kind: crate::functions::FunctionErrorKind::Execution,
+                    detail: "summary turn failed before completing".into(),
+                }),
+                pending_io,
+            );
+        }
+    }
+
     /// Auto-trigger hook. Checks whether the given thread has crossed
     /// its compaction `token_threshold` and, if so, registers a
     /// `Function::CompactThread` with a `CallerLink::Weave` caller —
