@@ -27,6 +27,13 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 
 pub struct ModelRequest<'a> {
+    /// Stable identity for this provider invocation and its requested tools.
+    pub run_id: &'a str,
+    /// Model participant being invoked. Provider adapters still receive a
+    /// conventional binary-role message list; the scheduler projects the
+    /// shared transcript from this participant's perspective before building
+    /// the request.
+    pub participant_id: &'a str,
     pub model: &'a str,
     /// Per-request output cap — the maximum number of tokens the model
     /// may generate in this single response. This is a ceiling on the

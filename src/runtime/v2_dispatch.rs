@@ -346,6 +346,8 @@ mod tests {
         let mut c = Conversation::new();
         for (data, mime) in images {
             c.push(Message {
+                author: None,
+                run_id: None,
                 role: Role::User,
                 content: vec![ProtoContentBlock::Image {
                     source: ImageSource::Bytes {
@@ -497,6 +499,8 @@ mod tests {
     fn recent_image_bytes_skips_url_sources() {
         let mut conv = Conversation::new();
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![ProtoContentBlock::Image {
                 source: ImageSource::Url {
@@ -517,6 +521,8 @@ mod tests {
         use whisper_agent_protocol::ToolResultContent;
         let mut conv = Conversation::new();
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::Assistant,
             content: vec![ProtoContentBlock::ToolResult {
                 tool_use_id: "tu_1".into(),

@@ -1,5 +1,6 @@
 package com.cjbal.whisperagent.protocol
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 /**
@@ -16,7 +17,18 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 data class ThreadConfigOverride(
+    val participants: ThreadParticipants? = null,
     val model: String? = null,
+    @SerialName("participant_profiles")
+    val participantProfiles: Map<String, ParticipantExecutionProfileRequest>? = null,
+)
+
+/** Mobile's currently-supported subset of a participant profile request. */
+@Serializable
+data class ParticipantExecutionProfileRequest(
+    val model: String? = null,
+    @SerialName("max_tokens") val maxTokens: Int? = null,
+    val bindings: ThreadBindingsRequest = ThreadBindingsRequest(),
 )
 
 /**

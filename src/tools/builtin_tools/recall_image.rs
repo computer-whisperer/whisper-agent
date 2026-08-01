@@ -145,6 +145,8 @@ mod tests {
 
     fn user_image_msg(bytes: &[u8], mime: ImageMime) -> Message {
         Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![ContentBlock::Image {
                 source: ImageSource::Bytes {

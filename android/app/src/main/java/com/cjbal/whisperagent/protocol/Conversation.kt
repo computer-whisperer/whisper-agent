@@ -17,6 +17,10 @@ enum class Role {
 
 @Serializable
 data class Message(
+    /** Stable thread participant id; null only on legacy persisted messages. */
+    val author: String? = null,
+    /** Stable model-generation id for assistant/tool entries. */
+    @SerialName("run_id") val runId: String? = null,
     val role: Role,
     val content: List<ContentBlock>,
 )

@@ -1770,6 +1770,8 @@ mod tests {
 
     fn req<'a>(messages: &'a [Message], tools: &'a [ToolSpec], model: &'a str) -> ModelRequest<'a> {
         ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model,
             max_tokens: 1024,
             system_prompt: "",

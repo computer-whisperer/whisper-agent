@@ -1519,6 +1519,8 @@ mod tests {
         // A system message with only non-text blocks (shouldn't occur in
         // practice but defensively handled) produces no wire messages.
         let msg = Message {
+            author: None,
+            run_id: None,
             role: Role::System,
             content: vec![],
         };

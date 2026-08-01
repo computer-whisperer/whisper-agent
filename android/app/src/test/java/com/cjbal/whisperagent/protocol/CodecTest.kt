@@ -97,7 +97,12 @@ class CodecTest {
 
     @Test
     fun serverToClient_assistantTextDelta_roundTrip() {
-        val original = ServerToClient.AssistantTextDelta(threadId = "t-1", delta = "Hello ")
+        val original = ServerToClient.AssistantTextDelta(
+            threadId = "t-1",
+            runId = "run-1",
+            participantId = "reviewer",
+            delta = "Hello ",
+        )
         val bytes = cbor.encodeToByteArray(ServerToClient.serializer(), original)
         val decoded = Codec.decodeFromServer(bytes)
         assertEquals(original, decoded)
@@ -166,6 +171,8 @@ class CodecTest {
                 conversation = listOf(
                     Message(role = Role.User, content = listOf(ContentBlock.Text("hello"))),
                     Message(
+                        author = "reviewer",
+                        runId = "run-1",
                         role = Role.Assistant,
                         content = listOf(
                             ContentBlock.Thinking("let me think"),
@@ -430,6 +437,35 @@ class CodecTest {
     @Test
     fun clientToServer_recoverThread_roundTrip() {
         val original = ClientToServer.RecoverThread(threadId = "t-2")
+        val bytes = Codec.encodeToServer(original)
+        val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun clientToServer_createThreadWithParticipantProfiles_roundTrip() {
+        val participants = ThreadParticipants(
+            members = listOf(
+                ThreadParticipant("human", ThreadParticipantKind.Client),
+                ThreadParticipant("builder", ThreadParticipantKind.Model),
+                ThreadParticipant("reviewer", ThreadParticipantKind.Model),
+            ),
+            defaultInput = "human",
+            defaultResponder = "builder",
+        )
+        val original = ClientToServer.CreateThread(
+            initialMessage = "draft then review",
+            configOverride = ThreadConfigOverride(
+                participants = participants,
+                participantProfiles = mapOf(
+                    "reviewer" to ParticipantExecutionProfileRequest(
+                        model = "review-model",
+                        maxTokens = 2048,
+                        bindings = ThreadBindingsRequest(backend = "anthropic"),
+                    ),
+                ),
+            ),
+        )
         val bytes = Codec.encodeToServer(original)
         val decoded = cbor.decodeFromByteArray(ClientToServer.serializer(), bytes)
         assertEquals(original, decoded)

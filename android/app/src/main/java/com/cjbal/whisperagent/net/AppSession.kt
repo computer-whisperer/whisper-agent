@@ -710,30 +710,47 @@ class AppSession(
             if (snap == null) return@update null
             when (event) {
                 is ServerToClient.ThreadUserMessage -> snap.appendMessage(
-                    Message(role = Role.User, content = listOf(ContentBlock.Text(event.text))),
+                    Message(
+                        author = snap.config.participants.defaultInput,
+                        role = Role.User,
+                        content = listOf(ContentBlock.Text(event.text)),
+                    ),
                 )
                 is ServerToClient.AssistantBegin -> snap.appendMessage(
-                    Message(role = Role.Assistant, content = emptyList()),
+                    Message(
+                        author = event.participantId,
+                        runId = event.runId.ifEmpty { null },
+                        role = Role.Assistant,
+                        content = emptyList(),
+                    ),
                 )
-                is ServerToClient.AssistantTextDelta -> snap.appendDeltaToLastAssistant(
+                is ServerToClient.AssistantTextDelta -> snap.appendDeltaToAssistantRun(
+                    runId = event.runId,
+                    participantId = event.participantId,
                     asTextDelta = event.delta,
                 )
-                is ServerToClient.AssistantReasoningDelta -> snap.appendDeltaToLastAssistant(
+                is ServerToClient.AssistantReasoningDelta -> snap.appendDeltaToAssistantRun(
+                    runId = event.runId,
+                    participantId = event.participantId,
                     asThinkingDelta = event.delta,
                 )
-                is ServerToClient.ToolCallBegin -> snap.appendBlockToLastAssistant(
-                    ContentBlock.ToolUse(
+                is ServerToClient.ToolCallBegin -> snap.appendBlockToAssistantRun(
+                    block = ContentBlock.ToolUse(
                         id = event.toolUseId,
                         name = event.name,
                         argsPreview = event.argsPreview.ifBlank { null },
                     ),
+                    runId = event.runId,
+                    participantId = event.participantId,
                 )
                 is ServerToClient.ToolCallEnd -> snap.appendToolResult(
-                    ContentBlock.ToolResult(
+                    block = ContentBlock.ToolResult(
                         toolUseId = event.toolUseId,
                         isError = event.isError,
                         previewText = event.resultPreview.ifBlank { null },
                     ),
+                    runId = event.runId,
+                    participantId = event.participantId,
                 )
                 is ServerToClient.AssistantEnd,
                 is ServerToClient.LoopComplete,
@@ -821,12 +838,25 @@ data class StreamingToolCall(
 private fun ThreadSnapshot.appendMessage(message: Message): ThreadSnapshot =
     copy(conversation = conversation + message)
 
-/** Append `block` to the last Assistant message's content, creating one if absent. */
-private fun ThreadSnapshot.appendBlockToLastAssistant(block: ContentBlock): ThreadSnapshot {
+/** Append `block` to one generation's Assistant message, creating it if absent. */
+private fun ThreadSnapshot.appendBlockToAssistantRun(
+    block: ContentBlock,
+    runId: String,
+    participantId: String,
+): ThreadSnapshot {
     val msgs = conversation.toMutableList()
-    val lastIdx = msgs.indexOfLast { it.role == Role.Assistant }
+    val lastIdx = msgs.indexOfLast {
+        it.role == Role.Assistant && (runId.isEmpty() || it.runId == runId)
+    }
     if (lastIdx < 0) {
-        msgs.add(Message(role = Role.Assistant, content = listOf(block)))
+        msgs.add(
+            Message(
+                author = participantId,
+                runId = runId.ifEmpty { null },
+                role = Role.Assistant,
+                content = listOf(block),
+            ),
+        )
     } else {
         val msg = msgs[lastIdx]
         msgs[lastIdx] = msg.copy(content = msg.content + block)
@@ -839,14 +869,26 @@ private fun ThreadSnapshot.appendBlockToLastAssistant(block: ContentBlock): Thre
  * Coalesces consecutive same-kind deltas into the trailing block; otherwise
  * starts a new block of the right kind.
  */
-private fun ThreadSnapshot.appendDeltaToLastAssistant(
+private fun ThreadSnapshot.appendDeltaToAssistantRun(
+    runId: String,
+    participantId: String,
     asTextDelta: String? = null,
     asThinkingDelta: String? = null,
 ): ThreadSnapshot {
     val msgs = conversation.toMutableList()
-    val lastIdx = msgs.indexOfLast { it.role == Role.Assistant }
+    val lastIdx = msgs.indexOfLast {
+        it.role == Role.Assistant && (runId.isEmpty() || it.runId == runId)
+    }
     val (msg, msgIdx) = if (lastIdx < 0) {
-        Pair(Message(role = Role.Assistant, content = emptyList()), msgs.size)
+        Pair(
+            Message(
+                author = participantId,
+                runId = runId.ifEmpty { null },
+                role = Role.Assistant,
+                content = emptyList(),
+            ),
+            msgs.size,
+        )
     } else {
         Pair(msgs[lastIdx], lastIdx)
     }
@@ -881,13 +923,24 @@ private fun ThreadSnapshot.appendDeltaToLastAssistant(
  * already opened it), append the block; otherwise spin up a new ToolResult
  * message.
  */
-private fun ThreadSnapshot.appendToolResult(block: ContentBlock.ToolResult): ThreadSnapshot {
+private fun ThreadSnapshot.appendToolResult(
+    block: ContentBlock.ToolResult,
+    runId: String,
+    participantId: String,
+): ThreadSnapshot {
     val msgs = conversation.toMutableList()
     val last = msgs.lastOrNull()
-    if (last != null && last.role == Role.ToolResult) {
+    if (last != null && last.role == Role.ToolResult && (runId.isEmpty() || last.runId == runId)) {
         msgs[msgs.size - 1] = last.copy(content = last.content + block)
     } else {
-        msgs.add(Message(role = Role.ToolResult, content = listOf(block)))
+        msgs.add(
+            Message(
+                author = participantId,
+                runId = runId.ifEmpty { null },
+                role = Role.ToolResult,
+                content = listOf(block),
+            ),
+        )
     }
     return copy(conversation = msgs)
 }

@@ -1138,13 +1138,16 @@ impl Scheduler {
                 // resource-registry user sets would carry stale thread_ids
                 // that prevent GC from ever marking those resources idle.
                 for thread_id in &pod.threads {
-                    let bindings = self.tasks.get(thread_id).map(|t| t.bindings.clone());
+                    let resources = self
+                        .tasks
+                        .get(thread_id)
+                        .map(|t| (t.bindings.clone(), t.config.clone()));
                     self.tasks.remove(thread_id);
                     self.cancel_tokens.remove(thread_id);
                     self.dirty.remove(thread_id);
                     self.router.drop_thread(thread_id);
-                    if let Some(bindings) = bindings {
-                        self.release_thread_resources(thread_id, &pod_id, &bindings);
+                    if let Some((bindings, config)) = resources {
+                        self.release_thread_resources(thread_id, &pod_id, &bindings, &config);
                     }
                 }
                 // Broadcast first so every client clears its view before the

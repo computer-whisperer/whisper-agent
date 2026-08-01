@@ -82,6 +82,8 @@ pub fn build_block(pod_dir: &Path, now: DateTime<Utc>, session: &SessionContext<
     let index_contents = read_index_or_empty(pod_dir);
     let text = render_block(&index_contents, now, session);
     Message {
+        author: Some(whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into()),
+        run_id: None,
         role: Role::System,
         content: vec![ContentBlock::Text { text }],
     }

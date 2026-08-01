@@ -24,8 +24,10 @@ pub use behavior::{
     CatchUp, Overlap, RetentionPolicy, TriggerSpec,
 };
 pub use conversation::{
-    Attachment, ContentBlock, ContentCapabilities, Conversation, DocumentMime, DocumentSource,
-    ImageMime, ImageSource, MediaSupport, Message, ProviderReplay, Role, ToolResultContent,
+    Attachment, ContentBlock, ContentCapabilities, Conversation, DEFAULT_INPUT_PARTICIPANT_ID,
+    DEFAULT_MODEL_PARTICIPANT_ID, DocumentMime, DocumentSource, GenerationContext, GenerationRunId,
+    ImageMime, ImageSource, MediaSupport, Message, ParticipantId, ProviderReplay, Role,
+    ThreadParticipant, ThreadParticipantKind, ThreadParticipants, ToolResultContent,
 };
 pub use permission::{BehaviorOpsCap, DispatchCap, PodModifyCap};
 pub use pod::{
@@ -189,6 +191,14 @@ pub struct TurnLog {
 /// just read `usage`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TurnEntry {
+    /// Stable generation identity. Empty only for entries loaded from threads
+    /// persisted before generation runs were explicit.
+    #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+    pub run_id: GenerationRunId,
+    /// Participant whose provider call produced this entry. Legacy entries
+    /// infer the historical `agent` participant.
+    #[serde(default = "conversation::default_model_participant_id")]
+    pub participant_id: ParticipantId,
     pub usage: Usage,
 }
 
@@ -210,6 +220,17 @@ pub struct TurnEntry {
 /// [`ThreadBindingsRequest`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThreadConfig {
+    /// Participants visible in this thread and the compatibility driver's
+    /// default input/responder pair. Threads persisted before participant
+    /// identity existed deserialize as the traditional user + agent pair.
+    #[serde(default)]
+    pub participants: ThreadParticipants,
+    /// Program that turns durable thread events into requested effects. The
+    /// first implementation preserves the historical model/tool loop; future
+    /// variants can select richer orchestration without changing Thread's I/O
+    /// machinery.
+    #[serde(default)]
+    pub driver: ThreadDriverConfig,
     pub model: String,
     /// Per-request output cap: the maximum number of tokens the model
     /// is allowed to generate in a single response. **Not** the
@@ -244,6 +265,12 @@ pub struct ThreadConfig {
     /// advertises nothing.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tunables: BTreeMap<String, TunableValue>,
+    /// Frozen execution setup for each model participant. The map is keyed by
+    /// [`ParticipantId`], and creation rejects entries for client participants
+    /// or unknown ids. Empty on legacy threads; runtimes must then synthesize
+    /// the historical profile from the thread-level model/bindings/prefix.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub participant_profiles: BTreeMap<ParticipantId, ParticipantExecutionProfile>,
 }
 
 impl ThreadConfig {
@@ -255,12 +282,15 @@ impl ThreadConfig {
     /// intentionally carries only model/runtime policy.
     pub fn from_thread_defaults(defaults: &ThreadDefaults) -> Self {
         Self {
+            participants: ThreadParticipants::default(),
+            driver: ThreadDriverConfig::default(),
             model: defaults.model.clone(),
             max_tokens: defaults.max_tokens,
             max_turns: defaults.max_turns,
             compaction: defaults.compaction.clone(),
             autoquery: defaults.autoquery.clone(),
             tunables: defaults.tunables.clone(),
+            participant_profiles: BTreeMap::new(),
         }
     }
 
@@ -280,18 +310,92 @@ impl ThreadConfig {
             tunables.extend(extra);
         }
         Self {
+            participants: ov.participants.unwrap_or(self.participants),
+            driver: ov.driver.unwrap_or(self.driver),
             model: ov.model.unwrap_or(self.model),
             max_tokens: ov.max_tokens.unwrap_or(self.max_tokens),
             max_turns: ov.max_turns.unwrap_or(self.max_turns),
             compaction: self.compaction.compose_override(ov.compaction),
             autoquery: self.autoquery.compose_override(ov.autoquery),
             tunables,
+            // Profile requests are creation inputs. The scheduler resolves
+            // them after the thread's bindings and scope have been frozen.
+            participant_profiles: self.participant_profiles,
         }
     }
 }
 
+/// Persisted driver selection for a thread definition. Struct variants keep
+/// the wire extensible with per-driver configuration while giving old threads
+/// a deterministic compatibility default.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThreadDriverConfig {
+    #[default]
+    BuiltinSingleAgentChat,
+}
+
+/// Creation-time, inheritable execution choices for one model participant.
+/// Every optional field falls back to the thread's compatibility setup. The
+/// scheduler resolves this into [`ParticipantExecutionProfile`] exactly once.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ParticipantExecutionProfileRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<SystemPromptChoice>,
+    /// Resource choices are independently resolved against the pod ceiling.
+    #[serde(default, skip_serializing_if = "ThreadBindingsRequest::is_empty")]
+    pub bindings: ThreadBindingsRequest,
+    /// Further narrow the thread's frozen scope. This can never widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::permission::Scope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_surface: Option<ToolSurface>,
+    /// Per-key additions/replacements layered over thread-level tunables.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tunables: BTreeMap<String, TunableValue>,
+}
+
+/// Fully resolved, persisted execution setup for a model participant.
+/// Unlike the request shape, this contains no inheritance sentinels: provider
+/// and tool dispatch can consume it directly without consulting pod config.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ParticipantExecutionProfile {
+    pub model: String,
+    pub max_tokens: u32,
+    pub system_prompt: String,
+    pub bindings: ThreadBindings,
+    pub scope: crate::permission::Scope,
+    pub tool_surface: ToolSurface,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tunables: BTreeMap<String, TunableValue>,
+    /// Provider-facing tool manifest, captured once all bound catalogs are
+    /// ready. Empty is a valid tool-free profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSchema>,
+    /// Stable setup messages after the system/tool fields (initial listing,
+    /// memory snapshot, and future scripted setup effects).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<Message>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ThreadConfigOverride {
+    /// Replace the thread's participant registry. The current compatibility
+    /// driver invokes `default_responder`; configurable drivers will address
+    /// arbitrary members directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participants: Option<ThreadParticipants>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<ThreadDriverConfig>,
+    /// Per-model-participant execution choices. Missing model participants
+    /// inherit the thread's compatibility setup; unknown/client ids reject
+    /// creation rather than being silently ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_profiles: Option<BTreeMap<ParticipantId, ParticipantExecutionProfileRequest>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Override for [`ThreadConfig::max_tokens`] — the per-request
@@ -355,6 +459,12 @@ impl ThreadConfigOverride {
     /// True when this override would not change thread creation at all.
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
+            && self.participants.is_none()
+            && self.driver.is_none()
+            && self
+                .participant_profiles
+                .as_ref()
+                .is_none_or(BTreeMap::is_empty)
             && self.max_tokens.is_none()
             && self.max_turns.is_none()
             && self.system_prompt.is_none()
@@ -2323,6 +2433,10 @@ pub enum ServerToClient {
     },
     ThreadAssistantBegin {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         turn: u32,
     },
     /// Mid-prefill progress heartbeat. Only emitted by backends that can
@@ -2336,6 +2450,10 @@ pub enum ServerToClient {
     /// persisted.
     ThreadPrefillProgress {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         /// Prompt tokens ingested so far.
         tokens_processed: u32,
         /// Total prompt length the backend is working through.
@@ -2357,6 +2475,10 @@ pub enum ServerToClient {
     /// `ThreadAssistantEnd` lands. Ephemeral: not persisted.
     ThreadOutputTokensProgress {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         output_tokens: u32,
     },
     /// In-flight tool-call placeholder. Emitted while the model is
@@ -2369,6 +2491,10 @@ pub enum ServerToClient {
     /// `tool_use_id`). Ephemeral; not persisted.
     ThreadToolCallStreaming {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         tool_use_id: String,
         name: String,
         /// Cumulative length of the args-JSON buffered so far. Not a
@@ -2382,6 +2508,10 @@ pub enum ServerToClient {
     /// next non-text event (ReasoningDelta, ToolCallBegin, AssistantEnd).
     ThreadAssistantTextDelta {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         delta: String,
     },
     /// A model-emitted image attachment on the current assistant turn —
@@ -2396,6 +2526,10 @@ pub enum ServerToClient {
     /// than waiting on a snapshot rebuild.
     ThreadAssistantImage {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         source: ImageSource,
     },
     /// Streaming chain-of-thought fragment — Anthropic extended-thinking,
@@ -2404,10 +2538,18 @@ pub enum ServerToClient {
     /// separate, visually-distinct block.
     ThreadAssistantReasoningDelta {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         delta: String,
     },
     ThreadToolCallBegin {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         tool_use_id: String,
         name: String,
         args_preview: String,
@@ -2429,11 +2571,19 @@ pub enum ServerToClient {
     /// still arrives in the conversation via the snapshot path.
     ThreadToolCallContent {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         tool_use_id: String,
         block: ContentBlock,
     },
     ThreadToolCallEnd {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         tool_use_id: String,
         /// Full text body of the tool result. The `_preview` suffix is
         /// kept for protocol stability; historically the runtime
@@ -2455,6 +2605,10 @@ pub enum ServerToClient {
     },
     ThreadAssistantEnd {
         thread_id: String,
+        #[serde(default, skip_serializing_if = "GenerationRunId::is_empty")]
+        run_id: GenerationRunId,
+        #[serde(default = "conversation::default_model_participant_id")]
+        participant_id: ParticipantId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
         usage: Usage,
@@ -3033,6 +3187,9 @@ mod tests {
     fn thread_config_composes_from_defaults_and_partial_override() {
         let base = ThreadConfig::from_thread_defaults(&sample_thread_defaults());
         let composed = base.compose_override(Some(ThreadConfigOverride {
+            participants: None,
+            driver: None,
+            participant_profiles: None,
             model: Some("claude-override".into()),
             max_tokens: None,
             max_turns: Some(20),
@@ -3068,6 +3225,149 @@ mod tests {
             composed.autoquery.query_source,
             KnowledgeAutoquerySource::TextOnly
         );
+    }
+
+    #[test]
+    fn thread_config_can_replace_participant_registry() {
+        let base = ThreadConfig::from_thread_defaults(&sample_thread_defaults());
+        let participants = ThreadParticipants {
+            members: vec![
+                ThreadParticipant {
+                    id: "human".into(),
+                    kind: ThreadParticipantKind::Client,
+                    display_name: Some("Human".into()),
+                },
+                ThreadParticipant {
+                    id: "builder".into(),
+                    kind: ThreadParticipantKind::Model,
+                    display_name: Some("Builder".into()),
+                },
+                ThreadParticipant {
+                    id: "reviewer".into(),
+                    kind: ThreadParticipantKind::Model,
+                    display_name: Some("Reviewer".into()),
+                },
+            ],
+            default_input: "human".into(),
+            default_responder: "builder".into(),
+        };
+        let composed = base.compose_override(Some(ThreadConfigOverride {
+            participants: Some(participants.clone()),
+            ..Default::default()
+        }));
+        assert_eq!(composed.participants, participants);
+        composed.participants.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_thread_config_gets_compatibility_participants_and_driver() {
+        let config = ThreadConfig::from_thread_defaults(&sample_thread_defaults());
+        let mut json = serde_json::to_value(config).unwrap();
+        json.as_object_mut().unwrap().remove("participants");
+        json.as_object_mut().unwrap().remove("driver");
+        json.as_object_mut().unwrap().remove("participant_profiles");
+
+        let decoded: ThreadConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.participants, ThreadParticipants::default());
+        assert_eq!(decoded.driver, ThreadDriverConfig::BuiltinSingleAgentChat);
+        assert!(decoded.participant_profiles.is_empty());
+    }
+
+    #[test]
+    fn builtin_driver_has_stable_tagged_wire_shape() {
+        let driver = ThreadDriverConfig::BuiltinSingleAgentChat;
+        assert_eq!(
+            serde_json::to_value(&driver).unwrap(),
+            serde_json::json!({ "kind": "builtin_single_agent_chat" })
+        );
+        assert_eq!(
+            serde_json::from_value::<ThreadDriverConfig>(
+                serde_json::json!({ "kind": "builtin_single_agent_chat" })
+            )
+            .unwrap(),
+            driver
+        );
+    }
+
+    #[test]
+    fn participant_execution_profile_round_trips_as_frozen_config() {
+        let mut config = ThreadConfig::from_thread_defaults(&sample_thread_defaults());
+        config.participant_profiles.insert(
+            "reviewer".into(),
+            ParticipantExecutionProfile {
+                model: "claude-reviewer".into(),
+                max_tokens: 2048,
+                system_prompt: "Review carefully.".into(),
+                bindings: ThreadBindings {
+                    backend: "anthropic".into(),
+                    host_env: Vec::new(),
+                    mcp_hosts: vec!["fetch".into()],
+                    tool_filter: None,
+                },
+                scope: crate::permission::Scope::deny_all(),
+                tool_surface: ToolSurface::default(),
+                tunables: BTreeMap::from_iter([(
+                    "effort".into(),
+                    TunableValue::Enum("high".into()),
+                )]),
+                tools: vec![ToolSchema {
+                    name: "lookup".into(),
+                    description: "Look something up".into(),
+                    params: Vec::new(),
+                    kind: ToolKind::Function,
+                }],
+                context: vec![Message::system_text("profile context")],
+            },
+        );
+
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let decoded: ThreadConfig = serde_json::from_slice(&bytes).unwrap();
+        let reviewer = decoded
+            .participant_profiles
+            .get(&ParticipantId::from("reviewer"))
+            .unwrap();
+        assert_eq!(reviewer.model, "claude-reviewer");
+        assert_eq!(reviewer.bindings.mcp_hosts, vec!["fetch"]);
+        assert_eq!(reviewer.tools[0].name, "lookup");
+        assert_eq!(reviewer.context.len(), 1);
+    }
+
+    #[test]
+    fn legacy_generation_metadata_gets_compatibility_identity() {
+        let entry: TurnEntry = serde_json::from_str(
+            r#"{"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}"#,
+        )
+        .unwrap();
+        assert!(entry.run_id.is_empty());
+        assert_eq!(entry.participant_id.as_str(), DEFAULT_MODEL_PARTICIPANT_ID);
+
+        let event: ServerToClient = serde_json::from_str(
+            r#"{"type":"thread_assistant_text_delta","thread_id":"t-1","delta":"hi"}"#,
+        )
+        .unwrap();
+        let ServerToClient::ThreadAssistantTextDelta {
+            run_id,
+            participant_id,
+            ..
+        } = event
+        else {
+            panic!("wrong event variant")
+        };
+        assert!(run_id.is_empty());
+        assert_eq!(participant_id.as_str(), DEFAULT_MODEL_PARTICIPANT_ID);
+    }
+
+    #[test]
+    fn generation_metadata_round_trips_on_stream_events() {
+        let event = ServerToClient::ThreadAssistantTextDelta {
+            thread_id: "t-1".into(),
+            run_id: "run-1".into(),
+            participant_id: "reviewer".into(),
+            delta: "hi".into(),
+        };
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["run_id"], "run-1");
+        assert_eq!(json["participant_id"], "reviewer");
     }
 
     #[test]
@@ -3127,6 +3427,30 @@ mod tests {
     #[test]
     fn thread_override_empty_tracks_all_creation_axes() {
         assert!(ThreadConfigOverride::default().is_empty());
+        assert!(
+            !ThreadConfigOverride {
+                participants: Some(ThreadParticipants::default()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !ThreadConfigOverride {
+                driver: Some(ThreadDriverConfig::BuiltinSingleAgentChat),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !ThreadConfigOverride {
+                participant_profiles: Some(BTreeMap::from_iter([(
+                    "agent".into(),
+                    ParticipantExecutionProfileRequest::default(),
+                )])),
+                ..Default::default()
+            }
+            .is_empty()
+        );
         assert!(
             !ThreadConfigOverride {
                 system_prompt: Some(SystemPromptChoice::Text { text: "x".into() }),

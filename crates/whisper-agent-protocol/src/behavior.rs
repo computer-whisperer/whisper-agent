@@ -247,6 +247,9 @@ impl BehaviorThreadOverride {
         Option<crate::ThreadBindingsRequest>,
     ) {
         let config = crate::ThreadConfigOverride {
+            participants: None,
+            driver: None,
+            participant_profiles: None,
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             max_turns: self.max_turns,

@@ -11,6 +11,215 @@ use serde_json::Value;
 
 use crate::tool_schema::{ParamSpec, ToolKind};
 
+/// Stable participant id used inside a thread definition and on authored
+/// transcript messages. Provider roles are deliberately separate: one
+/// participant's `assistant` output becomes input when another model
+/// participant is invoked.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct ParticipantId(String);
+
+impl ParticipantId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ParticipantId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for ParticipantId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for ParticipantId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Stable identity for one model-generation run. A run may contain the
+/// provider stream plus the tool calls it requested; a subsequent model
+/// sub-turn receives a fresh id even when it belongs to the same participant.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct GenerationRunId(String);
+
+impl GenerationRunId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<&str> for GenerationRunId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for GenerationRunId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for GenerationRunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Address of one participant-scoped generation. Kept as a reusable runtime
+/// value while wire events expose the two fields directly for simple clients.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GenerationContext {
+    pub run_id: GenerationRunId,
+    pub participant_id: ParticipantId,
+}
+
+impl GenerationContext {
+    pub fn new(
+        run_id: impl Into<GenerationRunId>,
+        participant_id: impl Into<ParticipantId>,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            participant_id: participant_id.into(),
+        }
+    }
+
+    /// Compatibility identity for persisted in-flight state that predates
+    /// explicit generations. New runtime paths always construct a non-empty id.
+    pub fn legacy() -> Self {
+        Self::new(GenerationRunId::default(), DEFAULT_MODEL_PARTICIPANT_ID)
+    }
+}
+
+impl Default for GenerationContext {
+    fn default() -> Self {
+        Self::legacy()
+    }
+}
+
+pub const DEFAULT_INPUT_PARTICIPANT_ID: &str = "user";
+pub const DEFAULT_MODEL_PARTICIPANT_ID: &str = "agent";
+
+pub(crate) fn default_model_participant_id() -> ParticipantId {
+    DEFAULT_MODEL_PARTICIPANT_ID.into()
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadParticipantKind {
+    /// An externally-driven participant, normally a human using a client.
+    Client,
+    /// A participant whose turns are generated through a model provider.
+    Model,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipant {
+    pub id: ParticipantId,
+    pub kind: ThreadParticipantKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Participant registry for a thread. The current compatibility driver uses
+/// `default_input` and `default_responder`; later drivers may address any
+/// participant directly and need not follow this pairwise topology.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadParticipants {
+    pub members: Vec<ThreadParticipant>,
+    pub default_input: ParticipantId,
+    pub default_responder: ParticipantId,
+}
+
+impl ThreadParticipants {
+    pub fn single_agent() -> Self {
+        Self {
+            members: vec![
+                ThreadParticipant {
+                    id: DEFAULT_INPUT_PARTICIPANT_ID.into(),
+                    kind: ThreadParticipantKind::Client,
+                    display_name: Some("User".into()),
+                },
+                ThreadParticipant {
+                    id: DEFAULT_MODEL_PARTICIPANT_ID.into(),
+                    kind: ThreadParticipantKind::Model,
+                    display_name: Some("Agent".into()),
+                },
+            ],
+            default_input: DEFAULT_INPUT_PARTICIPANT_ID.into(),
+            default_responder: DEFAULT_MODEL_PARTICIPANT_ID.into(),
+        }
+    }
+
+    pub fn member(&self, id: &ParticipantId) -> Option<&ThreadParticipant> {
+        self.members.iter().find(|member| member.id == *id)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for member in &self.members {
+            if member.id.as_str().trim().is_empty() {
+                return Err("thread participant id must not be empty".into());
+            }
+            if !ids.insert(member.id.clone()) {
+                return Err(format!("duplicate thread participant id `{}`", member.id));
+            }
+        }
+        let input = self.member(&self.default_input).ok_or_else(|| {
+            format!(
+                "default input participant `{}` is not in the registry",
+                self.default_input
+            )
+        })?;
+        if input.kind != ThreadParticipantKind::Client {
+            return Err(format!(
+                "default input participant `{}` must have kind `client`",
+                self.default_input
+            ));
+        }
+        let responder = self.member(&self.default_responder).ok_or_else(|| {
+            format!(
+                "default responder participant `{}` is not in the registry",
+                self.default_responder
+            )
+        })?;
+        if responder.kind != ThreadParticipantKind::Model {
+            return Err(format!(
+                "default responder participant `{}` must have kind `model`",
+                self.default_responder
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ThreadParticipants {
+    fn default() -> Self {
+        Self::single_agent()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ToolSchemaRef<'a> {
     pub name: &'a str,
@@ -75,6 +284,17 @@ pub enum Role {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
+    /// Participant that authored or owns this transcript entry. `None`
+    /// is accepted for threads persisted before participant identity was
+    /// introduced; [`Self::effective_author`] infers the legacy user/agent
+    /// identity from `role` in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<ParticipantId>,
+    /// Generation that produced this entry. Present on new assistant and
+    /// model-owned tool-result entries; absent on setup, client input, and
+    /// messages persisted before generation identity existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<GenerationRunId>,
     pub role: Role,
     pub content: Vec<ContentBlock>,
 }
@@ -82,6 +302,8 @@ pub struct Message {
 impl Message {
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
+            author: Some(DEFAULT_INPUT_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
@@ -89,6 +311,8 @@ impl Message {
 
     pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
         Self {
+            author: Some(DEFAULT_INPUT_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::User,
             content: blocks,
         }
@@ -104,6 +328,8 @@ impl Message {
     /// when the text is empty.
     pub fn system_text(text: impl Into<String>) -> Self {
         Self {
+            author: Some(DEFAULT_MODEL_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::System,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
@@ -122,6 +348,8 @@ impl Message {
             "Role::Tools content must be ContentBlock::ToolSchema entries"
         );
         Self {
+            author: Some(DEFAULT_MODEL_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::Tools,
             content: tools,
         }
@@ -129,6 +357,8 @@ impl Message {
 
     pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Self {
         Self {
+            author: Some(DEFAULT_MODEL_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::Assistant,
             content: blocks,
         }
@@ -141,6 +371,8 @@ impl Message {
     /// that want separate messages per result.
     pub fn tool_result_blocks(blocks: Vec<ContentBlock>) -> Self {
         Self {
+            author: Some(DEFAULT_MODEL_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::ToolResult,
             content: blocks,
         }
@@ -159,9 +391,35 @@ impl Message {
     /// turn.
     pub fn tool_result_text(text: impl Into<String>) -> Self {
         Self {
+            author: Some(DEFAULT_MODEL_PARTICIPANT_ID.into()),
+            run_id: None,
             role: Role::ToolResult,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+
+    pub fn with_author(mut self, author: impl Into<ParticipantId>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<GenerationRunId>) -> Self {
+        let run_id = run_id.into();
+        self.run_id = (!run_id.is_empty()).then_some(run_id);
+        self
+    }
+
+    /// Participant identity for both current and legacy messages. Legacy
+    /// `User` messages map to the default input participant; every other
+    /// role belongs to the default model participant because setup, model
+    /// output, and tool results all lived in that model's provider context.
+    pub fn effective_author(&self) -> ParticipantId {
+        self.author.clone().unwrap_or_else(|| match self.role {
+            Role::User => DEFAULT_INPUT_PARTICIPANT_ID.into(),
+            Role::System | Role::Tools | Role::Assistant | Role::ToolResult => {
+                DEFAULT_MODEL_PARTICIPANT_ID.into()
+            }
+        })
     }
 }
 
@@ -740,6 +998,21 @@ impl Conversation {
         end
     }
 
+    /// Build the provider-facing body for one model participant.
+    ///
+    /// Provider APIs still speak a binary user/assistant vocabulary. The
+    /// shared thread transcript does not: another model participant's output
+    /// is input from the active participant's perspective. Native assistant
+    /// and tool-result structure is therefore preserved only for entries
+    /// owned by `participant`; foreign model/tool entries are rendered as a
+    /// labeled user message with provider-replay metadata stripped.
+    pub fn project_body_for(&self, participant: &ParticipantId) -> Vec<Message> {
+        self.messages[self.setup_prefix_end()..]
+            .iter()
+            .map(|message| project_message_for(message, participant))
+            .collect()
+    }
+
     /// Index of the first body message, treating every leading
     /// `Role::System` or `Role::Tools` entry as part of the thread's
     /// initial context. Broader than [`Self::setup_prefix_end`]: a
@@ -798,6 +1071,8 @@ impl Conversation {
                 .all(|b| matches!(b, ContentBlock::ToolResult { .. }));
             if all_tool_result {
                 out.push(Message {
+                    author: None,
+                    run_id: msg.run_id,
                     role: Role::ToolResult,
                     content: msg.content,
                 });
@@ -819,12 +1094,16 @@ impl Conversation {
             }
             if !user_side.is_empty() {
                 out.push(Message {
+                    author: msg.author.clone(),
+                    run_id: msg.run_id.clone(),
                     role: Role::User,
                     content: user_side,
                 });
             }
             if !tool_side.is_empty() {
                 out.push(Message {
+                    author: None,
+                    run_id: msg.run_id,
                     role: Role::ToolResult,
                     content: tool_side,
                 });
@@ -832,6 +1111,98 @@ impl Conversation {
         }
         self.messages = out;
     }
+}
+
+fn project_message_for(message: &Message, participant: &ParticipantId) -> Message {
+    let author = message.effective_author();
+    match message.role {
+        Role::Assistant | Role::ToolResult if author != *participant => {
+            foreign_message_as_user(message, &author)
+        }
+        Role::User if author.as_str() != DEFAULT_INPUT_PARTICIPANT_ID && author != *participant => {
+            foreign_message_as_user(message, &author)
+        }
+        _ => message.clone(),
+    }
+}
+
+fn foreign_message_as_user(message: &Message, author: &ParticipantId) -> Message {
+    let escaped_author = escape_xml_attr(author.as_str());
+    let mut content = vec![ContentBlock::Text {
+        text: format!("<participant-message participant=\"{escaped_author}\">\n"),
+    }];
+    append_shareable_blocks(&message.content, &mut content);
+    if content.len() == 1 {
+        content.push(ContentBlock::Text {
+            text: "[no shareable content]".into(),
+        });
+    }
+    content.push(ContentBlock::Text {
+        text: "\n</participant-message>".into(),
+    });
+    Message {
+        author: message.author.clone().or_else(|| Some(author.clone())),
+        run_id: message.run_id.clone(),
+        role: Role::User,
+        content,
+    }
+}
+
+fn append_shareable_blocks(blocks: &[ContentBlock], out: &mut Vec<ContentBlock>) {
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text } => out.push(ContentBlock::Text { text: text.clone() }),
+            // Reasoning replay is private provider state, not speech to
+            // another participant. Do not expose either the opaque replay
+            // blob or the human-readable reasoning summary here.
+            ContentBlock::Thinking { .. } | ContentBlock::ToolSchema { .. } => {}
+            ContentBlock::Image { source, .. } => out.push(ContentBlock::Image {
+                source: source.clone(),
+                replay: None,
+            }),
+            ContentBlock::Document { source } => out.push(ContentBlock::Document {
+                source: source.clone(),
+            }),
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => out.push(ContentBlock::Text {
+                text: format!("[tool call {id}: {name} {}]", input),
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                out.push(ContentBlock::Text {
+                    text: format!(
+                        "[tool result {tool_use_id}{}]",
+                        if *is_error { " (error)" } else { "" }
+                    ),
+                });
+                match content {
+                    ToolResultContent::Text(text) => {
+                        out.push(ContentBlock::Text { text: text.clone() })
+                    }
+                    ToolResultContent::Blocks(blocks) => append_shareable_blocks(blocks, out),
+                }
+            }
+        }
+    }
+}
+
+fn escape_xml_attr(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -894,6 +1265,8 @@ mod tests {
         }]));
         // Legacy shape: tool result under Role::User.
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "u1".into(),
@@ -912,6 +1285,8 @@ mod tests {
     fn normalize_splits_mixed_user_message() {
         let mut conv = Conversation::new();
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![
                 ContentBlock::Text {
@@ -994,5 +1369,112 @@ mod tests {
         conv.normalize_legacy_tool_result_role();
         let after = serde_json::to_string(&conv).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn legacy_messages_infer_default_participants() {
+        let user: Message =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"hello"}]}"#)
+                .unwrap();
+        let assistant: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":[{"type":"text","text":"hi"}]}"#)
+                .unwrap();
+        assert!(user.author.is_none());
+        assert_eq!(
+            user.effective_author().as_str(),
+            DEFAULT_INPUT_PARTICIPANT_ID
+        );
+        assert_eq!(
+            assistant.effective_author().as_str(),
+            DEFAULT_MODEL_PARTICIPANT_ID
+        );
+    }
+
+    #[test]
+    fn participant_registry_rejects_invalid_default_roles() {
+        let mut participants = ThreadParticipants::default();
+        participants.default_responder = participants.default_input.clone();
+        let error = participants.validate().unwrap_err();
+        assert!(error.contains("must have kind `model`"), "got: {error}");
+    }
+
+    #[test]
+    fn projection_preserves_active_model_structure() {
+        let mut conv = Conversation::new();
+        conv.push(Message::system_text("system"));
+        conv.push(Message::tools_manifest(Vec::new()));
+        conv.push(Message::user_text("question"));
+        conv.push(Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "tu-1".into(),
+            name: "lookup".into(),
+            input: serde_json::json!({"q": "x"}),
+            replay: None,
+        }]));
+        conv.push(Message::tool_result_blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tu-1".into(),
+                content: ToolResultContent::Text("answer".into()),
+                is_error: false,
+            },
+        ]));
+
+        let projected = conv.project_body_for(&DEFAULT_MODEL_PARTICIPANT_ID.into());
+        assert_eq!(
+            projected.iter().map(|m| m.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::ToolResult]
+        );
+        assert!(matches!(
+            projected[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            projected[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+    }
+
+    #[test]
+    fn projection_turns_foreign_model_output_into_labeled_input() {
+        let reviewer = ParticipantId::new("reviewer&critic");
+        let builder = ParticipantId::new("builder");
+        let mut conv = Conversation::new();
+        conv.push(
+            Message::assistant_blocks(vec![
+                ContentBlock::Thinking {
+                    replay: Some(ProviderReplay {
+                        provider: "test".into(),
+                        data: serde_json::json!({"secret": true}),
+                    }),
+                    thinking: "private reasoning".into(),
+                },
+                ContentBlock::Text {
+                    text: "public answer".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tu-2".into(),
+                    name: "check".into(),
+                    input: serde_json::json!({"value": 1}),
+                    replay: None,
+                },
+            ])
+            .with_author(reviewer),
+        );
+
+        let projected = conv.project_body_for(&builder);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].role, Role::User);
+        let rendered: String = projected[0]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(rendered.contains("reviewer&amp;critic"), "got: {rendered}");
+        assert!(rendered.contains("public answer"), "got: {rendered}");
+        assert!(rendered.contains("tool call tu-2"), "got: {rendered}");
+        assert!(!rendered.contains("private reasoning"), "got: {rendered}");
+        assert!(!rendered.contains("secret"), "got: {rendered}");
     }
 }

@@ -155,6 +155,7 @@ Design docs in [`docs/`](docs/):
 - [`design_pod_thread_scheduler.md`](docs/design_pod_thread_scheduler.md) — pods, threads, and resources
 - [`design_permissions.md`](docs/design_permissions.md) — tool-boundary patterns
 - [`design_functions.md`](docs/design_functions.md) — unified Function model (design draft)
+- [`design_configurable_threads.md`](docs/design_configurable_threads.md) — participant-aware transcripts and configurable thread drivers
 - [`design_behaviors.md`](docs/design_behaviors.md) — autonomous pod behaviors (design)
 - [`design_knowledge_db.md`](docs/design_knowledge_db.md) — embedded retrieval / knowledge buckets
 

@@ -1205,6 +1205,8 @@ mod tests {
         let messages = make_messages();
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "you are helpful",
@@ -1234,6 +1236,8 @@ mod tests {
         let messages = make_messages();
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "",
@@ -1264,6 +1268,8 @@ mod tests {
         let messages = make_messages();
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "you are helpful",
@@ -1299,6 +1305,8 @@ mod tests {
         let messages = make_messages();
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "you are helpful",
@@ -1327,6 +1335,8 @@ mod tests {
         let messages = make_messages();
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "you are helpful",
@@ -1360,6 +1370,8 @@ mod tests {
         let breakpoints = crate::providers::model::default_cache_policy(&messages);
         let tunables = empty_tunables();
         let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
             model: "claude-opus-4-6",
             max_tokens: 1024,
             system_prompt: "you are helpful",

@@ -22,14 +22,15 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    BehaviorOrigin, ContentBlock, Conversation, ImageSource, Message, Role, ThreadBindings,
-    ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary, ToolResultContent, ToolSurface,
-    TurnEntry, TurnLog, Usage,
+    BehaviorOrigin, ContentBlock, Conversation, GenerationContext, ImageSource, Message, Role,
+    ThreadBindings, ThreadConfig, ThreadSnapshot, ThreadStateLabel, ThreadSummary,
+    ToolResultContent, ToolSurface, TurnEntry, TurnLog, Usage,
 };
 
 use crate::functions::InFlightOps;
 use crate::permission::Scope;
 use crate::providers::model::ModelResponse;
+use crate::runtime::driver::{DriverFinishReason, PersistedDriverEffect};
 use crate::tools::mcp::{CallToolResult, ToolAnnotations};
 
 pub type OpId = u64;
@@ -47,9 +48,11 @@ const CANCEL_REASON: &str = "cancelled";
 fn synth_interrupted_tool_result(
     tool_use_id: &str,
     synth_text: &str,
+    generation: &GenerationContext,
     events: &mut Vec<ThreadEvent>,
 ) -> ContentBlock {
     events.push(ThreadEvent::ToolCallEnd {
+        generation: generation.clone(),
         tool_use_id: tool_use_id.to_string(),
         result_preview: synth_text.to_string(),
         is_error: true,
@@ -88,8 +91,16 @@ pub struct Thread {
     /// field existed load with an empty log.
     #[serde(default)]
     pub turn_log: TurnLog,
-    /// Turns issued in the current user-message cycle; resets on user message.
+    /// Persisted mutable state owned by the configured driver.
     #[serde(default)]
+    pub driver_state: crate::runtime::driver::DriverState,
+    /// Durable requested/completed effect history. The scheduler flushes this
+    /// state before polling newly queued provider/tool futures.
+    #[serde(default)]
+    pub effect_journal: crate::runtime::driver::DriverEffectJournal,
+    /// Legacy load shim for thread JSON written before `driver_state`.
+    /// Runtime policy reads `driver_state`; new snapshots omit this field.
+    #[serde(default, skip_serializing)]
     pub turns_in_cycle: u32,
     /// The thread's permission scope, snapshotted from the pod's
     /// `[allow]` table at creation. Stored on the thread rather than
@@ -214,6 +225,11 @@ pub enum ThreadInternalState {
     AwaitingModel {
         op_id: OpId,
         started_at: DateTime<Utc>,
+        #[serde(default)]
+        generation: GenerationContext,
+        /// Zero only for legacy snapshots created before effect journaling.
+        #[serde(default)]
+        effect_id: crate::runtime::driver::DriverEffectId,
     },
     /// Model responded with tool_uses. Each entry in `pending_dispatch` still needs to
     /// be fired at MCP; `pending_io` maps op_ids of in-flight tool calls to their
@@ -221,6 +237,12 @@ pub enum ThreadInternalState {
     /// denied by the thread's scope is synthesized into `completed` here with
     /// `is_error: true` so the model's next turn sees the denial.
     AwaitingTools {
+        #[serde(default)]
+        generation: GenerationContext,
+        /// The pending `DispatchTools` record for this generation. Zero is the
+        /// legacy sentinel for snapshots with no effect journal.
+        #[serde(default)]
+        effect_id: crate::runtime::driver::DriverEffectId,
         pending_dispatch: Vec<ToolUseReq>,
         pending_io: HashMap<OpId, String>,
         completed: Vec<ContentBlock>,
@@ -249,9 +271,11 @@ pub struct ToolUseReq {
 pub enum IoRequest {
     ModelCall {
         op_id: OpId,
+        generation: GenerationContext,
     },
     ToolCall {
         op_id: OpId,
+        generation: GenerationContext,
         tool_use_id: String,
         name: String,
         input: serde_json::Value,
@@ -283,9 +307,11 @@ pub enum StepOutcome {
 #[derive(Debug, Clone)]
 pub enum ThreadEvent {
     AssistantBegin {
+        generation: GenerationContext,
         turn: u32,
     },
     ToolCallBegin {
+        generation: GenerationContext,
         tool_use_id: String,
         name: String,
         args_preview: String,
@@ -295,6 +321,7 @@ pub enum ThreadEvent {
         args: serde_json::Value,
     },
     ToolCallEnd {
+        generation: GenerationContext,
         tool_use_id: String,
         result_preview: String,
         is_error: bool,
@@ -309,6 +336,7 @@ pub enum ThreadEvent {
         attachments: Vec<ImageSource>,
     },
     AssistantEnd {
+        generation: GenerationContext,
         stop_reason: Option<String>,
         usage: Usage,
     },
@@ -333,6 +361,35 @@ pub enum ThreadEvent {
 }
 
 impl Thread {
+    /// Participant currently driving the model/tool loop. Outside an active
+    /// generation, fall back to the compatibility responder.
+    pub fn active_participant_id(&self) -> &whisper_agent_protocol::ParticipantId {
+        match &self.internal {
+            ThreadInternalState::AwaitingModel { generation, .. }
+            | ThreadInternalState::AwaitingTools { generation, .. } => &generation.participant_id,
+            _ => &self.config.participants.default_responder,
+        }
+    }
+
+    pub fn scope_for(&self, participant_id: &whisper_agent_protocol::ParticipantId) -> &Scope {
+        self.config
+            .participant_profiles
+            .get(participant_id)
+            .map(|profile| &profile.scope)
+            .unwrap_or(&self.scope)
+    }
+
+    pub fn bindings_for(
+        &self,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> &ThreadBindings {
+        self.config
+            .participant_profiles
+            .get(participant_id)
+            .map(|profile| &profile.bindings)
+            .unwrap_or(&self.bindings)
+    }
+
     pub fn new(
         id: String,
         pod_id: String,
@@ -342,6 +399,7 @@ impl Thread {
         tool_surface: ToolSurface,
     ) -> Self {
         let now = Utc::now();
+        let driver_state = crate::runtime::driver::DriverState::for_config(&config.driver);
         Self {
             id,
             pod_id,
@@ -353,6 +411,8 @@ impl Thread {
             conversation: Conversation::new(),
             total_usage: Usage::default(),
             turn_log: TurnLog::default(),
+            driver_state,
+            effect_journal: Default::default(),
             turns_in_cycle: 0,
             scope,
             tool_surface,
@@ -399,6 +459,22 @@ impl Thread {
 
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
+    }
+
+    /// Import the pre-driver `turns_in_cycle` field after deserialization.
+    /// Idempotent so load paths can call it unconditionally.
+    pub fn migrate_legacy_driver_state(&mut self) {
+        crate::runtime::driver::import_legacy_turn_count(
+            &mut self.driver_state,
+            self.turns_in_cycle,
+        );
+        self.turns_in_cycle = 0;
+    }
+
+    fn record_completed_driver_effect(&mut self, effect: PersistedDriverEffect) {
+        let effect_id = self.effect_journal.record(effect);
+        let completed = self.effect_journal.complete(effect_id);
+        debug_assert!(completed);
     }
 
     /// Build a new thread by rewinding `self` to message index
@@ -462,6 +538,8 @@ impl Thread {
             conversation,
             total_usage,
             turn_log,
+            driver_state: crate::runtime::driver::DriverState::for_config(&self.config.driver),
+            effect_journal: Default::default(),
             turns_in_cycle: 0,
             scope: self.scope.clone(),
             tool_surface: self.tool_surface.clone(),
@@ -576,9 +654,11 @@ impl Thread {
                 blocks.push(a.into_content_block());
             }
             Message::user_blocks(blocks)
-        };
+        }
+        .with_author(self.config.participants.default_input.clone());
         self.conversation.push(msg);
-        self.turns_in_cycle = 0;
+        crate::runtime::driver::input_accepted(&self.config.driver, &mut self.driver_state)
+            .expect("thread driver config/state must match");
         // Fresh per-turn sticky-routing slot. A new user message marks
         // the boundary between turns in codex's vocabulary — replaying
         // a prior turn's `x-codex-turn-state` into the next turn would
@@ -597,10 +677,13 @@ impl Thread {
 
     /// Append a server-generated system reminder that should be
     /// consumed by the model as part of the current user cycle. Unlike
-    /// a real user message, this does not reset `turns_in_cycle`; it is
-    /// an agent sub-turn nudge, not a new user request.
+    /// a real user message, this does not reset the driver's turn counter;
+    /// it is an agent sub-turn nudge, not a new user request.
     pub fn submit_server_nudge(&mut self, text: String, pending_resources: Vec<String>) {
-        self.conversation.push(Message::system_text(text));
+        self.conversation.push(
+            Message::system_text(text)
+                .with_author(self.config.participants.default_responder.clone()),
+        );
         self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
         } else {
@@ -641,6 +724,15 @@ impl Thread {
     /// path on startup (would otherwise drop `AwaitingTools::completed`
     /// on the floor when marking the thread Failed).
     pub fn heal_to_idle(&mut self, reason: &str, events: &mut Vec<ThreadEvent>) -> Vec<String> {
+        if !matches!(
+            self.internal,
+            ThreadInternalState::Idle
+                | ThreadInternalState::Completed
+                | ThreadInternalState::Failed { .. }
+                | ThreadInternalState::Cancelled
+        ) {
+            self.effect_journal.interrupt_pending(reason);
+        }
         match &self.internal {
             ThreadInternalState::Idle
             | ThreadInternalState::Completed
@@ -660,6 +752,8 @@ impl Thread {
         // `pending_io`, and `completed`, then reinstate the state
         // below with `Idle`.
         let ThreadInternalState::AwaitingTools {
+            generation,
+            effect_id: _,
             pending_dispatch,
             pending_io,
             mut completed,
@@ -672,6 +766,7 @@ impl Thread {
         let synth_text = format!("tool call interrupted: {reason}");
         for req in pending_dispatch {
             events.push(ThreadEvent::ToolCallEnd {
+                generation: generation.clone(),
                 tool_use_id: req.tool_use_id.clone(),
                 result_preview: synth_text.clone(),
                 is_error: true,
@@ -686,6 +781,7 @@ impl Thread {
         }
         for (_op_id, tool_use_id) in pending_io {
             events.push(ThreadEvent::ToolCallEnd {
+                generation: generation.clone(),
                 tool_use_id: tool_use_id.clone(),
                 result_preview: synth_text.clone(),
                 is_error: true,
@@ -699,8 +795,11 @@ impl Thread {
             interrupted.push(tool_use_id);
         }
         if !completed.is_empty() {
-            self.conversation
-                .push(Message::tool_result_blocks(completed));
+            self.conversation.push(
+                Message::tool_result_blocks(completed)
+                    .with_author(generation.participant_id.clone())
+                    .with_run_id(generation.run_id),
+            );
         }
         self.touch();
         interrupted
@@ -713,8 +812,12 @@ impl Thread {
     /// clients and adapters can classify the append without content-
     /// block inspection.
     pub fn submit_tool_result_text(&mut self, text: String, pending_resources: Vec<String>) {
-        self.conversation.push(Message::tool_result_text(text));
-        self.turns_in_cycle = 0;
+        self.conversation.push(
+            Message::tool_result_text(text)
+                .with_author(self.config.participants.default_responder.clone()),
+        );
+        crate::runtime::driver::input_accepted(&self.config.driver, &mut self.driver_state)
+            .expect("thread driver config/state must match");
         self.internal = if pending_resources.is_empty() {
             ThreadInternalState::NeedsModelCall
         } else {
@@ -756,7 +859,13 @@ impl Thread {
     /// [`Self::synthesize_trailing_tool_results`] as defensive heal
     /// for any orphaned ToolUse a wedged state might leave behind.
     pub fn cancel(&mut self, events: &mut Vec<ThreadEvent>) {
-        if let ThreadInternalState::AwaitingTools { completed, .. } = &mut self.internal {
+        if let ThreadInternalState::AwaitingTools {
+            generation,
+            completed,
+            ..
+        } = &mut self.internal
+        {
+            let generation = generation.clone();
             let mut merged = std::mem::take(completed);
             let matched: std::collections::HashSet<String> = merged
                 .iter()
@@ -773,24 +882,36 @@ impl Thread {
                     if let ContentBlock::ToolUse { id, .. } = block
                         && !matched.contains(id)
                     {
-                        merged.push(synth_interrupted_tool_result(id, &synth_text, events));
+                        merged.push(synth_interrupted_tool_result(
+                            id,
+                            &synth_text,
+                            &generation,
+                            events,
+                        ));
                     }
                 }
             }
             if !merged.is_empty() {
-                self.conversation.push(Message::tool_result_blocks(merged));
+                self.conversation.push(
+                    Message::tool_result_blocks(merged)
+                        .with_author(generation.participant_id)
+                        .with_run_id(generation.run_id),
+                );
             }
         } else {
             self.synthesize_trailing_tool_results(CANCEL_REASON, events);
         }
+        self.effect_journal.interrupt_pending(CANCEL_REASON);
         self.internal = ThreadInternalState::Cancelled;
         self.touch();
     }
 
     pub fn fail(&mut self, phase: impl Into<String>, message: impl Into<String>) {
+        let message = message.into();
+        self.effect_journal.fail_pending(message.clone());
         self.internal = ThreadInternalState::Failed {
             at_phase: phase.into(),
-            message: message.into(),
+            message,
         };
         self.touch();
     }
@@ -836,11 +957,19 @@ impl Thread {
             return;
         }
         let synth_text = format!("tool call interrupted: {reason}");
+        let generation = GenerationContext {
+            run_id: last.run_id.clone().unwrap_or_default(),
+            participant_id: last.effective_author(),
+        };
         let blocks: Vec<ContentBlock> = pending_ids
             .iter()
-            .map(|id| synth_interrupted_tool_result(id, &synth_text, events))
+            .map(|id| synth_interrupted_tool_result(id, &synth_text, &generation, events))
             .collect();
-        self.conversation.push(Message::tool_result_blocks(blocks));
+        self.conversation.push(
+            Message::tool_result_blocks(blocks)
+                .with_author(generation.participant_id)
+                .with_run_id(generation.run_id),
+        );
     }
 
     /// Is the task accepting new user input right now?
@@ -879,24 +1008,73 @@ impl Thread {
                 StepOutcome::Paused
             }
             ThreadInternalState::NeedsModelCall => {
-                if self.turns_in_cycle >= self.config.max_turns {
-                    tracing::warn!(max_turns = self.config.max_turns, thread_id = %self.id, "max_turns reached");
-                    events.push(ThreadEvent::LoopComplete);
-                    self.internal = ThreadInternalState::Completed;
-                    self.touch();
-                    return StepOutcome::Continue;
+                let effect = crate::runtime::driver::next_effect(
+                    &self.config.driver,
+                    &mut self.driver_state,
+                    &self.config.participants,
+                    self.config.max_turns,
+                );
+                match effect {
+                    Ok(crate::runtime::driver::DriverEffect::RunAgent {
+                        participant_id,
+                        turn,
+                    }) => {
+                        let op_id = next_id(next_op_id);
+                        let generation = GenerationContext::new(
+                            uuid::Uuid::new_v4().to_string(),
+                            participant_id,
+                        );
+                        let effect_id =
+                            self.effect_journal.record(PersistedDriverEffect::RunAgent {
+                                generation: generation.clone(),
+                                turn,
+                            });
+                        events.push(ThreadEvent::AssistantBegin {
+                            generation: generation.clone(),
+                            turn,
+                        });
+                        self.internal = ThreadInternalState::AwaitingModel {
+                            op_id,
+                            started_at: Utc::now(),
+                            generation: generation.clone(),
+                            effect_id,
+                        };
+                        self.touch();
+                        StepOutcome::DispatchIo(IoRequest::ModelCall { op_id, generation })
+                    }
+                    Ok(crate::runtime::driver::DriverEffect::Finish) => {
+                        self.record_completed_driver_effect(PersistedDriverEffect::Finish {
+                            generation: None,
+                            reason: DriverFinishReason::TurnLimit,
+                        });
+                        tracing::warn!(
+                            max_turns = self.config.max_turns,
+                            thread_id = %self.id,
+                            "driver finished cycle at turn limit"
+                        );
+                        events.push(ThreadEvent::LoopComplete);
+                        self.internal = ThreadInternalState::Completed;
+                        self.touch();
+                        StepOutcome::Continue
+                    }
+                    Ok(other) => {
+                        let message = format!(
+                            "driver returned invalid effect at runnable boundary: {other:?}"
+                        );
+                        events.push(ThreadEvent::Error {
+                            message: message.clone(),
+                        });
+                        self.fail("driver", message);
+                        StepOutcome::Continue
+                    }
+                    Err(message) => {
+                        events.push(ThreadEvent::Error {
+                            message: message.clone(),
+                        });
+                        self.fail("driver", message);
+                        StepOutcome::Continue
+                    }
                 }
-                self.turns_in_cycle += 1;
-                events.push(ThreadEvent::AssistantBegin {
-                    turn: self.turns_in_cycle,
-                });
-                let op_id = next_id(next_op_id);
-                self.internal = ThreadInternalState::AwaitingModel {
-                    op_id,
-                    started_at: Utc::now(),
-                };
-                self.touch();
-                StepOutcome::DispatchIo(IoRequest::ModelCall { op_id })
             }
             ThreadInternalState::WaitingOnResources { .. }
             | ThreadInternalState::AwaitingModel { .. } => {
@@ -906,6 +1084,8 @@ impl Thread {
                 StepOutcome::Paused
             }
             ThreadInternalState::AwaitingTools {
+                generation,
+                effect_id,
                 mut pending_dispatch,
                 mut pending_io,
                 completed,
@@ -914,6 +1094,7 @@ impl Thread {
                     let op_id = next_id(next_op_id);
                     pending_io.insert(op_id, next.tool_use_id.clone());
                     events.push(ThreadEvent::ToolCallBegin {
+                        generation: generation.clone(),
                         tool_use_id: next.tool_use_id.clone(),
                         name: next.name.clone(),
                         args_preview: truncate(
@@ -924,11 +1105,14 @@ impl Thread {
                     });
                     let dispatch = IoRequest::ToolCall {
                         op_id,
+                        generation: generation.clone(),
                         tool_use_id: next.tool_use_id.clone(),
                         name: next.name.clone(),
                         input: next.input.clone(),
                     };
                     self.internal = ThreadInternalState::AwaitingTools {
+                        generation,
+                        effect_id,
                         pending_dispatch,
                         pending_io,
                         completed,
@@ -937,13 +1121,62 @@ impl Thread {
                     StepOutcome::DispatchIo(dispatch)
                 } else if pending_io.is_empty() {
                     // All tool calls done — append ToolResult blocks and loop back.
-                    self.conversation
-                        .push(Message::tool_result_blocks(completed));
-                    self.internal = ThreadInternalState::NeedsModelCall;
-                    self.touch();
-                    StepOutcome::Continue
+                    let generation_for_effect = generation.clone();
+                    let driver_effect = crate::runtime::driver::tools_completed(
+                        &self.config.driver,
+                        &self.driver_state,
+                        &generation.participant_id,
+                        &self.config.participants,
+                    );
+                    self.conversation.push(
+                        Message::tool_result_blocks(completed)
+                            .with_author(generation.participant_id)
+                            .with_run_id(generation.run_id),
+                    );
+                    if effect_id != 0 {
+                        let completed = self.effect_journal.complete(effect_id);
+                        debug_assert!(completed);
+                    }
+                    match driver_effect {
+                        Ok(crate::runtime::driver::DriverEffect::Continue) => {
+                            self.record_completed_driver_effect(PersistedDriverEffect::Continue {
+                                generation: generation_for_effect,
+                            });
+                            self.internal = ThreadInternalState::NeedsModelCall;
+                            self.touch();
+                            StepOutcome::Continue
+                        }
+                        Ok(crate::runtime::driver::DriverEffect::Finish) => {
+                            self.record_completed_driver_effect(PersistedDriverEffect::Finish {
+                                generation: Some(generation_for_effect),
+                                reason: DriverFinishReason::ToolsCompleted,
+                            });
+                            events.push(ThreadEvent::LoopComplete);
+                            self.internal = ThreadInternalState::Completed;
+                            self.touch();
+                            StepOutcome::Continue
+                        }
+                        Ok(other) => {
+                            let message =
+                                format!("driver returned invalid effect after tools: {other:?}");
+                            events.push(ThreadEvent::Error {
+                                message: message.clone(),
+                            });
+                            self.fail("driver", message);
+                            StepOutcome::Continue
+                        }
+                        Err(message) => {
+                            events.push(ThreadEvent::Error {
+                                message: message.clone(),
+                            });
+                            self.fail("driver", message);
+                            StepOutcome::Continue
+                        }
+                    }
                 } else {
                     self.internal = ThreadInternalState::AwaitingTools {
+                        generation,
+                        effect_id,
                         pending_dispatch,
                         pending_io,
                         completed,
@@ -990,11 +1223,20 @@ impl Thread {
         match (&self.internal, result) {
             (
                 ThreadInternalState::AwaitingModel {
-                    op_id: expected, ..
+                    op_id: expected,
+                    generation,
+                    effect_id,
+                    ..
                 },
                 IoResult::ModelCall(res),
             ) if *expected == op_id => match res {
-                Ok(response) => self.integrate_model_response(response, tool_annotations, events),
+                Ok(response) => self.integrate_model_response(
+                    response,
+                    generation.clone(),
+                    *effect_id,
+                    tool_annotations,
+                    events,
+                ),
                 Err(msg) => {
                     events.push(ThreadEvent::Error {
                         message: format!("model call failed: {msg}"),
@@ -1024,6 +1266,8 @@ impl Thread {
     fn integrate_model_response(
         &mut self,
         response: ModelResponse,
+        generation: GenerationContext,
+        run_effect_id: crate::runtime::driver::DriverEffectId,
         tool_annotations: &HashMap<String, ToolAnnotations>,
         events: &mut Vec<ThreadEvent>,
     ) {
@@ -1033,7 +1277,11 @@ impl Thread {
             usage,
         } = response;
         self.total_usage.add(&usage);
-        self.turn_log.entries.push(TurnEntry { usage });
+        self.turn_log.entries.push(TurnEntry {
+            run_id: generation.run_id.clone(),
+            participant_id: generation.participant_id.clone(),
+            usage,
+        });
         // Text and thinking blocks are NOT emitted as events here — the
         // scheduler's streaming consumer broadcasts them via
         // `ThreadAssistantTextDelta` / `ThreadAssistantReasoningDelta` during
@@ -1052,27 +1300,76 @@ impl Thread {
                 _ => None,
             })
             .collect();
-        events.push(ThreadEvent::AssistantEnd { stop_reason, usage });
-        self.conversation
-            .push(Message::assistant_blocks(assistant_blocks));
-
-        if tool_uses.is_empty() {
-            events.push(ThreadEvent::LoopComplete);
-            self.internal = ThreadInternalState::Completed;
-            return;
+        events.push(ThreadEvent::AssistantEnd {
+            generation: generation.clone(),
+            stop_reason,
+            usage,
+        });
+        self.conversation.push(
+            Message::assistant_blocks(assistant_blocks)
+                .with_author(generation.participant_id.clone())
+                .with_run_id(generation.run_id.clone()),
+        );
+        if run_effect_id != 0 {
+            let completed = self.effect_journal.complete(run_effect_id);
+            debug_assert!(completed);
         }
 
-        // Scope admission lives at the scheduler's Function registry
-        // (see `register_tool_function` in
-        // `src/runtime/scheduler/functions.rs`): denied calls arrive
-        // here as `is_error: true` tool_results, admitted calls run as
-        // ordinary tool IO.
-        let _ = tool_annotations;
-        self.internal = ThreadInternalState::AwaitingTools {
-            pending_dispatch: make_dispatch_order(tool_uses),
-            pending_io: HashMap::new(),
-            completed: Vec::new(),
-        };
+        let driver_effect = crate::runtime::driver::agent_completed(
+            &self.config.driver,
+            &self.driver_state,
+            &generation.participant_id,
+            &self.config.participants,
+            !tool_uses.is_empty(),
+        );
+        match driver_effect {
+            Ok(crate::runtime::driver::DriverEffect::Finish) => {
+                self.record_completed_driver_effect(PersistedDriverEffect::Finish {
+                    generation: Some(generation),
+                    reason: DriverFinishReason::AgentCompleted,
+                });
+                events.push(ThreadEvent::LoopComplete);
+                self.internal = ThreadInternalState::Completed;
+            }
+            Ok(crate::runtime::driver::DriverEffect::DispatchTools) => {
+                // Scope admission lives at the scheduler's Function registry
+                // (see `register_tool_function` in
+                // `src/runtime/scheduler/functions.rs`): denied calls arrive
+                // here as `is_error: true` tool_results, admitted calls run as
+                // ordinary tool IO.
+                let _ = tool_annotations;
+                let effect_id = self
+                    .effect_journal
+                    .record(PersistedDriverEffect::DispatchTools {
+                        generation: generation.clone(),
+                        tool_use_ids: tool_uses
+                            .iter()
+                            .map(|tool_use| tool_use.tool_use_id.clone())
+                            .collect(),
+                    });
+                self.internal = ThreadInternalState::AwaitingTools {
+                    generation,
+                    effect_id,
+                    pending_dispatch: make_dispatch_order(tool_uses),
+                    pending_io: HashMap::new(),
+                    completed: Vec::new(),
+                };
+            }
+            Ok(other) => {
+                let message =
+                    format!("driver returned invalid effect after agent completion: {other:?}");
+                events.push(ThreadEvent::Error {
+                    message: message.clone(),
+                });
+                self.fail("driver", message);
+            }
+            Err(message) => {
+                events.push(ThreadEvent::Error {
+                    message: message.clone(),
+                });
+                self.fail("driver", message);
+            }
+        }
     }
 
     fn integrate_tool_result(
@@ -1083,6 +1380,8 @@ impl Thread {
         events: &mut Vec<ThreadEvent>,
     ) {
         let ThreadInternalState::AwaitingTools {
+            generation,
+            effect_id,
             pending_dispatch,
             mut pending_io,
             mut completed,
@@ -1136,6 +1435,7 @@ impl Thread {
         // protocol stability.
         let attachments: Vec<ImageSource> = content.image_sources().into_iter().cloned().collect();
         events.push(ThreadEvent::ToolCallEnd {
+            generation: generation.clone(),
             tool_use_id: tool_use_id.clone(),
             result_preview: preview,
             is_error,
@@ -1155,6 +1455,8 @@ impl Thread {
         });
 
         self.internal = ThreadInternalState::AwaitingTools {
+            generation,
+            effect_id,
             pending_dispatch,
             pending_io,
             completed,
@@ -1330,13 +1632,102 @@ mod tests {
 
     fn base_config_for_fork() -> ThreadConfig {
         ThreadConfig {
+            participants: Default::default(),
+            driver: Default::default(),
             model: "test".into(),
             max_tokens: 100,
             max_turns: 10,
             compaction: Default::default(),
             autoquery: Default::default(),
             tunables: Default::default(),
+            participant_profiles: Default::default(),
         }
+    }
+
+    #[test]
+    fn legacy_cycle_counter_migrates_into_driver_state() {
+        let task = Thread::new(
+            "legacy-driver".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        let mut json = serde_json::to_value(task).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("driver_state");
+        object.remove("effect_journal");
+        object.insert("turns_in_cycle".into(), serde_json::json!(3));
+
+        let mut decoded: Thread = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.turns_in_cycle, 3);
+        assert_eq!(
+            crate::runtime::driver::turns_in_cycle(&decoded.driver_state),
+            0
+        );
+        assert!(decoded.effect_journal.records().is_empty());
+
+        decoded.migrate_legacy_driver_state();
+        assert_eq!(decoded.turns_in_cycle, 0);
+        assert_eq!(
+            crate::runtime::driver::turns_in_cycle(&decoded.driver_state),
+            3
+        );
+
+        let migrated = serde_json::to_value(decoded).unwrap();
+        assert!(migrated.get("turns_in_cycle").is_none());
+        assert_eq!(
+            migrated["driver_state"],
+            serde_json::json!({
+                "kind": "builtin_single_agent_chat",
+                "cycles_started": 0,
+                "turns_in_cycle": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn participant_profile_overrides_execution_scope_and_bindings() {
+        let mut task = Thread::new(
+            "profiled".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings {
+                backend: "default-backend".into(),
+                ..Default::default()
+            },
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        task.config.participant_profiles.insert(
+            "reviewer".into(),
+            whisper_agent_protocol::ParticipantExecutionProfile {
+                model: "review-model".into(),
+                max_tokens: 50,
+                system_prompt: "review".into(),
+                bindings: ThreadBindings {
+                    backend: "review-backend".into(),
+                    ..Default::default()
+                },
+                scope: Scope::deny_all(),
+                tool_surface: ToolSurface::default(),
+                tunables: Default::default(),
+                tools: Vec::new(),
+                context: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            task.bindings_for(&"reviewer".into()).backend,
+            "review-backend"
+        );
+        assert_eq!(
+            task.bindings_for(&"missing".into()).backend,
+            "default-backend"
+        );
+        assert_eq!(task.scope_for(&"reviewer".into()), &Scope::deny_all());
+        assert_eq!(task.scope_for(&"missing".into()), &Scope::allow_all());
     }
 
     fn thread_with_two_turns() -> Thread {
@@ -1361,6 +1752,8 @@ mod tests {
                 text: "hi again".into(),
             }]));
         task.turn_log.entries.push(TurnEntry {
+            run_id: Default::default(),
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into(),
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -1368,6 +1761,8 @@ mod tests {
             },
         });
         task.turn_log.entries.push(TurnEntry {
+            run_id: Default::default(),
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into(),
             usage: Usage {
                 input_tokens: 20,
                 output_tokens: 4,
@@ -1384,8 +1779,253 @@ mod tests {
     }
 
     #[test]
+    fn configured_participants_author_new_transcript_messages() {
+        let mut config = base_config_for_fork();
+        config.participants = whisper_agent_protocol::ThreadParticipants {
+            members: vec![
+                whisper_agent_protocol::ThreadParticipant {
+                    id: "human".into(),
+                    kind: whisper_agent_protocol::ThreadParticipantKind::Client,
+                    display_name: None,
+                },
+                whisper_agent_protocol::ThreadParticipant {
+                    id: "builder".into(),
+                    kind: whisper_agent_protocol::ThreadParticipantKind::Model,
+                    display_name: None,
+                },
+            ],
+            default_input: "human".into(),
+            default_responder: "builder".into(),
+        };
+        let mut task = Thread::new(
+            "authored".into(),
+            "pod".into(),
+            config,
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
+        assert_eq!(
+            task.conversation.messages()[0].effective_author().as_str(),
+            "human"
+        );
+
+        let mut events = Vec::new();
+        task.integrate_model_response(
+            ModelResponse {
+                content: vec![ContentBlock::Text {
+                    text: "response".into(),
+                }],
+                stop_reason: Some("end_turn".into()),
+                usage: Usage::default(),
+            },
+            GenerationContext::new("test-run", "builder"),
+            0,
+            &HashMap::new(),
+            &mut events,
+        );
+        assert_eq!(
+            task.conversation.messages()[1].effective_author().as_str(),
+            "builder"
+        );
+        assert_eq!(
+            task.conversation.messages()[1]
+                .run_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("test-run")
+        );
+        assert_eq!(task.turn_log.entries[0].participant_id.as_str(), "builder");
+        assert_eq!(task.turn_log.entries[0].run_id.as_str(), "test-run");
+    }
+
+    #[test]
+    fn model_dispatch_has_one_stable_participant_scoped_generation() {
+        let mut config = base_config_for_fork();
+        config.participants.members[1].id = "builder".into();
+        config.participants.default_responder = "builder".into();
+        let mut task = Thread::new(
+            "generated".into(),
+            "pod".into(),
+            config,
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
+
+        let mut next_op_id = 1;
+        let mut events = Vec::new();
+        let outcome = task.step(&mut next_op_id, &mut events);
+        let begin = events.iter().find_map(|event| match event {
+            ThreadEvent::AssistantBegin { generation, .. } => Some(generation),
+            _ => None,
+        });
+        let Some(begin) = begin else {
+            panic!("missing AssistantBegin")
+        };
+        let StepOutcome::DispatchIo(IoRequest::ModelCall { op_id, generation }) = outcome else {
+            panic!("expected model dispatch")
+        };
+
+        assert!(!generation.run_id.is_empty());
+        assert_eq!(generation.participant_id.as_str(), "builder");
+        assert_eq!(begin, &generation);
+        let ThreadInternalState::AwaitingModel {
+            generation: persisted,
+            effect_id,
+            ..
+        } = &task.internal
+        else {
+            panic!("expected AwaitingModel")
+        };
+        assert_eq!(persisted, &generation);
+        let record = &task.effect_journal.records()[0];
+        assert_eq!(record.id, *effect_id);
+        assert!(matches!(
+            &record.effect,
+            PersistedDriverEffect::RunAgent {
+                generation: recorded,
+                turn: 1,
+            } if recorded == &generation
+        ));
+        assert_eq!(
+            record.outcome,
+            crate::runtime::driver::DriverEffectOutcome::Pending
+        );
+
+        // The pending record and its internal-state link serialize before the
+        // lazy model future is polled by the scheduler.
+        let persisted_json = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            persisted_json["effect_journal"]["records"][0]["id"],
+            *effect_id
+        );
+        assert_eq!(persisted_json["internal"]["effect_id"], *effect_id);
+
+        task.apply_io_result(
+            op_id,
+            IoResult::ModelCall(Ok(ModelResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                stop_reason: Some("end_turn".into()),
+                usage: Usage::default(),
+            })),
+            &HashMap::new(),
+            &mut events,
+        );
+        assert!(matches!(task.internal, ThreadInternalState::Completed));
+        assert_eq!(task.effect_journal.records().len(), 2);
+        assert!(task.effect_journal.records().iter().all(|record| {
+            record.outcome == crate::runtime::driver::DriverEffectOutcome::Completed
+        }));
+        assert!(matches!(
+            task.effect_journal.records()[1].effect,
+            PersistedDriverEffect::Finish {
+                reason: DriverFinishReason::AgentCompleted,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_cycle_resolves_dispatch_effect_before_driver_continues() {
+        use crate::tools::mcp::McpContentBlock;
+
+        let mut task = Thread::new(
+            "journal-tools".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        task.submit_user_message("use a tool".into(), Vec::new(), Vec::new());
+        let mut next_op_id = 1;
+        let mut events = Vec::new();
+        let StepOutcome::DispatchIo(IoRequest::ModelCall { op_id, .. }) =
+            task.step(&mut next_op_id, &mut events)
+        else {
+            panic!("expected model dispatch")
+        };
+
+        task.apply_io_result(
+            op_id,
+            IoResult::ModelCall(Ok(ModelResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu-1".into(),
+                    name: "lookup".into(),
+                    input: serde_json::json!({ "q": "x" }),
+                    replay: None,
+                }],
+                stop_reason: Some("tool_use".into()),
+                usage: Usage::default(),
+            })),
+            &HashMap::new(),
+            &mut events,
+        );
+        let ThreadInternalState::AwaitingTools { effect_id, .. } = &task.internal else {
+            panic!("expected tool dispatch")
+        };
+        assert_eq!(
+            task.effect_journal.records()[0].outcome,
+            crate::runtime::driver::DriverEffectOutcome::Completed
+        );
+        assert_eq!(task.effect_journal.records()[1].id, *effect_id);
+        assert_eq!(
+            task.effect_journal.records()[1].outcome,
+            crate::runtime::driver::DriverEffectOutcome::Pending
+        );
+
+        let StepOutcome::DispatchIo(IoRequest::ToolCall {
+            op_id: tool_op_id,
+            tool_use_id,
+            ..
+        }) = task.step(&mut next_op_id, &mut events)
+        else {
+            panic!("expected tool call")
+        };
+        task.apply_io_result(
+            tool_op_id,
+            IoResult::ToolCall {
+                tool_use_id,
+                result: Ok(CallToolResult {
+                    content: vec![McpContentBlock::Text { text: "ok".into() }],
+                    is_error: false,
+                }),
+            },
+            &HashMap::new(),
+            &mut events,
+        );
+
+        assert!(matches!(
+            task.step(&mut next_op_id, &mut events),
+            StepOutcome::Continue
+        ));
+        assert!(matches!(task.internal, ThreadInternalState::NeedsModelCall));
+        assert_eq!(task.effect_journal.records().len(), 3);
+        assert!(task.effect_journal.records().iter().all(|record| {
+            record.outcome == crate::runtime::driver::DriverEffectOutcome::Completed
+        }));
+        assert!(matches!(
+            task.effect_journal.records()[1].effect,
+            PersistedDriverEffect::DispatchTools { .. }
+        ));
+        assert!(matches!(
+            task.effect_journal.records()[2].effect,
+            PersistedDriverEffect::Continue { .. }
+        ));
+    }
+
+    #[test]
     fn fork_from_prefix_keeps_first_turn() {
-        let src = thread_with_two_turns();
+        let mut src = thread_with_two_turns();
+        src.record_completed_driver_effect(PersistedDriverEffect::Finish {
+            generation: None,
+            reason: DriverFinishReason::AgentCompleted,
+        });
         let forked = src.fork_from("new".into(), 2).unwrap();
         // Prefix [user, assistant] survives; second user/assistant pair gone.
         assert_eq!(forked.conversation.len(), 2);
@@ -1394,7 +2034,11 @@ mod tests {
         assert_eq!(forked.total_usage.output_tokens, 2);
         assert_eq!(forked.id, "new");
         assert_eq!(forked.pod_id, "pod");
-        assert_eq!(forked.turns_in_cycle, 0);
+        assert!(forked.effect_journal.records().is_empty());
+        assert_eq!(
+            crate::runtime::driver::turns_in_cycle(&forked.driver_state),
+            0
+        );
         assert!(forked.title.is_none());
         // The draft is the client's unsaved typing buffer on the
         // source thread — not meaningful on the new thread. The
@@ -1489,6 +2133,8 @@ mod tests {
         task.conversation
             .push(Message::assistant_blocks(tool_use_blocks));
         task.internal = ThreadInternalState::AwaitingTools {
+            generation: GenerationContext::default(),
+            effect_id: 0,
             pending_dispatch,
             pending_io,
             completed,
@@ -1531,6 +2177,8 @@ mod tests {
         task.internal = ThreadInternalState::AwaitingModel {
             op_id: 42,
             started_at: Utc::now(),
+            generation: GenerationContext::default(),
+            effect_id: 0,
         };
         let interrupted = task.heal_to_idle("reset", &mut events);
         assert!(interrupted.is_empty());
@@ -1547,6 +2195,35 @@ mod tests {
 
         // Conversation untouched through all three flips.
         assert_eq!(task.conversation.messages().len(), 4);
+    }
+
+    #[test]
+    fn restart_healing_interrupts_a_durable_pending_effect() {
+        let mut task = Thread::new(
+            "restart-journal".into(),
+            "pod".into(),
+            base_config_for_fork(),
+            ThreadBindings::default(),
+            Scope::allow_all(),
+            ToolSurface::default(),
+        );
+        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
+        let mut next_op_id = 1;
+        let mut events = Vec::new();
+        assert!(matches!(
+            task.step(&mut next_op_id, &mut events),
+            StepOutcome::DispatchIo(IoRequest::ModelCall { .. })
+        ));
+        assert!(task.effect_journal.has_pending());
+
+        task.heal_to_idle("task was in-flight at last shutdown", &mut events);
+        assert!(matches!(task.internal, ThreadInternalState::Idle));
+        assert!(!task.effect_journal.has_pending());
+        assert!(matches!(
+            &task.effect_journal.records()[0].outcome,
+            crate::runtime::driver::DriverEffectOutcome::Interrupted { reason }
+                if reason == "task was in-flight at last shutdown"
+        ));
     }
 
     #[test]
@@ -1759,6 +2436,8 @@ mod tests {
         task.internal = ThreadInternalState::AwaitingModel {
             op_id: 1,
             started_at: Utc::now(),
+            generation: GenerationContext::default(),
+            effect_id: 0,
         };
         let before_len = task.conversation.messages().len();
         let mut events = Vec::new();

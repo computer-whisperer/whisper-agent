@@ -79,6 +79,8 @@ sealed class ServerToClient {
 
     data class AssistantBegin(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val turn: Int,
     ) : ServerToClient()
 
@@ -90,6 +92,8 @@ sealed class ServerToClient {
      */
     data class PrefillProgress(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val tokensProcessed: Int,
         val tokensTotal: Int,
     ) : ServerToClient()
@@ -105,6 +109,8 @@ sealed class ServerToClient {
      */
     data class OutputTokensProgress(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val outputTokens: Int,
     ) : ServerToClient()
 
@@ -117,6 +123,8 @@ sealed class ServerToClient {
      */
     data class ToolCallStreaming(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val toolUseId: String,
         val name: String,
         val argsChars: Int,
@@ -124,22 +132,30 @@ sealed class ServerToClient {
 
     data class AssistantTextDelta(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val delta: String,
     ) : ServerToClient()
 
     data class AssistantReasoningDelta(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val delta: String,
     ) : ServerToClient()
 
     data class AssistantEnd(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val stopReason: String? = null,
         val usage: Usage,
     ) : ServerToClient()
 
     data class ToolCallBegin(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val toolUseId: String,
         val name: String,
         val argsPreview: String,
@@ -148,6 +164,8 @@ sealed class ServerToClient {
 
     data class ToolCallEnd(
         val threadId: String,
+        val runId: String = "",
+        val participantId: String = "agent",
         val toolUseId: String,
         val resultPreview: String,
         val isError: Boolean,

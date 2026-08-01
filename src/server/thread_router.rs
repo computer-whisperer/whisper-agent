@@ -219,16 +219,19 @@ impl ThreadEventRouter {
     pub(crate) fn dispatch_events(&self, thread_id: &str, events: Vec<ThreadEvent>) {
         for event in events {
             match event {
-                ThreadEvent::AssistantBegin { turn } => {
+                ThreadEvent::AssistantBegin { generation, turn } => {
                     self.broadcast_to_subscribers(
                         thread_id,
                         ServerToClient::ThreadAssistantBegin {
                             thread_id: thread_id.to_string(),
+                            run_id: generation.run_id,
+                            participant_id: generation.participant_id,
                             turn,
                         },
                     );
                 }
                 ThreadEvent::ToolCallBegin {
+                    generation,
                     tool_use_id,
                     name,
                     args_preview,
@@ -238,6 +241,8 @@ impl ThreadEventRouter {
                         thread_id,
                         ServerToClient::ThreadToolCallBegin {
                             thread_id: thread_id.to_string(),
+                            run_id: generation.run_id,
+                            participant_id: generation.participant_id,
                             tool_use_id,
                             name,
                             args_preview,
@@ -246,6 +251,7 @@ impl ThreadEventRouter {
                     );
                 }
                 ThreadEvent::ToolCallEnd {
+                    generation,
                     tool_use_id,
                     result_preview,
                     is_error,
@@ -255,6 +261,8 @@ impl ThreadEventRouter {
                         thread_id,
                         ServerToClient::ThreadToolCallEnd {
                             thread_id: thread_id.to_string(),
+                            run_id: generation.run_id,
+                            participant_id: generation.participant_id,
                             tool_use_id,
                             result_preview,
                             is_error,
@@ -263,6 +271,7 @@ impl ThreadEventRouter {
                     );
                 }
                 ThreadEvent::AssistantEnd {
+                    generation: _,
                     stop_reason: _,
                     usage: _,
                 } => {

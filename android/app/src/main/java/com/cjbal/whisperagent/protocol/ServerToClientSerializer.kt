@@ -7,6 +7,7 @@ import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.descriptors.buildClassSerialDescriptor
 import kotlinx.serialization.encoding.CompositeDecoder
+import kotlinx.serialization.encoding.CompositeEncoder
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.encoding.decodeStructure
@@ -62,6 +63,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
     private const val IDX_TOKENS_TOTAL = 36
     private const val IDX_ARGS_CHARS = 37
     private const val IDX_OUTPUT_TOKENS = 38
+    private const val IDX_RUN_ID = 39
+    private const val IDX_PARTICIPANT_ID = 40
 
     private val tasksSerializer = ListSerializer(ThreadSummary.serializer())
     private val podsSerializer = ListSerializer(PodSummary.serializer())
@@ -109,6 +112,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         element("tokens_total", Int.serializer().descriptor, isOptional = true)
         element("args_chars", Int.serializer().descriptor, isOptional = true)
         element("output_tokens", Int.serializer().descriptor, isOptional = true)
+        element("run_id", String.serializer().descriptor, isOptional = true)
+        element("participant_id", String.serializer().descriptor, isOptional = true)
         // Note: `summary` (IDX_SUMMARY) is shared between ThreadCreated and
         // BehaviorCreated; `state` (IDX_STATE) is shared between
         // ThreadStateChanged and BehaviorStateChanged. The decode loop
@@ -116,6 +121,11 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
         // seen `type` field — serde's internally-tagged enum emits `type`
         // before the variant's struct fields, so by the time we hit a
         // shared key the type is known.
+    }
+
+    private fun CompositeEncoder.encodeGeneration(runId: String, participantId: String) {
+        if (runId.isNotEmpty()) encodeStringElement(descriptor, IDX_RUN_ID, runId)
+        encodeStringElement(descriptor, IDX_PARTICIPANT_ID, participantId)
     }
 
     override fun serialize(encoder: Encoder, value: ServerToClient) {
@@ -187,22 +197,26 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 is ServerToClient.AssistantBegin -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_begin")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeIntElement(descriptor, IDX_TURN, value.turn)
                 }
                 is ServerToClient.PrefillProgress -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_prefill_progress")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeIntElement(descriptor, IDX_TOKENS_PROCESSED, value.tokensProcessed)
                     encodeIntElement(descriptor, IDX_TOKENS_TOTAL, value.tokensTotal)
                 }
                 is ServerToClient.OutputTokensProgress -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_output_tokens_progress")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeIntElement(descriptor, IDX_OUTPUT_TOKENS, value.outputTokens)
                 }
                 is ServerToClient.ToolCallStreaming -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_tool_call_streaming")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeStringElement(descriptor, IDX_TOOL_USE_ID, value.toolUseId)
                     encodeStringElement(descriptor, IDX_NAME, value.name)
                     encodeIntElement(descriptor, IDX_ARGS_CHARS, value.argsChars)
@@ -210,16 +224,19 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 is ServerToClient.AssistantTextDelta -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_text_delta")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeStringElement(descriptor, IDX_DELTA, value.delta)
                 }
                 is ServerToClient.AssistantReasoningDelta -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_reasoning_delta")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeStringElement(descriptor, IDX_DELTA, value.delta)
                 }
                 is ServerToClient.AssistantEnd -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_assistant_end")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     value.stopReason?.let {
                         encodeStringElement(descriptor, IDX_STOP_REASON, it)
                     }
@@ -230,6 +247,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 is ServerToClient.ToolCallBegin -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_tool_call_begin")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeStringElement(descriptor, IDX_TOOL_USE_ID, value.toolUseId)
                     encodeStringElement(descriptor, IDX_NAME, value.name)
                     encodeStringElement(descriptor, IDX_ARGS_PREVIEW, value.argsPreview)
@@ -237,6 +255,7 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 is ServerToClient.ToolCallEnd -> {
                     encodeStringElement(descriptor, IDX_TYPE, "thread_tool_call_end")
                     encodeStringElement(descriptor, IDX_THREAD_ID, value.threadId)
+                    encodeGeneration(value.runId, value.participantId)
                     encodeStringElement(descriptor, IDX_TOOL_USE_ID, value.toolUseId)
                     encodeStringElement(descriptor, IDX_RESULT_PREVIEW, value.resultPreview)
                     encodeBooleanElement(descriptor, IDX_IS_ERROR, value.isError)
@@ -395,6 +414,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
             var tokensTotal: Int? = null
             var argsChars: Int? = null
             var outputTokens: Int? = null
+            var runId = ""
+            var participantId = "agent"
 
             loop@ while (true) {
                 when (val i = decodeElementIndex(descriptor)) {
@@ -479,6 +500,8 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                     IDX_TOKENS_TOTAL -> tokensTotal = decodeIntElement(descriptor, i)
                     IDX_ARGS_CHARS -> argsChars = decodeIntElement(descriptor, i)
                     IDX_OUTPUT_TOKENS -> outputTokens = decodeIntElement(descriptor, i)
+                    IDX_RUN_ID -> runId = decodeStringElement(descriptor, i)
+                    IDX_PARTICIPANT_ID -> participantId = decodeStringElement(descriptor, i)
                     else -> throw SerializationException("unexpected element index $i")
                 }
             }
@@ -524,44 +547,62 @@ object ServerToClientSerializer : KSerializer<ServerToClient> {
                 )
                 "thread_assistant_begin" -> ServerToClient.AssistantBegin(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     turn = requireNotNull(turn) { "missing turn" },
                 )
                 "thread_prefill_progress" -> ServerToClient.PrefillProgress(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     tokensProcessed = requireNotNull(tokensProcessed) { "missing tokens_processed" },
                     tokensTotal = requireNotNull(tokensTotal) { "missing tokens_total" },
                 )
                 "thread_output_tokens_progress" -> ServerToClient.OutputTokensProgress(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     outputTokens = requireNotNull(outputTokens) { "missing output_tokens" },
                 )
                 "thread_tool_call_streaming" -> ServerToClient.ToolCallStreaming(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
                     name = requireNotNull(name) { "missing name" },
                     argsChars = requireNotNull(argsChars) { "missing args_chars" },
                 )
                 "thread_assistant_text_delta" -> ServerToClient.AssistantTextDelta(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     delta = requireNotNull(delta) { "missing delta" },
                 )
                 "thread_assistant_reasoning_delta" -> ServerToClient.AssistantReasoningDelta(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     delta = requireNotNull(delta) { "missing delta" },
                 )
                 "thread_assistant_end" -> ServerToClient.AssistantEnd(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     stopReason = stopReason,
                     usage = requireNotNull(usage) { "missing usage" },
                 )
                 "thread_tool_call_begin" -> ServerToClient.ToolCallBegin(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
                     name = requireNotNull(name) { "missing name" },
                     argsPreview = requireNotNull(argsPreview) { "missing args_preview" },
                 )
                 "thread_tool_call_end" -> ServerToClient.ToolCallEnd(
                     threadId = requireNotNull(threadId) { "missing thread_id" },
+                    runId = runId,
+                    participantId = participantId,
                     toolUseId = requireNotNull(toolUseId) { "missing tool_use_id" },
                     resultPreview = requireNotNull(resultPreview) { "missing result_preview" },
                     isError = isError,

@@ -49,11 +49,48 @@ data class CompactionConfig(
 )
 
 @Serializable
+enum class ThreadParticipantKind {
+    @SerialName("client") Client,
+    @SerialName("model") Model,
+}
+
+@Serializable
+data class ThreadParticipant(
+    val id: String,
+    val kind: ThreadParticipantKind,
+    @SerialName("display_name") val displayName: String? = null,
+)
+
+@Serializable
+data class ThreadParticipants(
+    val members: List<ThreadParticipant> = listOf(
+        ThreadParticipant("user", ThreadParticipantKind.Client, "User"),
+        ThreadParticipant("agent", ThreadParticipantKind.Model, "Agent"),
+    ),
+    @SerialName("default_input") val defaultInput: String = "user",
+    @SerialName("default_responder") val defaultResponder: String = "agent",
+)
+
+@Serializable
 data class ThreadConfig(
+    val participants: ThreadParticipants = ThreadParticipants(),
     val model: String = "",
     @SerialName("max_tokens") val maxTokens: Int = 0,
     @SerialName("max_turns") val maxTurns: Int = 0,
     val compaction: CompactionConfig = CompactionConfig(),
+    @SerialName("participant_profiles")
+    val participantProfiles: Map<String, ParticipantExecutionProfile> = emptyMap(),
+)
+
+/** Resolved provider setup for one model participant. Additional setup fields
+ * (scope, tool surface, schemas, scripted context) are intentionally skipped by
+ * the mobile client until it has UI for inspecting them. */
+@Serializable
+data class ParticipantExecutionProfile(
+    val model: String = "",
+    @SerialName("max_tokens") val maxTokens: Int = 0,
+    @SerialName("system_prompt") val systemPrompt: String = "",
+    val bindings: ThreadBindings = ThreadBindings(),
 )
 
 /**
@@ -87,7 +124,11 @@ data class ThreadBindings(
 )
 
 @Serializable
-data class TurnEntry(val usage: Usage)
+data class TurnEntry(
+    @SerialName("run_id") val runId: String = "",
+    @SerialName("participant_id") val participantId: String = "agent",
+    val usage: Usage,
+)
 
 @Serializable
 data class TurnLog(val entries: List<TurnEntry> = emptyList())

@@ -692,6 +692,7 @@ impl Scheduler {
         use super::ToolRoute;
         let crate::runtime::thread::IoRequest::ToolCall {
             op_id,
+            generation,
             tool_use_id,
             name,
             input,
@@ -702,7 +703,9 @@ impl Scheduler {
             return;
         };
 
-        let Some(disposition) = self.tool_disposition(thread_id, &name) else {
+        let Some(disposition) =
+            self.tool_disposition_for(thread_id, &generation.participant_id, &name)
+        else {
             // Unknown thread — defensive; upstream route_tool checks
             // will surface the error.
             let fut = crate::runtime::io_dispatch::build_io_future(
@@ -851,7 +854,7 @@ impl Scheduler {
             return;
         }
 
-        let spec = match self.route_tool(thread_id, &name) {
+        let spec = match self.route_tool_for(thread_id, &generation.participant_id, &name) {
             Some(ToolRoute::Builtin { .. }) => Function::BuiltinToolCall {
                 name: name.clone(),
                 args: input.clone(),
@@ -949,7 +952,7 @@ impl Scheduler {
         let dispatch_admitted = self
             .tasks
             .get(parent_thread_id)
-            .map(|t| t.scope.dispatch)
+            .map(|task| task.scope_for(task.active_participant_id()).dispatch)
             .unwrap_or(crate::permission::DispatchCap::None)
             != crate::permission::DispatchCap::None;
         if !dispatch_admitted {
@@ -2484,7 +2487,13 @@ impl Scheduler {
                 if matches!(decision, crate::permission::SudoDecision::ApproveRemember)
                     && let Some(task) = self.tasks.get_mut(&thread_id)
                 {
-                    task.scope.tools.set_allow(tool_name.clone());
+                    let participant_id = task.active_participant_id().clone();
+                    if let Some(profile) = task.config.participant_profiles.get_mut(&participant_id)
+                    {
+                        profile.scope.tools.set_allow(tool_name.clone());
+                    } else {
+                        task.scope.tools.set_allow(tool_name.clone());
+                    }
                     let snapshot = task.snapshot();
                     self.mark_dirty(&thread_id);
                     self.router.broadcast_to_subscribers(
@@ -2840,6 +2849,9 @@ impl Scheduler {
             .filter_map(|(id, task)| match task.scope.escalation {
                 crate::permission::Escalation::Interactive { via_conn } if via_conn == dropped => {
                     task.scope.escalation = crate::permission::Escalation::None;
+                    for profile in task.config.participant_profiles.values_mut() {
+                        profile.scope.escalation = crate::permission::Escalation::None;
+                    }
                     Some(id.clone())
                 }
                 _ => None,
@@ -2903,6 +2915,10 @@ impl Scheduler {
             return;
         }
         task.scope.escalation = crate::permission::Escalation::Interactive { via_conn: conn_id };
+        for profile in task.config.participant_profiles.values_mut() {
+            profile.scope.escalation =
+                crate::permission::Escalation::Interactive { via_conn: conn_id };
+        }
         self.mark_dirty(thread_id);
     }
 
@@ -2912,13 +2928,18 @@ impl Scheduler {
     /// route_tool surfaces the error. Consults the thread's snapshot
     /// `Scope.tools`; pod-file edits don't retroactively change a
     /// thread's active scope.
-    pub(super) fn tool_disposition(
+    pub(super) fn tool_disposition_for(
         &self,
         thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
         name: &str,
     ) -> Option<crate::permission::Disposition> {
         let task = self.tasks.get(thread_id)?;
-        Some(task.scope.tools.disposition(&name.to_string()))
+        Some(
+            task.scope_for(participant_id)
+                .tools
+                .disposition(&name.to_string()),
+        )
     }
 
     /// Complete the tool-call Function for `(thread_id, tool_use_id)`

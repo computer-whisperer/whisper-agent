@@ -1309,6 +1309,8 @@ fn build_app(scene: Scene) -> Box<dyn App> {
                 }));
                 q.push_back(InboundEvent::Wire(ServerToClient::ThreadPrefillProgress {
                     thread_id: "t-1".into(),
+                    run_id: "scene-run".into(),
+                    participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into(),
                     tokens_processed: 4231,
                     tokens_total: 8192,
                 }));
@@ -2636,6 +2638,8 @@ fn mock_snapshot() -> ThreadSnapshot {
          enough that I can scan it.",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![
             ContentBlock::Thinking {
@@ -2680,12 +2684,15 @@ fn mock_snapshot() -> ThreadSnapshot {
         pod_id: "default".into(),
         title: Some("first conversation".into()),
         config: ThreadConfig {
+            participants: Default::default(),
+            driver: Default::default(),
             model: "claude-opus-4-7".into(),
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
             tunables: Default::default(),
+            participant_profiles: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride
@@ -2823,12 +2830,15 @@ fn base_snapshot(
         pod_id: "default".into(),
         title: Some("first conversation".into()),
         config: ThreadConfig {
+            participants: Default::default(),
+            driver: Default::default(),
             model: "claude-opus-4-7".into(),
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
             tunables: Default::default(),
+            participant_profiles: Default::default(),
         },
         bindings: ThreadBindings::default(),
         state,
@@ -2856,6 +2866,8 @@ fn mock_image_snapshot() -> ThreadSnapshot {
     let mut conv = Conversation::new();
     conv.push(Message::system_text(""));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::User,
         content: vec![
             ContentBlock::Text {
@@ -2879,6 +2891,8 @@ fn mock_image_snapshot() -> ThreadSnapshot {
         ],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text {
@@ -2923,6 +2937,8 @@ fn mock_setup_snapshot() -> ThreadSnapshot {
          no more than two sentences.",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Tools,
         content: vec![
             ContentBlock::ToolSchema {
@@ -2961,6 +2977,8 @@ fn mock_setup_snapshot() -> ThreadSnapshot {
         "Quick sanity check — do you see the system prompt I just loaded?",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "Yes — it's the Mavis prompt that scopes responses to literal reads of code,\
@@ -2973,6 +2991,8 @@ fn mock_setup_snapshot() -> ThreadSnapshot {
     // the assistant message in the rendered scene.
     snapshot.turn_log = TurnLog {
         entries: vec![TurnEntry {
+            run_id: "scene-run".into(),
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into(),
             usage: Usage {
                 input_tokens: 1284,
                 output_tokens: 86,
@@ -2998,6 +3018,8 @@ fn mock_diff_snapshot() -> ThreadSnapshot {
          a tiny module-level docs file alongside it.",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text {
@@ -3028,6 +3050,8 @@ fn mock_diff_snapshot() -> ThreadSnapshot {
         ],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::ToolResult,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-edit-001".into(),
@@ -3036,6 +3060,8 @@ fn mock_diff_snapshot() -> ThreadSnapshot {
         }],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "tool-write-001".into(),
@@ -3050,6 +3076,8 @@ fn mock_diff_snapshot() -> ThreadSnapshot {
         }],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::ToolResult,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-write-001".into(),
@@ -3073,6 +3101,8 @@ fn mock_failure_snapshot() -> ThreadSnapshot {
         "Run `validate_release` against the candidate tag and report the diff.",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "Pulling the candidate tag and validating now.".into(),
@@ -3120,6 +3150,8 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         "List the files in /sandbox/buckets and grep them for 'TODO'.",
     ));
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text {
@@ -3137,6 +3169,8 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         ],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::ToolResult,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-call-001".into(),
@@ -3147,6 +3181,8 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         }],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "tool-call-002".into(),
@@ -3159,6 +3195,8 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         }],
     });
     conv.push(Message {
+        author: None,
+        run_id: None,
         role: Role::ToolResult,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-call-002".into(),
@@ -3174,12 +3212,15 @@ fn mock_tool_snapshot() -> ThreadSnapshot {
         pod_id: "default".into(),
         title: Some("first conversation".into()),
         config: ThreadConfig {
+            participants: Default::default(),
+            driver: Default::default(),
             model: "claude-opus-4-7".into(),
             max_tokens: 4096,
             max_turns: 8,
             compaction: CompactionConfig::default(),
             autoquery: Default::default(),
             tunables: Default::default(),
+            participant_profiles: Default::default(),
         },
         // Seed a backend so the thread-header `backend/model` chip
         // exercises the populated branch in dump scenes that ride

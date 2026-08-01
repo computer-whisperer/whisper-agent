@@ -271,6 +271,35 @@ impl Scheduler {
         // MCPs, but the registry sees a fresh user) and the usual
         // `ThreadCreated` broadcast fires.
         let config_override = Some(ThreadConfigOverride {
+            // Carry the participant registry verbatim. The compatibility
+            // driver will invoke the same default responder, while future
+            // scripted drivers retain the full topology across derivation.
+            participants: Some(old_config.participants.clone()),
+            driver: Some(old_config.driver.clone()),
+            participant_profiles: (!old_config.participant_profiles.is_empty()).then(|| {
+                old_config
+                    .participant_profiles
+                    .iter()
+                    .map(|(participant_id, profile)| {
+                        (
+                            participant_id.clone(),
+                            whisper_agent_protocol::ParticipantExecutionProfileRequest {
+                                model: Some(profile.model.clone()),
+                                max_tokens: Some(profile.max_tokens),
+                                system_prompt: Some(
+                                    whisper_agent_protocol::SystemPromptChoice::Text {
+                                        text: profile.system_prompt.clone(),
+                                    },
+                                ),
+                                bindings: super::bindings_request_from_resolved(&profile.bindings),
+                                scope: Some(profile.scope.clone()),
+                                tool_surface: Some(profile.tool_surface.clone()),
+                                tunables: profile.tunables.clone(),
+                            },
+                        )
+                    })
+                    .collect()
+            }),
             model: Some(old_config.model.clone()),
             max_tokens: Some(old_config.max_tokens),
             max_turns: Some(old_config.max_turns),
@@ -381,6 +410,47 @@ impl Scheduler {
             }
             for msg in tail {
                 new_task.conversation.push(msg);
+            }
+            // Keep the normalized profiles aligned with the verbatim setup
+            // snapshot above. Legacy parents have no profile map, so derive
+            // the compatibility responder's fields from the copied prefix;
+            // additional participants inherit their already-frozen private
+            // setup from the parent profile.
+            let default_responder = new_task.config.participants.default_responder.clone();
+            let default_system_prompt = new_task.conversation.system_prompt_text().to_string();
+            let default_tools: Vec<_> = new_task
+                .conversation
+                .tool_schemas()
+                .map(|tool| whisper_agent_protocol::ToolSchema {
+                    name: tool.name.to_string(),
+                    description: tool.description.to_string(),
+                    params: tool.params.to_vec(),
+                    kind: tool.kind,
+                })
+                .collect();
+            let context_start = new_task.conversation.setup_prefix_end();
+            let context_end = new_task.conversation.initial_context_end();
+            let default_context =
+                new_task.conversation.messages()[context_start..context_end].to_vec();
+            if let Some(profile) = new_task
+                .config
+                .participant_profiles
+                .get_mut(&default_responder)
+            {
+                profile.system_prompt = default_system_prompt;
+                profile.tools = default_tools;
+                profile.context = default_context;
+            }
+            for (participant_id, old_profile) in &old_config.participant_profiles {
+                if participant_id == &default_responder {
+                    continue;
+                }
+                if let Some(profile) = new_task.config.participant_profiles.get_mut(participant_id)
+                {
+                    profile.system_prompt = old_profile.system_prompt.clone();
+                    profile.tools = old_profile.tools.clone();
+                    profile.context = old_profile.context.clone();
+                }
             }
         }
         self.mark_dirty(&new_thread_id);

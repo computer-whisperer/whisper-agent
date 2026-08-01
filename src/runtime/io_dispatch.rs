@@ -558,18 +558,35 @@ pub(crate) fn build_io_future(
     req: IoRequest,
 ) -> SchedulerFuture {
     match req {
-        IoRequest::ModelCall { op_id } => model_call(scheduler, thread_id, op_id),
+        IoRequest::ModelCall { op_id, generation } => {
+            model_call(scheduler, thread_id, op_id, generation)
+        }
         IoRequest::ToolCall {
             op_id,
+            generation,
             tool_use_id,
             name,
             input,
-        } => tool_call(scheduler, thread_id, op_id, tool_use_id, name, input),
+        } => tool_call(
+            scheduler,
+            thread_id,
+            op_id,
+            generation,
+            tool_use_id,
+            name,
+            input,
+        ),
     }
 }
 
-fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> SchedulerFuture {
-    let (owned_req, model_name, backend_name) = build_model_request(scheduler, &thread_id);
+fn model_call(
+    scheduler: &Scheduler,
+    thread_id: String,
+    op_id: OpId,
+    generation: whisper_agent_protocol::GenerationContext,
+) -> SchedulerFuture {
+    let (owned_req, model_name, backend_name) =
+        build_model_request(scheduler, &thread_id, &generation);
     let provider = match scheduler.backend(&backend_name) {
         Some(entry) => entry.provider.clone(),
         None => {
@@ -593,8 +610,18 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
     let forensic_sink = scheduler.forensic_sink();
     let cancel = scheduler.cancel_token_or_default(&thread_id);
     Box::pin(async move {
-        debug!(%thread_id, op_id, backend = %backend_name, model = %model_name, "dispatching streaming model call");
+        debug!(
+            %thread_id,
+            op_id,
+            run_id = %generation.run_id,
+            participant_id = %generation.participant_id,
+            backend = %backend_name,
+            model = %model_name,
+            "dispatching streaming model call"
+        );
         let req = ModelRequest {
+            run_id: owned_req.run_id.as_str(),
+            participant_id: owned_req.participant_id.as_str(),
             model: &owned_req.model,
             max_tokens: owned_req.max_tokens,
             system_prompt: &owned_req.system_prompt,
@@ -611,6 +638,7 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
             provider.as_ref(),
             &req,
             &thread_id,
+            &generation,
             &backend_name,
             &stream_tx,
             &usage_tx,
@@ -629,6 +657,8 @@ fn model_call(scheduler: &Scheduler, thread_id: String, op_id: OpId) -> Schedule
                 tracing::warn!(
                     %thread_id,
                     op_id,
+                    run_id = %generation.run_id,
+                    participant_id = %generation.participant_id,
                     backend = %backend_name,
                     model = %model_name,
                     error.code = detail.code.as_deref().unwrap_or(""),
@@ -681,6 +711,7 @@ async fn stream_with_retry(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
+    generation: &whisper_agent_protocol::GenerationContext,
     backend_name: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
     usage_tx: &tokio::sync::mpsc::UnboundedSender<BackendUsageUpdate>,
@@ -696,6 +727,7 @@ async fn stream_with_retry(
             provider,
             req,
             thread_id,
+            generation,
             backend_name,
             stream_tx,
             usage_tx,
@@ -793,6 +825,7 @@ async fn consume_stream(
     provider: &dyn crate::providers::model::ModelProvider,
     req: &ModelRequest<'_>,
     thread_id: &str,
+    generation: &whisper_agent_protocol::GenerationContext,
     backend_name: &str,
     stream_tx: &tokio::sync::mpsc::UnboundedSender<StreamUpdate>,
     usage_tx: &tokio::sync::mpsc::UnboundedSender<BackendUsageUpdate>,
@@ -808,6 +841,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadAssistantTextDelta {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         delta: text,
                     },
                 });
@@ -818,6 +853,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadAssistantReasoningDelta {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         delta: text,
                     },
                 });
@@ -833,6 +870,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadAssistantImage {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         source,
                     },
                 });
@@ -859,6 +898,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadToolCallStreaming {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         tool_use_id: id,
                         name,
                         args_chars,
@@ -913,6 +954,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadPrefillProgress {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         tokens_processed,
                         tokens_total,
                     },
@@ -929,6 +972,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadOutputTokensProgress {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         output_tokens,
                     },
                 });
@@ -964,6 +1009,8 @@ async fn consume_stream(
                     thread_id: thread_id.to_string(),
                     event: ServerToClient::ThreadAssistantEnd {
                         thread_id: thread_id.to_string(),
+                        run_id: generation.run_id.clone(),
+                        participant_id: generation.participant_id.clone(),
                         stop_reason: stop_reason.clone(),
                         usage,
                     },
@@ -993,13 +1040,14 @@ fn tool_call(
     scheduler: &Scheduler,
     thread_id: String,
     op_id: OpId,
+    generation: whisper_agent_protocol::GenerationContext,
     tool_use_id: String,
     name: String,
     input: serde_json::Value,
 ) -> SchedulerFuture {
     use crate::runtime::scheduler::ToolRoute;
     let cancel = scheduler.cancel_token_or_default(&thread_id);
-    match scheduler.route_tool(&thread_id, &name) {
+    match scheduler.route_tool_for(&thread_id, &generation.participant_id, &name) {
         Some(ToolRoute::Builtin { pod_id }) => {
             // Snapshot pod dir + config now while we have the sync
             // borrow. If the pod has vanished between route_tool and
@@ -1127,6 +1175,8 @@ fn tool_call(
                                         thread_id: stream_thread_id.clone(),
                                         event: ServerToClient::ThreadToolCallContent {
                                             thread_id: stream_thread_id.clone(),
+                                            run_id: generation.run_id.clone(),
+                                            participant_id: generation.participant_id.clone(),
                                             tool_use_id: stream_tool_use_id.clone(),
                                             block: wire_block,
                                         },
@@ -1267,6 +1317,8 @@ fn tool_call(
 /// Owned-by-value model request payload — the dispatched future outlives the
 /// scheduler borrow that produced it, so it can't hold references back.
 struct OwnedModelRequest {
+    run_id: whisper_agent_protocol::GenerationRunId,
+    participant_id: whisper_agent_protocol::ParticipantId,
     model: String,
     max_tokens: u32,
     system_prompt: String,
@@ -1275,8 +1327,9 @@ struct OwnedModelRequest {
     cache_breakpoints: Vec<CacheBreakpoint>,
     tunables: BTreeMap<String, TunableValue>,
     /// Per-thread routing-affinity key — surfaced to providers as
-    /// [`ModelRequest::request_cache_key`]. Sourced from `thread_id`
-    /// so every request for the same thread shares it.
+    /// [`ModelRequest::request_cache_key`]. The compatibility participant
+    /// retains the historical thread id; additional participants receive a
+    /// stable participant-qualified key.
     request_cache_key: String,
     /// Server-process lifetime identifier. Surfaced to providers as
     /// [`ModelRequest::session_id`]. Cloned from the scheduler's
@@ -1298,46 +1351,95 @@ struct OwnedModelRequest {
 fn build_model_request(
     scheduler: &Scheduler,
     thread_id: &str,
+    generation: &whisper_agent_protocol::GenerationContext,
 ) -> (OwnedModelRequest, String, String) {
     let task = scheduler.task(thread_id).expect("task exists");
+    let participant_id = generation.participant_id.clone();
+    let profile = task.config.participant_profiles.get(&participant_id);
     // System prompt + tool manifest live at the head of the
     // conversation (captured there at thread creation / MCP-rebind
     // time). Adapters keep their existing `req.system_prompt` +
     // `req.tools` expectations — we just source those fields from
     // the conversation here instead of a parallel config slot.
-    let system_prompt = task.conversation.system_prompt_text().to_string();
-    let tools: Vec<ToolSpec> = task
-        .conversation
-        .tool_schemas()
-        .map(|t| ToolSpec {
-            name: t.name.to_string(),
-            description: t.description.to_string(),
-            params: t.params.to_vec(),
-            kind: t.kind,
-        })
-        .collect();
-    let setup_end = task.conversation.setup_prefix_end();
-    let messages = task.conversation.messages()[setup_end..].to_vec();
-    let backend_name = task.bindings.backend.clone();
+    let system_prompt = profile
+        .map(|profile| profile.system_prompt.clone())
+        .unwrap_or_else(|| task.conversation.system_prompt_text().to_string());
+    let tools: Vec<ToolSpec> = match profile {
+        Some(profile) => profile
+            .tools
+            .iter()
+            .map(|tool| ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                params: tool.params.clone(),
+                kind: tool.kind,
+            })
+            .collect(),
+        None => task
+            .conversation
+            .tool_schemas()
+            .map(|tool| ToolSpec {
+                name: tool.name.to_string(),
+                description: tool.description.to_string(),
+                params: tool.params.to_vec(),
+                kind: tool.kind,
+            })
+            .collect(),
+    };
+    let mut messages = task.conversation.project_body_for(&participant_id);
+    if let Some(profile) = profile {
+        // The shared transcript retains the compatibility participant's
+        // rendered listing/memory prefix for clients and old readers. Replace
+        // those leading setup effects with this participant's frozen context.
+        let lifted = task
+            .conversation
+            .initial_context_end()
+            .saturating_sub(task.conversation.setup_prefix_end())
+            .min(messages.len());
+        messages.drain(..lifted);
+        let mut participant_messages = profile.context.clone();
+        participant_messages.extend(messages);
+        messages = participant_messages;
+    }
+    let backend_name = profile
+        .map(|profile| profile.bindings.backend.clone())
+        .unwrap_or_else(|| task.bindings.backend.clone());
     // Empty task.config.model → consult the backend's default_model. If that's
     // also None (common for single-model local endpoints), pass empty through.
-    let model = if task.config.model.is_empty() {
+    let configured_model = profile
+        .map(|profile| profile.model.as_str())
+        .unwrap_or(task.config.model.as_str());
+    let model = if configured_model.is_empty() {
         scheduler
             .backend(&backend_name)
             .and_then(|e| e.default_model.clone())
             .unwrap_or_default()
     } else {
-        task.config.model.clone()
+        configured_model.to_string()
     };
-    let max_tokens = task.config.max_tokens;
+    let max_tokens = profile
+        .map(|profile| profile.max_tokens)
+        .unwrap_or(task.config.max_tokens);
     let cache_breakpoints = default_cache_policy(&messages);
-    let tunables = task.config.tunables.clone();
-    let request_cache_key = thread_id.to_string();
+    let tunables = profile
+        .map(|profile| profile.tunables.clone())
+        .unwrap_or_else(|| task.config.tunables.clone());
+    // Preserve the historical key for the compatibility responder. Once a
+    // thread invokes additional participants, suffix their id so distinct
+    // per-participant projections cannot collide in provider cache routing.
+    let request_cache_key =
+        if participant_id.as_str() == whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID {
+            thread_id.to_string()
+        } else {
+            format!("{thread_id}:{}", participant_id.as_str())
+        };
     let session_id = scheduler.session_id().to_string();
     let installation_id = scheduler.installation_id().to_string();
     let turn_routing_token = std::sync::Arc::clone(&task.turn_routing_token);
     (
         OwnedModelRequest {
+            run_id: generation.run_id.clone(),
+            participant_id,
             model: model.clone(),
             max_tokens,
             system_prompt,

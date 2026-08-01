@@ -325,6 +325,8 @@ mod tests {
 
     fn user_image_msg(bytes: &[u8], mime: ImageMime) -> Message {
         Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![ContentBlock::Image {
                 source: ImageSource::Bytes {
@@ -370,6 +372,8 @@ mod tests {
         conv.push(user_image_msg(b"u1-img", ImageMime::Png));
         // Assistant emits an image during this turn (no further user msg).
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::Assistant,
             content: vec![ContentBlock::Image {
                 source: ImageSource::Bytes {
@@ -410,6 +414,8 @@ mod tests {
     fn url_source_images_skipped() {
         let mut conv = Conversation::new();
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::User,
             content: vec![ContentBlock::Image {
                 source: ImageSource::Url {
@@ -425,6 +431,8 @@ mod tests {
     fn tool_result_images_classified_as_tool_result() {
         let mut conv = Conversation::new();
         conv.push(Message {
+            author: None,
+            run_id: None,
             role: Role::Assistant,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "tu_1".into(),

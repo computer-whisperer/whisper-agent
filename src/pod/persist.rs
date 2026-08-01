@@ -1048,12 +1048,15 @@ mod tests {
 
     fn sample_task(id: &str) -> Thread {
         let cfg = ThreadConfig {
+            participants: Default::default(),
+            driver: Default::default(),
             model: "claude-opus-4-7".into(),
             max_tokens: 8000,
             max_turns: 50,
             compaction: Default::default(),
             autoquery: Default::default(),
             tunables: Default::default(),
+            participant_profiles: Default::default(),
         };
         let bindings = ThreadBindings {
             backend: "anthropic".into(),
@@ -1100,6 +1103,39 @@ mod tests {
         assert_eq!(loaded.pods.len(), 1);
         assert_eq!(loaded.pods[0].id, "t-rt");
         assert!(loaded.pods[0].threads.contains("t-rt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_interrupts_journaled_effect_that_was_in_flight_at_shutdown() {
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        let mut task = sample_task("t-effect-restart");
+        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
+        let mut next_op_id = 1;
+        let mut events = Vec::new();
+        assert!(matches!(
+            task.step(&mut next_op_id, &mut events),
+            crate::runtime::thread::StepOutcome::DispatchIo(
+                crate::runtime::thread::IoRequest::ModelCall { .. }
+            )
+        ));
+        assert!(task.effect_journal.has_pending());
+        p.flush(&task).await.unwrap();
+
+        let loaded = p.load_all().await.unwrap();
+        assert_eq!(loaded.threads.len(), 1);
+        let resumed = &loaded.threads[0];
+        assert!(matches!(
+            &resumed.internal,
+            ThreadInternalState::Failed { at_phase, .. } if at_phase == "resume"
+        ));
+        assert!(!resumed.effect_journal.has_pending());
+        assert!(matches!(
+            &resumed.effect_journal.records()[0].outcome,
+            crate::runtime::driver::DriverEffectOutcome::Interrupted { reason }
+                if reason == "task was in-flight at last shutdown"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

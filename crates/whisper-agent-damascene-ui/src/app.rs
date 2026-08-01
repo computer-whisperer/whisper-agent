@@ -4071,6 +4071,7 @@ impl ChatApp {
                 thread_id,
                 tokens_processed,
                 tokens_total,
+                ..
             } => {
                 self.prefill
                     .insert(thread_id, (tokens_processed, tokens_total));
@@ -4093,6 +4094,7 @@ impl ChatApp {
             ServerToClient::ThreadOutputTokensProgress {
                 thread_id,
                 output_tokens,
+                ..
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id)
                     && view.streaming_active
@@ -4148,7 +4150,9 @@ impl ChatApp {
                     view.next_msg_index += 1;
                 }
             }
-            ServerToClient::ThreadAssistantTextDelta { thread_id, delta } => {
+            ServerToClient::ThreadAssistantTextDelta {
+                thread_id, delta, ..
+            } => {
                 // First delta clears the prefill indicator — the
                 // protocol guarantees prefill events stop once the
                 // assistant starts emitting output.
@@ -4168,7 +4172,9 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::ThreadAssistantReasoningDelta { thread_id, delta } => {
+            ServerToClient::ThreadAssistantReasoningDelta {
+                thread_id, delta, ..
+            } => {
                 self.prefill.remove(&thread_id);
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     if view.streaming_started_at.is_none() {
@@ -4227,6 +4233,7 @@ impl ChatApp {
                 thread_id,
                 tool_use_id,
                 block,
+                ..
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     let chunk_text = match &block {
@@ -4256,6 +4263,7 @@ impl ChatApp {
                 result_preview,
                 is_error,
                 attachments,
+                ..
             } => {
                 if let Some(view) = self.views.get_mut(&thread_id) {
                     if let Some(DisplayItem::ToolCall {
@@ -4329,7 +4337,9 @@ impl ChatApp {
                     }
                 }
             }
-            ServerToClient::ThreadAssistantImage { thread_id, source } => {
+            ServerToClient::ThreadAssistantImage {
+                thread_id, source, ..
+            } => {
                 // Native image output (Gemini today, OpenAI image_generation
                 // soon). Decoded once at receive time and pushed as its
                 // own row — coalescing onto the trailing AssistantText
@@ -7619,6 +7629,9 @@ impl ChatApp {
                 })
         });
         let config_override = ThreadConfigOverride {
+            participants: None,
+            driver: None,
+            participant_profiles: None,
             model,
             max_tokens: self.new_thread_max_tokens,
             max_turns: self.new_thread_max_turns,

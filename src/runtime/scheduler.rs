@@ -34,7 +34,9 @@ mod triggers;
 
 pub use self::thread_config::build_default_pod_config;
 
-use self::bindings::{narrow_resolved_bindings_to_scope, resolve_bindings_choice};
+use self::bindings::{
+    ResolvedBindings, narrow_resolved_bindings_to_scope, resolve_bindings_choice,
+};
 use self::retention::{RetentionAction, archive_thread_json, delete_thread_json};
 use self::thread_config::{apply_config_override, base_thread_config_from_pod};
 
@@ -1315,7 +1317,15 @@ impl Scheduler {
     /// declared" shape) are skipped — `ThreadContext::default()` is
     /// what `get_or_default` returns anyway.
     fn seed_v2_contexts_from_bindings(&self, task: &crate::runtime::thread::Thread) {
-        for binding in &task.bindings.host_env {
+        for binding in std::iter::once(&task.bindings)
+            .chain(
+                task.config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .flat_map(|bindings| bindings.host_env.iter())
+        {
             let HostEnvBinding::Named {
                 name,
                 workspace_root,
@@ -2230,17 +2240,34 @@ impl Scheduler {
         &self,
         thread_id: &str,
     ) -> Vec<crate::runtime::tool_listing::AdmissibleTool> {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        self.admissible_and_askable_tools_for(thread_id, task.active_participant_id())
+    }
+
+    pub(crate) fn admissible_and_askable_tools_for(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> Vec<crate::runtime::tool_listing::AdmissibleTool> {
         use crate::runtime::tool_listing::{
             AdmissibleTool, ToolAdmission, ToolCategory, classify_admission,
         };
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
+        let profile = task.config.participant_profiles.get(participant_id);
+        let bindings = profile.map(|p| &p.bindings).unwrap_or(&task.bindings);
+        let scope = profile.map(|p| &p.scope).unwrap_or(&task.scope);
+        let model = profile
+            .map(|p| p.model.as_str())
+            .unwrap_or(task.config.model.as_str());
         let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
         let pod_ceiling_tools = pod_ceiling.tools.clone();
-        let escalation_available = task.scope.escalation.is_interactive();
+        let escalation_available = scope.escalation.is_interactive();
         let (queryable_knowledge_server, queryable_knowledge_pod) =
-            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
+            self.in_scope_knowledge_bucket_names_for_participant(thread_id, participant_id);
         let has_knowledge_targets =
             !queryable_knowledge_server.is_empty() || !queryable_knowledge_pod.is_empty();
         let has_editable_knowledge_targets = self.has_editable_knowledge_bucket_target(
@@ -2259,8 +2286,8 @@ impl Scheduler {
         // the filter is purely to keep the model from trying.
         let active_caps = self
             .backends
-            .get(&task.bindings.backend)
-            .map(|entry| entry.provider.capabilities_for(&task.config.model))
+            .get(&bindings.backend)
+            .map(|entry| entry.provider.capabilities_for(model))
             .unwrap_or_default();
         let model_takes_images = !active_caps.input.image.is_empty();
         let model_takes_documents = !active_caps.input.document.is_empty();
@@ -2268,7 +2295,7 @@ impl Scheduler {
         let mut seen: HashSet<String> = HashSet::new();
 
         let classify = |name: &str| -> ToolAdmission {
-            let admission = classify_admission(&task.scope.tools, &pod_ceiling_tools, name);
+            let admission = classify_admission(&scope.tools, &pod_ceiling_tools, name);
             if admission == ToolAdmission::Askable && !escalation_available {
                 ToolAdmission::OutOfReach
             } else {
@@ -2292,7 +2319,7 @@ impl Scheduler {
             }
             let cap_admission = builtin_cap_admission(
                 &tool.name,
-                &task.scope,
+                scope,
                 &pod_ceiling,
                 has_knowledge_targets,
                 has_editable_knowledge_targets,
@@ -2324,7 +2351,7 @@ impl Scheduler {
             }
         }
 
-        for bound in self.bound_mcp_hosts(thread_id) {
+        for bound in self.bound_mcp_hosts_for(thread_id, participant_id) {
             for tool in &bound.entry.tools {
                 // Hide media tools from models that can't ingest the
                 // matching modality. Tools still live in the host
@@ -2375,11 +2402,11 @@ impl Scheduler {
         // allow.host_env entry, which for v2 must match a
         // `[[auth.daemons]]` name), not on `name` (the local binding
         // name the model sees as a tool prefix).
-        for binding in &task.bindings.host_env {
+        for binding in &bindings.host_env {
             let HostEnvBinding::Named { name, .. } = binding else {
                 continue;
             };
-            if !task.scope.host_envs.admits(name) {
+            if !scope.host_envs.admits(name) {
                 continue;
             }
             let Some((provider, _spec)) = self.resolve_binding(&task.pod_id, binding) else {
@@ -2442,17 +2469,27 @@ impl Scheduler {
     ///   mask and argument validator need). The model can still
     ///   invoke these tools; when it needs the prose, `describe_tool`
     ///   re-fetches the full schema, which is kept server-side.
-    pub(crate) fn wire_tool_descriptors(&self, thread_id: &str) -> Vec<McpTool> {
+    pub(crate) fn wire_tool_descriptors_for(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> Vec<McpTool> {
         use whisper_agent_protocol::tool_surface::CoreTools;
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
-        let full_desc_all = matches!(task.tool_surface.core_tools, CoreTools::All);
-        let full_desc_set: HashSet<String> = match &task.tool_surface.core_tools {
+        let tool_surface = task
+            .config
+            .participant_profiles
+            .get(participant_id)
+            .map(|p| &p.tool_surface)
+            .unwrap_or(&task.tool_surface);
+        let full_desc_all = matches!(tool_surface.core_tools, CoreTools::All);
+        let full_desc_set: HashSet<String> = match &tool_surface.core_tools {
             CoreTools::All => HashSet::new(),
             CoreTools::Named(names) => names.iter().cloned().collect(),
         };
-        self.admissible_and_askable_tools(thread_id)
+        self.admissible_and_askable_tools_for(thread_id, participant_id)
             .into_iter()
             .filter(|t| !t.requires_escalation)
             .map(|t| {
@@ -2478,13 +2515,29 @@ impl Scheduler {
     /// Render the tool-catalog listing to append to the system prompt
     /// at thread seed. Empty string when `initial_listing = None`.
     pub(crate) fn render_initial_listing(&self, thread_id: &str) -> String {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return String::new();
+        };
+        self.render_initial_listing_for(thread_id, &task.config.participants.default_responder)
+    }
+
+    pub(crate) fn render_initial_listing_for(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> String {
         use whisper_agent_protocol::tool_surface::CoreTools;
         let Some(task) = self.tasks.get(thread_id) else {
             return String::new();
         };
-        let escalation_available = task.scope.escalation.is_interactive();
-        let tools = self.admissible_and_askable_tools(thread_id);
-        let core_names: Vec<String> = match &task.tool_surface.core_tools {
+        let profile = task.config.participant_profiles.get(participant_id);
+        let scope = profile.map(|p| &p.scope).unwrap_or(&task.scope);
+        let tool_surface = profile
+            .map(|p| &p.tool_surface)
+            .unwrap_or(&task.tool_surface);
+        let escalation_available = scope.escalation.is_interactive();
+        let tools = self.admissible_and_askable_tools_for(thread_id, participant_id);
+        let core_names: Vec<String> = match &tool_surface.core_tools {
             CoreTools::All => tools
                 .iter()
                 .filter(|t| !t.requires_escalation)
@@ -2494,7 +2547,7 @@ impl Scheduler {
         };
         crate::runtime::tool_listing::render_listing(
             &tools,
-            task.tool_surface.initial_listing,
+            tool_surface.initial_listing,
             escalation_available,
             &core_names,
         )
@@ -2519,6 +2572,16 @@ impl Scheduler {
     /// stripped) so the MCP wire call carries the server-side name
     /// the host expects. `None` when nothing claims the name.
     pub(crate) fn route_tool(&self, thread_id: &str, tool_name: &str) -> Option<ToolRoute> {
+        let task = self.tasks.get(thread_id)?;
+        self.route_tool_for(thread_id, task.active_participant_id(), tool_name)
+    }
+
+    pub(crate) fn route_tool_for(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+        tool_name: &str,
+    ) -> Option<ToolRoute> {
         if crate::tools::builtin_tools::is_builtin(tool_name) {
             let pod_id = self.tasks.get(thread_id)?.pod_id.clone();
             return Some(ToolRoute::Builtin { pod_id });
@@ -2530,11 +2593,14 @@ impl Scheduler {
         // `{binding_name}_{tool}` prefix against `capabilities().tools`.
         // First-match wins, mirroring v1 ordering semantics.
         if let Some(task) = self.tasks.get(thread_id) {
-            for binding in &task.bindings.host_env {
+            let profile = task.config.participant_profiles.get(participant_id);
+            let bindings = profile.map(|p| &p.bindings).unwrap_or(&task.bindings);
+            let scope = profile.map(|p| &p.scope).unwrap_or(&task.scope);
+            for binding in &bindings.host_env {
                 let HostEnvBinding::Named { name, .. } = binding else {
                     continue;
                 };
-                if !task.scope.host_envs.admits(name) {
+                if !scope.host_envs.admits(name) {
                     continue;
                 }
                 let Some((provider, spec)) = self.resolve_binding(&task.pod_id, binding) else {
@@ -2568,7 +2634,7 @@ impl Scheduler {
                 }
             }
         }
-        for bound in self.bound_mcp_hosts(thread_id) {
+        for bound in self.bound_mcp_hosts_for(thread_id, participant_id) {
             let Some(prefix) = bound.prefix else {
                 // Shared MCP — match by exact name.
                 if bound.entry.tools.iter().any(|t| t.name == tool_name)
@@ -2615,13 +2681,27 @@ impl Scheduler {
     /// through the resource registry, so this only walks shared MCP
     /// hosts in pod-declared order (no prefix on legacy entries).
     fn bound_mcp_hosts(&self, thread_id: &str) -> Vec<BoundMcp<'_>> {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return Vec::new();
+        };
+        self.bound_mcp_hosts_for(thread_id, &task.config.participants.default_responder)
+    }
+
+    fn bound_mcp_hosts_for(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> Vec<BoundMcp<'_>> {
         let mut out = Vec::new();
         let Some(task) = self.tasks.get(thread_id) else {
             return out;
         };
-        for name in &task.bindings.mcp_hosts {
+        let profile = task.config.participant_profiles.get(participant_id);
+        let bindings = profile.map(|p| &p.bindings).unwrap_or(&task.bindings);
+        let scope = profile.map(|p| &p.scope).unwrap_or(&task.scope);
+        for name in &bindings.mcp_hosts {
             // Same defense-in-depth gate as above for shared MCP hosts.
-            if !task.scope.mcp_hosts.admits(name) {
+            if !scope.mcp_hosts.admits(name) {
                 continue;
             }
             let id = McpHostId::shared(name);
@@ -2656,7 +2736,16 @@ impl Scheduler {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for name in &task.bindings.mcp_hosts {
+        let shared_hosts: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
+            .chain(
+                task.config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .flat_map(|bindings| bindings.mcp_hosts.iter())
+            .collect();
+        for name in shared_hosts {
             let id = McpHostId::shared(name);
             match self.resources.mcp_hosts.get(&id) {
                 Some(e) if e.state.is_ready() => {}
@@ -2672,7 +2761,7 @@ impl Scheduler {
     pub(crate) fn thread_pod_modify_cap(&self, thread_id: &str) -> crate::permission::PodModifyCap {
         self.tasks
             .get(thread_id)
-            .map(|t| t.scope.pod_modify)
+            .map(|task| task.scope_for(task.active_participant_id()).pod_modify)
             .unwrap_or(crate::permission::PodModifyCap::None)
     }
 
@@ -2685,7 +2774,7 @@ impl Scheduler {
     ) -> crate::permission::BehaviorOpsCap {
         self.tasks
             .get(thread_id)
-            .map(|t| t.scope.behaviors)
+            .map(|task| task.scope_for(task.active_participant_id()).behaviors)
             .unwrap_or(crate::permission::BehaviorOpsCap::None)
     }
 
@@ -2718,7 +2807,7 @@ impl Scheduler {
         }
 
         let task = self.tasks.get(thread_id)?;
-        let caller_scope = task.scope.clone();
+        let caller_scope = task.scope_for(task.active_participant_id()).clone();
         let pod_ceiling = self.pod_scope_ceiling(&task.pod_id);
 
         let content = args.get("content").and_then(|v| v.as_str())?;
@@ -2851,11 +2940,26 @@ impl Scheduler {
         let Some(task) = self.tasks.get(thread_id) else {
             return (Vec::new(), Vec::new());
         };
+        self.in_scope_knowledge_bucket_names_for_participant(
+            thread_id,
+            task.active_participant_id(),
+        )
+    }
+
+    fn in_scope_knowledge_bucket_names_for_participant(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> (Vec<String>, Vec<String>) {
+        let Some(task) = self.tasks.get(thread_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let scope = task.scope_for(participant_id);
         let ceiling_tokens = self.knowledge_scope_tokens_for_pod(&task.pod_id);
         let mut server = Vec::new();
         let mut pod = Vec::new();
         for token in ceiling_tokens {
-            if !task.scope.knowledge_buckets.admits(&token) {
+            if !scope.knowledge_buckets.admits(&token) {
                 continue;
             }
             match split_knowledge_bucket_token(&token) {
@@ -2941,6 +3045,8 @@ impl Scheduler {
             self.pods.insert(pod.id.clone(), pod);
         }
         for mut task in state.threads {
+            let had_legacy_driver_state = task.turns_in_cycle != 0;
+            task.migrate_legacy_driver_state();
             // Re-pre-register each of the thread's host-env bindings so
             // the registry knows their (provider, spec) pairs. For
             // `Named` bindings we look up the pod entry by name; for
@@ -2949,7 +3055,7 @@ impl Scheduler {
             // spec no longer matches any allow entry) are dropped; if
             // the resulting list is empty and the pod has a default,
             // we re-seed from the default.
-            let mut bindings_dirty = false;
+            let mut bindings_dirty = had_legacy_driver_state;
             // Escalation is a live-conn pointer; conn ids don't
             // survive a process restart. Any persisted
             // `Interactive{via_conn}` refers to a conn that no longer
@@ -2960,6 +3066,12 @@ impl Scheduler {
             // `rebind_escalation_if_orphaned`.
             if let crate::permission::Escalation::Interactive { .. } = task.scope.escalation {
                 task.scope.escalation = crate::permission::Escalation::None;
+            }
+            for profile in task.config.participant_profiles.values_mut() {
+                if let crate::permission::Escalation::Interactive { .. } = profile.scope.escalation
+                {
+                    profile.scope.escalation = crate::permission::Escalation::None;
+                }
             }
             // Migrate legacy Inline bindings: walk the pod's allow
             // list for a structurally equivalent entry and rebind to
@@ -3121,14 +3233,34 @@ impl Scheduler {
                 bindings_dirty = true;
             }
 
-            let backend_id = BackendId::for_name(&task.bindings.backend);
-            self.resources.add_backend_user(&backend_id, &task.id);
+            let backend_names: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
+                .chain(
+                    task.config
+                        .participant_profiles
+                        .values()
+                        .map(|profile| &profile.bindings),
+                )
+                .map(|bindings| bindings.backend.as_str())
+                .collect();
+            for backend_name in backend_names {
+                let backend_id = BackendId::for_name(backend_name);
+                self.resources.add_backend_user(&backend_id, &task.id);
+            }
             // Refcount the shared MCP hosts this thread is bound to.
             // Shared registry entries exist from server startup, so
             // this is just bookkeeping for GC-correctness (idle
             // shared MCPs don't get torn down while users reference
             // them).
-            for name in &task.bindings.mcp_hosts {
+            let shared_hosts: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
+                .chain(
+                    task.config
+                        .participant_profiles
+                        .values()
+                        .map(|profile| &profile.bindings),
+                )
+                .flat_map(|bindings| bindings.mcp_hosts.iter())
+                .collect();
+            for name in shared_hosts {
                 self.resources
                     .add_mcp_user(&McpHostId::shared(name), &task.id);
             }
@@ -3321,6 +3453,10 @@ impl Scheduler {
         let system_prompt_choice = config_override
             .as_ref()
             .and_then(|o| o.system_prompt.clone());
+        let mut participant_profile_requests = config_override
+            .as_ref()
+            .and_then(|o| o.participant_profiles.clone())
+            .unwrap_or_default();
         let caps_override = config_override.as_ref().and_then(|o| o.caps);
         let tools_override = config_override.as_ref().and_then(|o| o.tools.clone());
         let knowledge_buckets_override = config_override
@@ -3331,7 +3467,12 @@ impl Scheduler {
             .and_then(|o| o.tool_surface.clone());
         // Resolve the thread's plain config (model, limits, policy).
         let base_config = base_thread_config_from_pod(pod);
-        let config = apply_config_override(base_config, config_override);
+        let mut config = apply_config_override(base_config, config_override);
+        config
+            .participants
+            .validate()
+            .map_err(|e| format!("invalid thread participants: {e}"))?;
+        validate_participant_profile_requests(&config.participants, &participant_profile_requests)?;
 
         // Resolve the binding choices (backend / sandbox / shared MCP hosts):
         // start from pod defaults, layer the request on top, validate every
@@ -3469,6 +3610,112 @@ impl Scheduler {
             .thread_defaults
             .tool_surface
             .compose(effective_tool_surface_override.as_ref());
+
+        // Normalize one frozen provider/tool profile for every model
+        // participant. Missing entries inherit the compatibility setup;
+        // explicit entries may replace bindings but are still resolved under
+        // the pod ceiling and may only narrow the thread's effective scope.
+        let base_system_prompt = resolve_system_prompt_choice(pod, system_prompt_choice.as_ref());
+        let model_members: Vec<_> = config
+            .participants
+            .members
+            .iter()
+            .filter(|member| member.kind == whisper_agent_protocol::ThreadParticipantKind::Model)
+            .map(|member| member.id.clone())
+            .collect();
+        let mut participant_profiles = std::collections::BTreeMap::new();
+        for participant_id in model_members {
+            let request = participant_profile_requests
+                .remove(&participant_id)
+                .unwrap_or_default();
+            let mut participant_scope = request
+                .scope
+                .as_ref()
+                .map(|requested| scope.narrow(requested))
+                .unwrap_or_else(|| scope.clone());
+            // Escalation is a live response channel, not configurable
+            // authority. A profile inherits the thread channel verbatim.
+            participant_scope.escalation = scope.escalation;
+
+            let mut participant_resolved = if request.bindings.is_empty() {
+                ResolvedBindings {
+                    backend_name: bindings.backend.clone(),
+                    host_env: bindings.host_env.clone(),
+                    shared_host_names: bindings.mcp_hosts.clone(),
+                }
+            } else {
+                let mut merged = bindings_request_from_resolved(&bindings);
+                if request.bindings.backend.is_some() {
+                    merged.backend = request.bindings.backend.clone();
+                }
+                if request.bindings.host_env.is_some() {
+                    merged.host_env = request.bindings.host_env.clone();
+                }
+                if request.bindings.mcp_hosts.is_some() {
+                    merged.mcp_hosts = request.bindings.mcp_hosts.clone();
+                }
+                resolve_bindings_choice(pod, Some(merged), Some(&scope))?
+            };
+            narrow_resolved_bindings_to_scope(&mut participant_resolved, &participant_scope)?;
+            for name in &participant_resolved.shared_host_names {
+                if !self
+                    .resources
+                    .mcp_hosts
+                    .contains_key(&McpHostId::shared(name))
+                {
+                    return Err(format!(
+                        "participant `{participant_id}` binds shared MCP host `{name}`, but it is not configured on this server"
+                    ));
+                }
+            }
+            let mut tunables = config.tunables.clone();
+            tunables.extend(request.tunables);
+            participant_profiles.insert(
+                participant_id,
+                whisper_agent_protocol::ParticipantExecutionProfile {
+                    model: request.model.unwrap_or_else(|| config.model.clone()),
+                    max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
+                    system_prompt: request
+                        .system_prompt
+                        .as_ref()
+                        .map(|choice| resolve_system_prompt_choice(pod, Some(choice)))
+                        .unwrap_or_else(|| base_system_prompt.clone()),
+                    bindings: ThreadBindings {
+                        backend: participant_resolved.backend_name,
+                        host_env: participant_resolved.host_env,
+                        mcp_hosts: participant_resolved.shared_host_names,
+                        tool_filter: bindings.tool_filter.clone(),
+                    },
+                    scope: participant_scope,
+                    tool_surface: request.tool_surface.unwrap_or_else(|| tool_surface.clone()),
+                    tunables,
+                    tools: Vec::new(),
+                    context: Vec::new(),
+                },
+            );
+        }
+        // V2 daemon sessions are keyed by (thread, binding name), so two
+        // participants may share a named binding only when its frozen session
+        // configuration is identical.
+        let mut named_host_envs = std::collections::BTreeMap::new();
+        for binding in std::iter::once(&bindings)
+            .chain(
+                participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .flat_map(|bindings| bindings.host_env.iter())
+        {
+            if let HostEnvBinding::Named { name, .. } = binding
+                && let Some(previous) = named_host_envs.insert(name.clone(), binding.clone())
+                && previous != *binding
+            {
+                return Err(format!(
+                    "host env binding `{name}` has conflicting per-participant session options"
+                ));
+            }
+        }
+        config.participant_profiles = participant_profiles;
         let mut task = Thread::new(
             thread_id.clone(),
             pod_id.clone(),
@@ -3518,7 +3765,13 @@ impl Scheduler {
         thread_id: &str,
         override_choice: Option<&whisper_agent_protocol::SystemPromptChoice>,
     ) {
-        let system_prompt = {
+        let profile_system_prompt = self.tasks.get(thread_id).and_then(|task| {
+            task.config
+                .participant_profiles
+                .get(&task.config.participants.default_responder)
+                .map(|profile| profile.system_prompt.clone())
+        });
+        let system_prompt = profile_system_prompt.unwrap_or_else(|| {
             let pod = self
                 .tasks
                 .get(thread_id)
@@ -3535,10 +3788,12 @@ impl Scheduler {
                 // happen in practice (task was just registered).
                 (_, None) => String::new(),
             }
-        };
+        });
         if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.conversation
-                .push(whisper_agent_protocol::Message::system_text(system_prompt));
+            task.conversation.push(
+                whisper_agent_protocol::Message::system_text(system_prompt)
+                    .with_author(task.config.participants.default_responder.clone()),
+            );
         }
         // Tools manifest + initial listing + memory snapshot all land
         // together as a single idempotent operation. Self-gates on
@@ -3585,14 +3840,22 @@ impl Scheduler {
     /// which lights up when the backend's kind is `openai_responses`.
     /// Other built-ins (web_search, file_search, code_interpreter)
     /// would slot in here when their wire shapes are wired up.
-    fn synthesize_provider_builtin_tools(
+    fn synthesize_provider_builtin_tools_for(
         &self,
         thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
     ) -> Vec<whisper_agent_protocol::ContentBlock> {
         let Some(task) = self.tasks.get(thread_id) else {
             return Vec::new();
         };
-        let Some(entry) = self.backends.get(&task.bindings.backend) else {
+        let bindings = task
+            .config
+            .participant_profiles
+            .get(participant_id)
+            .map(|profile| &profile.bindings)
+            .unwrap_or(&task.bindings);
+        let scope = task.scope_for(participant_id);
+        let Some(entry) = self.backends.get(&bindings.backend) else {
             return Vec::new();
         };
         if entry.kind != "openai_responses" {
@@ -3626,6 +3889,89 @@ impl Scheduler {
                 kind: whisper_agent_protocol::ToolKind::ProviderBuiltin,
             },
         ]
+        .into_iter()
+        .filter(|block| match block {
+            whisper_agent_protocol::ContentBlock::ToolSchema { name, .. } => {
+                scope.tools.disposition(name) == crate::permission::Disposition::Allow
+            }
+            _ => false,
+        })
+        .collect()
+    }
+
+    fn tool_schemas_for_participant(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> Vec<whisper_agent_protocol::ToolSchema> {
+        let mut schemas: Vec<_> = self
+            .wire_tool_descriptors_for(thread_id, participant_id)
+            .into_iter()
+            .map(|tool| {
+                whisper_agent_protocol::ToolSchema::from_mcp(
+                    tool.name,
+                    tool.description,
+                    &tool.input_schema,
+                )
+            })
+            .collect();
+        schemas.extend(
+            self.synthesize_provider_builtin_tools_for(thread_id, participant_id)
+                .into_iter()
+                .filter_map(|block| match block {
+                    whisper_agent_protocol::ContentBlock::ToolSchema {
+                        name,
+                        description,
+                        params,
+                        kind,
+                    } => Some(whisper_agent_protocol::ToolSchema {
+                        name,
+                        description,
+                        params,
+                        kind,
+                    }),
+                    _ => None,
+                }),
+        );
+        schemas
+    }
+
+    fn memory_snapshot_for_participant(
+        &self,
+        thread_id: &str,
+        participant_id: &whisper_agent_protocol::ParticipantId,
+    ) -> Option<whisper_agent_protocol::Message> {
+        let task = self.tasks.get(thread_id)?;
+        let profile = task.config.participant_profiles.get(participant_id);
+        let bindings = profile.map(|p| &p.bindings).unwrap_or(&task.bindings);
+        let model = profile
+            .map(|p| p.model.as_str())
+            .unwrap_or(task.config.model.as_str());
+        let pod_dir = self.pods.get(&task.pod_id).map(|p| p.dir.clone())?;
+        let host_env_infos: Vec<crate::runtime::memory_snapshot::HostEnvInfo<'_>> = bindings
+            .host_env
+            .iter()
+            .filter_map(|binding| match binding {
+                HostEnvBinding::Named {
+                    name,
+                    workspace_root,
+                    ..
+                } => Some(crate::runtime::memory_snapshot::HostEnvInfo {
+                    name: name.as_str(),
+                    workspace_root: workspace_root.as_deref(),
+                }),
+                HostEnvBinding::Inline { .. } => None,
+            })
+            .collect();
+        let session = crate::runtime::memory_snapshot::SessionContext {
+            model,
+            backend: bindings.backend.as_str(),
+            host_envs: &host_env_infos,
+        };
+        Some(
+            crate::runtime::memory_snapshot::build_block(&pod_dir, chrono::Utc::now(), &session)
+                .with_author(participant_id.clone()),
+        )
     }
 
     fn finalize_setup_prefix(&mut self, thread_id: &str) {
@@ -3641,84 +3987,81 @@ impl Scheduler {
             return;
         }
 
-        let mut tool_blocks: Vec<whisper_agent_protocol::ContentBlock> = self
-            .wire_tool_descriptors(thread_id)
+        let responder = self
+            .tasks
+            .get(thread_id)
+            .map(|task| task.config.participants.default_responder.clone())
+            .unwrap_or_else(|| whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID.into());
+        let tool_blocks = self
+            .tool_schemas_for_participant(thread_id, &responder)
             .into_iter()
-            .map(|t| {
-                let typed = whisper_agent_protocol::ToolSchema::from_mcp(
-                    t.name,
-                    t.description,
-                    &t.input_schema,
-                );
-                whisper_agent_protocol::ContentBlock::ToolSchema {
-                    name: typed.name,
-                    description: typed.description,
-                    params: typed.params,
-                    kind: typed.kind,
-                }
+            .map(|schema| whisper_agent_protocol::ContentBlock::ToolSchema {
+                name: schema.name,
+                description: schema.description,
+                params: schema.params,
+                kind: schema.kind,
             })
             .collect();
-        // Append provider-side built-in tools the bound backend supports.
-        // These don't go through the MCP / host-env catalogs (they're
-        // executed inside the provider's API request), so the wire
-        // descriptors above don't surface them — we synthesize here.
-        for block in self.synthesize_provider_builtin_tools(thread_id) {
-            tool_blocks.push(block);
-        }
-        let tools_msg = whisper_agent_protocol::Message::tools_manifest(tool_blocks);
+        let tools_msg = whisper_agent_protocol::Message::tools_manifest(tool_blocks)
+            .with_author(responder.clone());
 
         let listing_text = self.render_initial_listing(thread_id);
+        let memory_msg = self.memory_snapshot_for_participant(thread_id, &responder);
 
-        let memory_msg = self.tasks.get(thread_id).and_then(|task| {
-            let pod_dir = self.pods.get(&task.pod_id).map(|p| p.dir.clone())?;
-            // Pull session context off the task — model id, backend
-            // name, and the host-env binding map. Borrowed straight
-            // out of `task`; `build_block` doesn't retain references
-            // past the call.
-            let host_env_infos: Vec<crate::runtime::memory_snapshot::HostEnvInfo<'_>> = task
-                .bindings
-                .host_env
-                .iter()
-                .filter_map(|b| match b {
-                    whisper_agent_protocol::HostEnvBinding::Named {
-                        name,
-                        workspace_root,
-                        runas: _,
-                        ..
-                    } => Some(crate::runtime::memory_snapshot::HostEnvInfo {
-                        name: name.as_str(),
-                        workspace_root: workspace_root.as_deref(),
-                    }),
-                    // Inline bindings are reserved / not constructable
-                    // from current wire types — skip from the surface.
-                    whisper_agent_protocol::HostEnvBinding::Inline { .. } => None,
-                })
-                .collect();
-            let session = crate::runtime::memory_snapshot::SessionContext {
-                model: task.config.model.as_str(),
-                backend: task.bindings.backend.as_str(),
-                host_envs: &host_env_infos,
-            };
-            Some(crate::runtime::memory_snapshot::build_block(
-                &pod_dir,
-                chrono::Utc::now(),
-                &session,
-            ))
-        });
+        let profile_ids: Vec<_> = self
+            .tasks
+            .get(thread_id)
+            .map(|task| task.config.participant_profiles.keys().cloned().collect())
+            .unwrap_or_default();
+        let profile_setups: Vec<_> = profile_ids
+            .into_iter()
+            .map(|participant_id| {
+                let tools = self.tool_schemas_for_participant(thread_id, &participant_id);
+                let mut context = Vec::new();
+                let listing = if participant_id == responder {
+                    listing_text.clone()
+                } else {
+                    self.render_initial_listing_for(thread_id, &participant_id)
+                };
+                if !listing.is_empty() {
+                    context.push(
+                        whisper_agent_protocol::Message::system_text(listing)
+                            .with_author(participant_id.clone()),
+                    );
+                }
+                let profile_memory = if participant_id == responder {
+                    memory_msg.clone()
+                } else {
+                    self.memory_snapshot_for_participant(thread_id, &participant_id)
+                };
+                if let Some(memory) = profile_memory {
+                    context.push(memory);
+                }
+                (participant_id, tools, context)
+            })
+            .collect();
 
         let snapshot = if let Some(task) = self.tasks.get_mut(thread_id) {
+            for (participant_id, tools, context) in profile_setups {
+                if let Some(profile) = task.config.participant_profiles.get_mut(&participant_id) {
+                    profile.tools = tools;
+                    profile.context = context;
+                }
+            }
             let mut at = task.conversation.setup_prefix_end();
             task.conversation.insert(at, tools_msg);
             at += 1;
             if !listing_text.is_empty() {
                 task.conversation.insert(
                     at,
-                    whisper_agent_protocol::Message::system_text(listing_text),
+                    whisper_agent_protocol::Message::system_text(listing_text)
+                        .with_author(responder.clone()),
                 );
                 at += 1;
             }
             if let Some(memory_msg) = memory_msg {
-                task.conversation.insert(at, memory_msg);
+                task.conversation
+                    .insert(at, memory_msg.with_author(responder));
             }
             Some(task.snapshot())
         } else {
@@ -3760,8 +4103,24 @@ impl Scheduler {
         let thread_id = task.id.clone();
         let pod_id = task.pod_id.clone();
 
-        let backend_name = task.bindings.backend.clone();
-        let shared_hosts = task.bindings.mcp_hosts.clone();
+        let backend_names: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
+            .chain(
+                task.config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .map(|bindings| bindings.backend.clone())
+            .collect();
+        let shared_hosts: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
+            .chain(
+                task.config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .flat_map(|bindings| bindings.mcp_hosts.iter().cloned())
+            .collect();
         let summary = task.summary();
         self.cancel_tokens.insert(
             thread_id.clone(),
@@ -3773,9 +4132,11 @@ impl Scheduler {
             pod.threads.insert(thread_id.clone());
         }
 
-        let backend_id = BackendId::for_name(&backend_name);
-        self.resources.add_backend_user(&backend_id, &thread_id);
-        self.emit_backend_updated(&backend_id);
+        for backend_name in backend_names {
+            let backend_id = BackendId::for_name(&backend_name);
+            self.resources.add_backend_user(&backend_id, &thread_id);
+            self.emit_backend_updated(&backend_id);
+        }
         for name in &shared_hosts {
             let host_id = McpHostId::shared(name);
             self.resources.add_mcp_user(&host_id, &thread_id);
@@ -3899,6 +4260,9 @@ impl Scheduler {
             Some(conn_id) => crate::permission::Escalation::Interactive { via_conn: conn_id },
             None => crate::permission::Escalation::None,
         };
+        for profile in task.config.participant_profiles.values_mut() {
+            profile.scope.escalation = task.scope.escalation;
+        }
         // Pre-validate the host_env binding before handing the task
         // off to `register_new_task` (which `.expect()`s that the
         // binding resolves). Relevant to the inherit path: a Named
@@ -4622,11 +4986,32 @@ impl Scheduler {
         thread_id: &str,
         pod_id: &str,
         bindings: &whisper_agent_protocol::ThreadBindings,
+        config: &whisper_agent_protocol::ThreadConfig,
     ) {
         let _ = pod_id;
-        let backend_id = BackendId::for_name(&bindings.backend);
-        self.resources.remove_backend_user(&backend_id, thread_id);
-        for shared in &bindings.mcp_hosts {
+        let backend_names: std::collections::BTreeSet<_> = std::iter::once(bindings)
+            .chain(
+                config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .map(|bindings| bindings.backend.as_str())
+            .collect();
+        for backend_name in backend_names {
+            let backend_id = BackendId::for_name(backend_name);
+            self.resources.remove_backend_user(&backend_id, thread_id);
+        }
+        let shared_hosts: std::collections::BTreeSet<_> = std::iter::once(bindings)
+            .chain(
+                config
+                    .participant_profiles
+                    .values()
+                    .map(|profile| &profile.bindings),
+            )
+            .flat_map(|bindings| bindings.mcp_hosts.iter())
+            .collect();
+        for shared in shared_hosts {
             let mid = McpHostId::shared(shared);
             self.resources.remove_mcp_user(&mid, thread_id);
             self.emit_mcp_host_updated(&mid);
@@ -4718,8 +5103,8 @@ impl Scheduler {
         };
         // Capture bindings BEFORE removing from self.tasks — we need
         // them to release resource users.
-        let bindings = match self.tasks.get(thread_id) {
-            Some(t) => t.bindings.clone(),
+        let (bindings, config) = match self.tasks.get(thread_id) {
+            Some(t) => (t.bindings.clone(), t.config.clone()),
             None => return,
         };
         self.tasks.remove(thread_id);
@@ -4741,7 +5126,7 @@ impl Scheduler {
         if let Some(pod) = self.pods.get_mut(pod_id) {
             pod.threads.remove(thread_id);
         }
-        self.release_thread_resources(thread_id, pod_id, &bindings);
+        self.release_thread_resources(thread_id, pod_id, &bindings, &config);
         self.router.drop_thread(thread_id);
         self.router
             .broadcast_task_list(ServerToClient::ThreadArchived {
@@ -4781,7 +5166,15 @@ impl Scheduler {
             ) {
                 continue;
             }
-            for name in &task.bindings.mcp_hosts {
+            for name in std::iter::once(&task.bindings)
+                .chain(
+                    task.config
+                        .participant_profiles
+                        .values()
+                        .map(|profile| &profile.bindings),
+                )
+                .flat_map(|bindings| bindings.mcp_hosts.iter())
+            {
                 in_use_mcp_hosts.insert(McpHostId::shared(name));
             }
         }
@@ -5146,6 +5539,68 @@ fn resolve_system_prompt_file(pod: &crate::pod::Pod, name: &str) -> String {
     }
 }
 
+fn resolve_system_prompt_choice(
+    pod: &crate::pod::Pod,
+    choice: Option<&whisper_agent_protocol::SystemPromptChoice>,
+) -> String {
+    match choice {
+        Some(whisper_agent_protocol::SystemPromptChoice::Text { text }) => text.clone(),
+        Some(whisper_agent_protocol::SystemPromptChoice::File { name }) => {
+            resolve_system_prompt_file(pod, name)
+        }
+        None => pod.system_prompt.clone(),
+    }
+}
+
+/// Convert a frozen binding snapshot back into the request shape so a
+/// participant profile can replace one axis while inheriting the other two
+/// from the thread (rather than accidentally falling back to pod defaults).
+fn bindings_request_from_resolved(bindings: &ThreadBindings) -> ThreadBindingsRequest {
+    let host_env = bindings
+        .host_env
+        .iter()
+        .filter_map(|binding| match binding {
+            HostEnvBinding::Named {
+                name,
+                workspace_root,
+                runas,
+                options,
+            } => Some(whisper_agent_protocol::HostEnvBindingRequest {
+                name: name.clone(),
+                workspace_root: workspace_root.clone(),
+                runas: runas.clone(),
+                options: options.clone(),
+            }),
+            HostEnvBinding::Inline { .. } => None,
+        })
+        .collect();
+    ThreadBindingsRequest {
+        backend: Some(bindings.backend.clone()),
+        host_env: Some(host_env),
+        mcp_hosts: Some(bindings.mcp_hosts.clone()),
+    }
+}
+
+fn validate_participant_profile_requests(
+    participants: &whisper_agent_protocol::ThreadParticipants,
+    requests: &std::collections::BTreeMap<
+        whisper_agent_protocol::ParticipantId,
+        whisper_agent_protocol::ParticipantExecutionProfileRequest,
+    >,
+) -> Result<(), String> {
+    for participant_id in requests.keys() {
+        let member = participants.member(participant_id).ok_or_else(|| {
+            format!("participant profile references unknown participant `{participant_id}`")
+        })?;
+        if member.kind != whisper_agent_protocol::ThreadParticipantKind::Model {
+            return Err(format!(
+                "participant profile `{participant_id}` targets a client participant"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------- Run loop ----------
 
 pub async fn run(
@@ -5331,6 +5786,64 @@ async fn connect_shared_mcp_on_boot(
         .map(|t| (t.name.clone(), t.annotations.clone()))
         .collect();
     resources.populate_mcp_tools(&id, tools, annotations);
+}
+
+#[cfg(test)]
+mod participant_profile_tests {
+    use super::validate_participant_profile_requests;
+    use std::collections::BTreeMap;
+    use whisper_agent_protocol::{
+        ParticipantExecutionProfileRequest, ThreadParticipant, ThreadParticipantKind,
+        ThreadParticipants,
+    };
+
+    fn participants() -> ThreadParticipants {
+        ThreadParticipants {
+            members: vec![
+                ThreadParticipant {
+                    id: "human".into(),
+                    kind: ThreadParticipantKind::Client,
+                    display_name: None,
+                },
+                ThreadParticipant {
+                    id: "builder".into(),
+                    kind: ThreadParticipantKind::Model,
+                    display_name: None,
+                },
+            ],
+            default_input: "human".into(),
+            default_responder: "builder".into(),
+        }
+    }
+
+    #[test]
+    fn profiles_may_only_target_registered_models() {
+        let valid = BTreeMap::from_iter([(
+            "builder".into(),
+            ParticipantExecutionProfileRequest::default(),
+        )]);
+        assert!(validate_participant_profile_requests(&participants(), &valid).is_ok());
+
+        let client = BTreeMap::from_iter([(
+            "human".into(),
+            ParticipantExecutionProfileRequest::default(),
+        )]);
+        assert!(
+            validate_participant_profile_requests(&participants(), &client)
+                .unwrap_err()
+                .contains("client participant")
+        );
+
+        let unknown = BTreeMap::from_iter([(
+            "reviewer".into(),
+            ParticipantExecutionProfileRequest::default(),
+        )]);
+        assert!(
+            validate_participant_profile_requests(&participants(), &unknown)
+                .unwrap_err()
+                .contains("unknown participant")
+        );
+    }
 }
 
 #[cfg(test)]
