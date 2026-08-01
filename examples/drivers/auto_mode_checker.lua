@@ -31,11 +31,16 @@ function on_event(state, event)
   if k == "input_accepted" then
     -- Fresh cycle. Any in-flight interception is void — the scheduler
     -- heals the primary out of its parked boundary on superseding
-    -- input.
-    return { state = {} }
+    -- input. `primary` survives for present().
+    return { state = { primary = event.thread_id } }
   end
 
   if k == "turn_start" then
+    if state.primary == nil then
+      -- Driver-run turn on a seeded thread that never saw
+      -- input_accepted: the conversation head is whoever turns first.
+      state.primary = event.thread_id
+    end
     return { effects = { { kind = "run_agent", thread_id = event.thread_id } },
              state = state }
   end
@@ -102,4 +107,27 @@ function on_event(state, event)
   end
 
   return { state = state }
+end
+
+-- Presentation: a pure function of the state on_event returned. The
+-- primary transcript is always the head; while a check is in flight,
+-- surface a status line and the checker thread. A finished checker
+-- drops from the display but stays reachable via the weave's
+-- drill-down thread list — curate, never conceal.
+function present(state)
+  local blocks = {}
+  if state.primary then
+    blocks[#blocks + 1] =
+      { kind = "primary_transcript", thread_id = state.primary }
+  end
+  if state.checking then
+    blocks[#blocks + 1] = { kind = "status",
+      text = "permission check in flight ("
+        .. #state.checking.calls .. " tool calls)" }
+    if state.checking.checker then
+      blocks[#blocks + 1] =
+        { kind = "thread_list", thread_ids = { state.checking.checker } }
+    end
+  end
+  return blocks
 end

@@ -632,6 +632,11 @@ impl Thread {
             origin: self.origin.clone(),
             continued_from: self.continued_from.clone(),
             dispatched_by: self.dispatched_by.clone(),
+            // A thread has no knowledge of its weave relationships; the
+            // scheduler decorates these from the ticker index before
+            // anything client-facing ships (`Scheduler::decorate_summary`).
+            weave_id: None,
+            weave_role: None,
         }
     }
 

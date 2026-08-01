@@ -19,6 +19,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use whisper_agent_protocol::weave::{PresentationBlock, WeaveSnapshot, WeaveThreadRefInfo};
 use whisper_agent_protocol::{ParticipantId, ThreadDriverConfig, ThreadParticipants};
 
 use crate::runtime::driver::{
@@ -31,13 +32,9 @@ pub type WeaveId = String;
 /// Role a referenced thread plays in this weave: the primary conversation
 /// context, or an auxiliary thread the weave derived or adopted (compaction
 /// sources, permission checkers, subagents). Provenance detail lives in the
-/// ref's `relationship`, not the role.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WeaveThreadRole {
-    Primary,
-    Auxiliary,
-}
+/// ref's `relationship`, not the role. The protocol type is used directly —
+/// persisted weave JSON and the step-7b wire tier share the encoding.
+pub use whisper_agent_protocol::weave::WeaveThreadRole;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WeaveThreadRef {
@@ -87,6 +84,15 @@ pub struct Weave {
     /// enforced by the scheduler's `thread_ticker` index, not here; this
     /// list is the weave's own record of what it coordinates.
     pub threads: Vec<WeaveThreadRef>,
+    /// Presentation blocks last composed by the scripted driver's
+    /// `present(state)` (step 7b) — a cache of a pure function of
+    /// `driver_state`, refreshed after each activation and validated
+    /// against `threads`. Empty means "no driver-composed display":
+    /// builtin weaves, programs without `present`, or a `present` that
+    /// errored (presentation degrades; ground truth doesn't). The wire
+    /// snapshot synthesizes the degenerate presentation in that case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presentation: Vec<PresentationBlock>,
     pub created: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
 }
@@ -114,8 +120,81 @@ impl Weave {
                 ticks: true,
                 relationship: None,
             }],
+            presentation: Vec::new(),
             created: now,
             last_active: now,
+        }
+    }
+
+    /// Drop presentation blocks that reference threads this weave does
+    /// not reference — presentation curates, it cannot fabricate. Used
+    /// on freshly composed blocks and again at snapshot time (a ref
+    /// removed after composition invalidates cached blocks too).
+    pub fn validate_presentation(&self, blocks: Vec<PresentationBlock>) -> Vec<PresentationBlock> {
+        blocks
+            .into_iter()
+            .filter_map(|block| match block {
+                PresentationBlock::PrimaryTranscript { thread_id } => self
+                    .references(&thread_id)
+                    .then_some(PresentationBlock::PrimaryTranscript { thread_id }),
+                PresentationBlock::ThreadList { thread_ids } => {
+                    let kept: Vec<String> = thread_ids
+                        .into_iter()
+                        .filter(|id| self.references(id))
+                        .collect();
+                    (!kept.is_empty()).then_some(PresentationBlock::ThreadList { thread_ids: kept })
+                }
+                block @ PresentationBlock::Status { .. } => Some(block),
+            })
+            .collect()
+    }
+
+    /// The client-facing coordination view (step 7b). The `threads`
+    /// list is always complete — guaranteed drill-down — and an empty
+    /// presentation cache is replaced by the degenerate presentation:
+    /// the primary transcript plus a list of the auxiliaries.
+    pub fn wire_snapshot(&self) -> WeaveSnapshot {
+        let presentation = {
+            let validated = self.validate_presentation(self.presentation.clone());
+            if validated.is_empty() {
+                let mut blocks = Vec::new();
+                if let Some(primary) = self.primary_thread_id() {
+                    blocks.push(PresentationBlock::PrimaryTranscript {
+                        thread_id: primary.to_string(),
+                    });
+                }
+                let auxiliaries: Vec<String> = self
+                    .threads
+                    .iter()
+                    .filter(|r| r.role == WeaveThreadRole::Auxiliary)
+                    .map(|r| r.thread_id.clone())
+                    .collect();
+                if !auxiliaries.is_empty() {
+                    blocks.push(PresentationBlock::ThreadList {
+                        thread_ids: auxiliaries,
+                    });
+                }
+                blocks
+            } else {
+                validated
+            }
+        };
+        WeaveSnapshot {
+            weave_id: self.id.clone(),
+            pod_id: self.pod_id.clone(),
+            driver: self.driver.clone(),
+            driver_program_hash: self.driver_program_hash.clone(),
+            threads: self
+                .threads
+                .iter()
+                .map(|r| WeaveThreadRefInfo {
+                    thread_id: r.thread_id.clone(),
+                    role: r.role,
+                    ticks: r.ticks,
+                    relationship: r.relationship.as_ref().map(|rel| rel.kind.clone()),
+                })
+                .collect(),
+            presentation,
         }
     }
 
@@ -488,5 +567,104 @@ mod tests {
         assert!(weave.remove_reference("t-check"));
         assert!(!weave.references("t-check"));
         assert!(!weave.remove_reference("t-check"));
+    }
+
+    #[test]
+    fn wire_snapshot_synthesizes_degenerate_presentation() {
+        let mut weave = Weave::singleton_for_thread(
+            "t-1",
+            "pod",
+            whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat,
+        );
+        // Singleton: one primary_transcript block, no thread_list.
+        let snapshot = weave.wire_snapshot();
+        assert_eq!(
+            snapshot.presentation,
+            vec![PresentationBlock::PrimaryTranscript {
+                thread_id: "t-1".into()
+            }]
+        );
+        assert_eq!(snapshot.threads.len(), 1);
+
+        // With an auxiliary, the degenerate form lists it.
+        weave.add_derived(
+            "t-check",
+            ThreadRelationship {
+                kind: "check".into(),
+                source: None,
+            },
+        );
+        let snapshot = weave.wire_snapshot();
+        assert_eq!(
+            snapshot.presentation,
+            vec![
+                PresentationBlock::PrimaryTranscript {
+                    thread_id: "t-1".into()
+                },
+                PresentationBlock::ThreadList {
+                    thread_ids: vec!["t-check".into()]
+                },
+            ]
+        );
+        assert_eq!(snapshot.threads[1].relationship.as_deref(), Some("check"));
+    }
+
+    #[test]
+    fn presentation_validation_drops_fabricated_references() {
+        let mut weave = Weave::singleton_for_thread(
+            "t-1",
+            "pod",
+            whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat,
+        );
+        let validated = weave.validate_presentation(vec![
+            PresentationBlock::PrimaryTranscript {
+                thread_id: "t-1".into(),
+            },
+            PresentationBlock::Status {
+                text: "checking".into(),
+            },
+            // Fabricated: never referenced by this weave.
+            PresentationBlock::PrimaryTranscript {
+                thread_id: "t-elsewhere".into(),
+            },
+            PresentationBlock::ThreadList {
+                thread_ids: vec!["t-elsewhere".into(), "t-1".into()],
+            },
+        ]);
+        assert_eq!(
+            validated,
+            vec![
+                PresentationBlock::PrimaryTranscript {
+                    thread_id: "t-1".into()
+                },
+                PresentationBlock::Status {
+                    text: "checking".into()
+                },
+                PresentationBlock::ThreadList {
+                    thread_ids: vec!["t-1".into()]
+                },
+            ]
+        );
+
+        // A cached presentation whose referenced thread has since been
+        // unreferenced degrades to the degenerate form at snapshot time.
+        weave.add_derived(
+            "t-check",
+            ThreadRelationship {
+                kind: "check".into(),
+                source: None,
+            },
+        );
+        weave.presentation = vec![PresentationBlock::ThreadList {
+            thread_ids: vec!["t-check".into()],
+        }];
+        assert!(!weave.wire_snapshot().presentation.is_empty());
+        weave.remove_reference("t-check");
+        assert_eq!(
+            weave.wire_snapshot().presentation,
+            vec![PresentationBlock::PrimaryTranscript {
+                thread_id: "t-1".into()
+            }]
+        );
     }
 }

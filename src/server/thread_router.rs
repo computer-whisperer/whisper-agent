@@ -39,6 +39,11 @@ use crate::runtime::thread::ThreadEvent;
 pub(crate) struct ThreadEventRouter {
     clients: HashMap<ConnId, mpsc::UnboundedSender<ServerToClient>>,
     subscriptions: HashMap<String, HashSet<ConnId>>,
+    /// Weave-tier subscriptions (step 7b): `weave_id → set<ConnId>`.
+    /// Subscribers receive a full `WeaveSnapshot` whenever the weave's
+    /// thread refs or presentation change. Thread content still flows
+    /// through `subscriptions`.
+    weave_subscriptions: HashMap<String, HashSet<ConnId>>,
     audit: AuditLog,
     host_id: String,
 }
@@ -48,6 +53,7 @@ impl ThreadEventRouter {
         Self {
             clients: HashMap::new(),
             subscriptions: HashMap::new(),
+            weave_subscriptions: HashMap::new(),
             audit,
             host_id,
         }
@@ -66,6 +72,9 @@ impl ThreadEventRouter {
     pub(crate) fn unregister_client(&mut self, conn_id: ConnId) {
         self.clients.remove(&conn_id);
         for subs in self.subscriptions.values_mut() {
+            subs.remove(&conn_id);
+        }
+        for subs in self.weave_subscriptions.values_mut() {
             subs.remove(&conn_id);
         }
     }
@@ -87,6 +96,34 @@ impl ThreadEventRouter {
 
     pub(crate) fn drop_thread(&mut self, thread_id: &str) {
         self.subscriptions.remove(thread_id);
+    }
+
+    pub(crate) fn subscribe_weave(&mut self, conn_id: ConnId, weave_id: &str) {
+        self.weave_subscriptions
+            .entry(weave_id.to_string())
+            .or_default()
+            .insert(conn_id);
+    }
+
+    pub(crate) fn unsubscribe_weave(&mut self, conn_id: ConnId, weave_id: &str) {
+        if let Some(subs) = self.weave_subscriptions.get_mut(weave_id) {
+            subs.remove(&conn_id);
+        }
+    }
+
+    pub(crate) fn drop_weave(&mut self, weave_id: &str) {
+        self.weave_subscriptions.remove(weave_id);
+    }
+
+    pub(crate) fn broadcast_to_weave_subscribers(&self, weave_id: &str, event: ServerToClient) {
+        let Some(subs) = self.weave_subscriptions.get(weave_id) else {
+            return;
+        };
+        for conn_id in subs {
+            if let Some(tx) = self.clients.get(conn_id) {
+                let _ = tx.send(event.clone());
+            }
+        }
     }
 
     // ---------- Send / broadcast ----------

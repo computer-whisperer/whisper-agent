@@ -15,6 +15,7 @@ pub mod pod;
 pub mod sandbox;
 pub mod tool_schema;
 pub mod tool_surface;
+pub mod weave;
 
 pub use permission::{AllowMap, Disposition};
 
@@ -973,6 +974,17 @@ pub struct ThreadSummary {
     /// under their parent in the sidebar without fetching the full snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatched_by: Option<String>,
+    /// The weave that ticks this thread (migration step 7b). `None` for
+    /// dormant threads (no ticker) and on snapshots from before the
+    /// weave tier landed. Exposed on the list tier so clients can nest
+    /// a weave's auxiliary threads under its primary row and know which
+    /// weave to subscribe to, without fetching the full snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weave_id: Option<String>,
+    /// This thread's role within the ticking weave. `None` exactly when
+    /// `weave_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weave_role: Option<weave::WeaveThreadRole>,
 }
 
 /// Entry in an `EmbeddingProvidersList` response. Mirrors
@@ -1805,6 +1817,17 @@ pub enum ClientToServer {
     UnsubscribeFromThread {
         thread_id: String,
     },
+    /// Subscribe to a weave's coordination view (step 7b). Server
+    /// responds with a `WeaveSnapshot` and re-sends the full snapshot
+    /// whenever the weave's thread refs or presentation change.
+    /// Thread *content* still streams through the per-thread tier —
+    /// clients subscribe to the threads the presentation references.
+    SubscribeToWeave {
+        weave_id: String,
+    },
+    UnsubscribeFromWeave {
+        weave_id: String,
+    },
     /// Request the current list of non-archived tasks.
     ListThreads {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2398,6 +2421,16 @@ pub enum ServerToClient {
     ThreadSnapshot {
         thread_id: String,
         snapshot: ThreadSnapshot,
+    },
+    /// The full coordination view of one weave (step 7b). Sent once in
+    /// reply to `SubscribeToWeave` and re-sent to weave subscribers
+    /// whenever the weave's thread refs or presentation change —
+    /// snapshots are small, so updates resend the whole thing rather
+    /// than patching. Thread content is not here; it streams through
+    /// the per-thread tier.
+    WeaveSnapshot {
+        weave_id: String,
+        snapshot: weave::WeaveSnapshot,
     },
 
     // --- Per-task turn tier (only to subscribers of `thread_id`) ---

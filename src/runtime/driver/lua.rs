@@ -196,17 +196,10 @@ struct OutcomeWire {
     state: Option<serde_json::Value>,
 }
 
-/// Run one driver event through a fresh sandboxed VM.
-///
-/// `chunk_name` labels Lua error messages (use the program name).
-/// Errors are driver failures, not scheduler failures — the caller
-/// fails the weave's coordinated work with the message.
-pub fn run_event(
-    source: &str,
-    chunk_name: &str,
-    state: &serde_json::Value,
-    event: &ScriptedEvent,
-) -> Result<ScriptedOutcome, String> {
+/// Build the sandboxed VM every driver call runs in: minimal stdlib,
+/// base-library escape hatches stripped, memory ceiling, instruction
+/// budget.
+fn sandboxed_vm() -> Result<Lua, String> {
     let lua = Lua::new_with(
         mlua::StdLib::TABLE | mlua::StdLib::STRING | mlua::StdLib::MATH | mlua::StdLib::UTF8,
         mlua::LuaOptions::default(),
@@ -259,7 +252,21 @@ pub fn run_event(
         },
     );
     hook_installed.map_err(|e| format!("lua instruction hook: {e}"))?;
+    Ok(lua)
+}
 
+/// Run one driver event through a fresh sandboxed VM.
+///
+/// `chunk_name` labels Lua error messages (use the program name).
+/// Errors are driver failures, not scheduler failures — the caller
+/// fails the weave's coordinated work with the message.
+pub fn run_event(
+    source: &str,
+    chunk_name: &str,
+    state: &serde_json::Value,
+    event: &ScriptedEvent,
+) -> Result<ScriptedOutcome, String> {
+    let lua = sandboxed_vm()?;
     lua.load(source)
         .set_name(chunk_name)
         .exec()
@@ -293,6 +300,44 @@ pub fn run_event(
         effects: wire.effects,
         state: wire.state.unwrap_or_else(|| state.clone()),
     })
+}
+
+/// Evaluate the program's optional `present(state) -> blocks` entry
+/// point (migration step 7b): a pure function of persisted driver state
+/// composing the weave's presentation structure — replayable by
+/// construction, since it can see nothing else.
+///
+/// `Ok(None)` means the program defines no `present`; the caller
+/// synthesizes the degenerate presentation. Errors degrade the display
+/// (the caller falls back to degenerate) — they never fail the weave's
+/// coordinated work, per "presentation can degrade, ground truth
+/// cannot".
+pub fn run_present(
+    source: &str,
+    chunk_name: &str,
+    state: &serde_json::Value,
+) -> Result<Option<Vec<whisper_agent_protocol::weave::PresentationBlock>>, String> {
+    let lua = sandboxed_vm()?;
+    lua.load(source)
+        .set_name(chunk_name)
+        .exec()
+        .map_err(|e| format!("driver `{chunk_name}` failed to load: {e}"))?;
+    let Ok(presenter) = lua.globals().get::<mlua::Function>("present") else {
+        return Ok(None);
+    };
+    let state_value = lua
+        .to_value(state)
+        .map_err(|e| format!("driver state to lua: {e}"))?;
+    let returned: mlua::Value = presenter
+        .call(state_value)
+        .map_err(|e| format!("driver `{chunk_name}` present: {e}"))?;
+    if returned.is_nil() {
+        return Ok(None);
+    }
+    let blocks: Vec<whisper_agent_protocol::weave::PresentationBlock> = lua
+        .from_value(returned)
+        .map_err(|e| format!("driver `{chunk_name}` returned malformed presentation: {e}"))?;
+    Ok(Some(blocks))
 }
 
 /// Content hash stamped on the weave when a scripted driver starts
@@ -514,5 +559,82 @@ mod tests {
         assert_eq!(a, program_hash("return 1"));
         assert_ne!(a, program_hash("return 2"));
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn present_absent_or_nil_means_no_presentation() {
+        let no_present = "function on_event(s, e) return nil end";
+        assert_eq!(run_present(no_present, "d", &json!({})).unwrap(), None);
+        let nil_present = r#"
+            function on_event(s, e) return nil end
+            function present(state) return nil end
+        "#;
+        assert_eq!(run_present(nil_present, "d", &json!({})).unwrap(), None);
+    }
+
+    #[test]
+    fn present_composes_blocks_from_state_alone() {
+        use whisper_agent_protocol::weave::PresentationBlock;
+        let src = r#"
+            function on_event(s, e) return nil end
+            function present(state)
+              local blocks = {
+                { kind = "primary_transcript", thread_id = state.primary },
+                { kind = "status", text = "checking " .. state.n .. " calls" },
+              }
+              if state.checker then
+                blocks[#blocks + 1] =
+                  { kind = "thread_list", thread_ids = { state.checker } }
+              end
+              return blocks
+            end
+        "#;
+        let blocks = run_present(src, "d", &json!({"primary": "t1", "n": 2, "checker": "t2"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocks,
+            vec![
+                PresentationBlock::PrimaryTranscript {
+                    thread_id: "t1".into()
+                },
+                PresentationBlock::Status {
+                    text: "checking 2 calls".into()
+                },
+                PresentationBlock::ThreadList {
+                    thread_ids: vec!["t2".into()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn present_failures_are_reported_not_swallowed() {
+        let erroring = r#"
+            function on_event(s, e) return nil end
+            function present(state) error("display bug") end
+        "#;
+        let err = run_present(erroring, "d", &json!({})).unwrap_err();
+        assert!(err.contains("display bug"), "got: {err}");
+
+        let malformed = r#"
+            function on_event(s, e) return nil end
+            function present(state) return { { kind = "status" } } end
+        "#;
+        let err = run_present(malformed, "d", &json!({})).unwrap_err();
+        assert!(err.contains("malformed presentation"), "got: {err}");
+    }
+
+    #[test]
+    fn present_runs_under_the_same_instruction_budget() {
+        let runaway = r#"
+            function on_event(s, e) return nil end
+            function present(state)
+              local n = 0
+              while true do n = n + 1 end
+            end
+        "#;
+        let err = run_present(runaway, "d", &json!({})).unwrap_err();
+        assert!(err.contains("instruction budget"), "got: {err}");
     }
 }

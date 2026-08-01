@@ -251,6 +251,50 @@ impl Scheduler {
         if let Some(message) = failure {
             self.fail_scripted(weave_id, origin_thread, &message);
         }
+        self.refresh_scripted_presentation(weave_id);
+    }
+
+    /// Recompute the weave's presentation cache from the program's
+    /// `present(state)` after an activation, then re-send the wire
+    /// snapshot to weave subscribers (step 7b). Presentation errors
+    /// degrade the display to the degenerate fallback — they never fail
+    /// the weave's coordinated work.
+    fn refresh_scripted_presentation(&mut self, weave_id: &str) {
+        let Some(weave) = self.weaves.get(weave_id) else {
+            return;
+        };
+        let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = weave.driver.clone()
+        else {
+            return;
+        };
+        let pod_id = weave.pod_id.clone();
+        let DriverState::Scripted { data, .. } = &weave.driver_state else {
+            return;
+        };
+        let data = data.clone();
+        let blocks = match self.load_driver_program(&pod_id, &name) {
+            Ok(source) => match lua::run_present(&source, &name, &data) {
+                Ok(Some(blocks)) => blocks,
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    warn!(
+                        weave_id,
+                        error, "driver present() failed; degrading display"
+                    );
+                    Vec::new()
+                }
+            },
+            // An unreadable program already failed the activation
+            // itself; for the display it just means degenerate.
+            Err(_) => Vec::new(),
+        };
+        let weave = self.weaves.get_mut(weave_id).expect("present above");
+        let validated = weave.validate_presentation(blocks);
+        if weave.presentation != validated {
+            weave.presentation = validated;
+            self.mark_weave_dirty(weave_id);
+        }
+        self.notify_weave_subscribers(weave_id);
     }
 
     fn apply_scripted_effect(

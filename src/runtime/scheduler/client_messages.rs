@@ -310,8 +310,34 @@ impl Scheduler {
             ClientToServer::UnsubscribeFromThread { thread_id } => {
                 self.router.unsubscribe(conn_id, &thread_id);
             }
+            ClientToServer::SubscribeToWeave { weave_id } => {
+                if let Some(weave) = self.weaves.get(&weave_id) {
+                    let snapshot = weave.wire_snapshot();
+                    self.router.subscribe_weave(conn_id, &weave_id);
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::WeaveSnapshot { weave_id, snapshot },
+                    );
+                } else {
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id: None,
+                            thread_id: None,
+                            message: format!("unknown weave {weave_id}"),
+                        },
+                    );
+                }
+            }
+            ClientToServer::UnsubscribeFromWeave { weave_id } => {
+                self.router.unsubscribe_weave(conn_id, &weave_id);
+            }
             ClientToServer::ListThreads { correlation_id } => {
-                let tasks = self.tasks.values().map(|t| t.summary()).collect();
+                let tasks = self
+                    .tasks
+                    .values()
+                    .map(|t| self.decorate_summary(t.summary()))
+                    .collect();
                 self.router.send_to_client(
                     conn_id,
                     ServerToClient::ThreadList {

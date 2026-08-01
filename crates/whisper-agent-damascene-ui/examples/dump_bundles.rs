@@ -2060,6 +2060,8 @@ fn mock_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "t-2".into(),
@@ -2071,6 +2073,8 @@ fn mock_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "t-3".into(),
@@ -2082,6 +2086,8 @@ fn mock_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
     ]
 }
@@ -2130,6 +2136,8 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-child-a".into(),
@@ -2141,6 +2149,8 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: Some(parent_id.clone()),
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-child-b".into(),
@@ -2152,6 +2162,8 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: Some(parent_id.clone()),
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-child-c".into(),
@@ -2163,6 +2175,8 @@ fn mock_dispatch_chain_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: Some(parent_id),
+            weave_id: None,
+            weave_role: None,
         },
     ]
 }
@@ -2190,6 +2204,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-int-002".into(),
@@ -2201,6 +2217,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-int-003".into(),
@@ -2212,6 +2230,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: None,
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         // --- behavior-spawned (architect) ---
         ThreadSummary {
@@ -2224,6 +2244,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: Some(mk_origin("architect", "2026-05-09T02:00:00Z")),
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         // --- behavior-spawned (researcher, two recent fires) ---
         ThreadSummary {
@@ -2236,6 +2258,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: Some(mk_origin("researcher", "2026-05-09T07:50:00Z")),
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         ThreadSummary {
             thread_id: "task-researcher-002".into(),
@@ -2247,6 +2271,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: Some(mk_origin("researcher", "2026-05-09T06:50:00Z")),
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
         // --- orphan-origin (behavior 'old-greeter' was deleted but
         //     this thread survived; it should fall through to the
@@ -2261,6 +2287,8 @@ fn mock_mavis_threads() -> Vec<ThreadSummary> {
             origin: Some(mk_origin("old-greeter", "2026-05-01T10:00:00Z")),
             continued_from: None,
             dispatched_by: None,
+            weave_id: None,
+            weave_role: None,
         },
     ]
 }
@@ -2615,6 +2643,8 @@ fn mock_many_threads(n: usize) -> Vec<ThreadSummary> {
                 origin: None,
                 continued_from: None,
                 dispatched_by: None,
+                weave_id: None,
+                weave_role: None,
             }
         })
         .collect()

@@ -55,7 +55,7 @@ use tracing::{error, info, warn};
 use whisper_agent_protocol::{
     ClientToServer, ContentBlock, HostEnvBinding, KnowledgeAutoqueryConfig,
     KnowledgeAutoquerySource, ResourceKind, ServerToClient, ThreadBindings, ThreadBindingsRequest,
-    ThreadConfigOverride, ThreadStateLabel,
+    ThreadConfigOverride, ThreadStateLabel, ThreadSummary,
 };
 
 use crate::knowledge::BucketRegistry;
@@ -3349,6 +3349,43 @@ impl Scheduler {
         }
     }
 
+    /// Stamp weave coordinates onto a client-facing thread summary
+    /// (step 7b). `Thread::summary()` leaves `weave_id`/`weave_role`
+    /// empty — a thread has no knowledge of its relationships — so
+    /// every summary that ships over the wire passes through here,
+    /// picking up the ticking weave from the scheduler's index.
+    /// Dormant threads (no ticker) stay untagged.
+    pub(super) fn decorate_summary(&self, mut summary: ThreadSummary) -> ThreadSummary {
+        if let Some(weave_id) = self.thread_ticker.get(&summary.thread_id)
+            && let Some(weave) = self.weaves.get(weave_id)
+            && let Some(thread_ref) = weave
+                .threads
+                .iter()
+                .find(|r| r.thread_id == summary.thread_id)
+        {
+            summary.weave_id = Some(weave_id.clone());
+            summary.weave_role = Some(thread_ref.role);
+        }
+        summary
+    }
+
+    /// Re-send a weave's full wire snapshot to its subscribers. Called
+    /// whenever the weave's thread refs or presentation may have
+    /// changed (end of every scripted activation, unreference on
+    /// sweep). Snapshots are small and subscribers few, so occasional
+    /// unchanged re-sends beat tracking a last-broadcast copy.
+    pub(super) fn notify_weave_subscribers(&self, weave_id: &str) {
+        if let Some(weave) = self.weaves.get(weave_id) {
+            self.router.broadcast_to_weave_subscribers(
+                weave_id,
+                ServerToClient::WeaveSnapshot {
+                    weave_id: weave_id.to_string(),
+                    snapshot: weave.wire_snapshot(),
+                },
+            );
+        }
+    }
+
     /// Mark a behavior's `state.json` for writeback at the next flush.
     /// Mirrors `mark_dirty` for threads — the batched flush at the end
     /// of each scheduler-loop iteration serializes writes per-behavior,
@@ -4258,7 +4295,7 @@ impl Scheduler {
             )
             .flat_map(|bindings| bindings.mcp_hosts.iter().cloned())
             .collect();
-        let summary = task.summary();
+        let summary = self.decorate_summary(task.summary());
         self.cancel_tokens.insert(
             thread_id.clone(),
             tokio_util::sync::CancellationToken::new(),
@@ -5931,9 +5968,11 @@ impl Scheduler {
         for weave_id in &weaves_to_remove {
             self.weaves.remove(weave_id);
             self.dirty_weaves.remove(weave_id);
+            self.router.drop_weave(weave_id);
         }
         for weave_id in weaves_to_flush {
             self.mark_weave_dirty(&weave_id);
+            self.notify_weave_subscribers(&weave_id);
         }
         // v2 sessions are per-thread (no dedup) so nothing to release-
         // count — drop fires CloseSession to the daemon. In-flight

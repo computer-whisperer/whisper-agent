@@ -155,11 +155,14 @@ run_agent(thread, limits)                           -- tick one turn
 call_tool(thread, tool, arguments)
 derive_thread(definition, seed, relationship)       -- fork/compact/check/...
 adopt_ticker(thread) / release_ticker(thread)
-update_presentation(structure)
 emit_event(payload)
 await_input(selector)
 finish(outcome)
 ```
+
+(An `update_presentation(structure)` effect appeared in earlier drafts of
+this list; it was rejected when 7b was ratified — see Presentation. The
+display is a pure function of driver state, not an imperative effect.)
 
 `run_agent` remains a compound effect containing the tested
 model → tools → same-model loop; decomposing its sub-turns is not required
@@ -172,30 +175,66 @@ compatibility driver is the degenerate program.
 
 ## Presentation
 
-The driver assembles and updates a typed presentation data structure that
-fixed machinery in the UI renders — the driver composes blocks, it does not
-paint. The structure must be replayable: a pure function of persisted driver
-state, or maintained through journaled `update_presentation` effects, so a
-reconnecting client rebuilds the display without private channel state.
+The driver assembles a typed presentation data structure that fixed
+machinery in the UI renders — the driver composes blocks, it does not
+paint.
+
+**Ratified 2026-08-01: presentation is a pure function of persisted driver
+state.** A scripted program may define a second entry point
+`present(state) -> blocks`, evaluated in the same sandbox after each
+activation. It sees only the persisted driver state, so it is replayable
+by construction; there is no journal growth from display churn, and the
+display cannot drift from state. The journaled-`update_presentation`
+alternative was REJECTED because: every update bloats the effect journal
+with display-only records, reconnect needs the latest structure persisted
+anyway (so journaling buys no replay capability the pure function lacks),
+and an imperative update can be forgotten, leaving a stale display that
+the pure form makes unrepresentable. A program with no `present` — and
+every builtin weave — gets the degenerate presentation: one
+`primary_transcript` block plus the auxiliary thread list.
 
 The block vocabulary starts deliberately minimal and grows only as real
-drivers demand:
+drivers demand (a markdown panel was considered and deferred until a
+driver needs it):
 
 - `primary_transcript(thread_ref)` — the conversation head. A compaction
   roll is the driver advancing this pointer along a journaled
   `compaction` edge; the old context stays reachable via drill-down.
+  Typed input targets whatever thread this block references;
+  weave-routed input (`await_input`) is deferred until a driver needs it.
 - `thread_list([...])` — auxiliary referenced threads (checkers, subagents).
-- `status(text)` and a markdown panel.
+- `status(text)` — one-line driver state for the chrome.
 
 A malformed or erroring presentation falls back to the drill-down thread
-list; presentation can degrade, ground truth cannot.
+list; presentation can degrade, ground truth cannot. Blocks referencing
+threads the weave does not reference are dropped at validation — the
+structure can curate, never fabricate.
 
 ## Clients
 
 The Kotlin Android app is deprecated (ruling 2026-07-31). whisper-agent-
 damascene-ui gains a mobile-responsive layout system and is wrapped as the
 Android app. Wire-protocol growth for weaves therefore does not need to
-preserve the hand-mirrored Kotlin protocol layer.
+preserve the hand-mirrored Kotlin protocol layer; new weave messages are
+not mirrored into the Kotlin codec.
+
+**Wire shape ratified 2026-08-01 (7b):** the weave tier lands *additively*
+beside the existing thread tier. The thread tier — list broadcasts,
+per-thread subscription, snapshots, streaming turn events — is untouched
+and remains the single ground-truth stream. New messages carry weave
+snapshots (driver identity + program hash, thread refs with roles and
+relationships, presentation blocks) and presentation updates to weave
+subscribers. Composition is client-side: presentation blocks *reference*
+thread ids, and the client subscribes to those threads through the
+existing per-thread tier, mounting their streams into presentation slots.
+A server-side multiplex of thread events into weave envelopes was
+REJECTED as a translation layer with no gain — drill-down would no longer
+be literally the same machinery as normal rendering. `ThreadSummary`
+grows `weave_id` + `weave_role` tags so the conversation list can nest
+auxiliary threads under their weave's primary row (hiding auxiliaries
+entirely was rejected: ground truth stays one click, not one hop, away).
+The weave-first protocol rework (list weaves, subscribe by weave id,
+thread tier demoted to drill-down) is deferred to the final-naming step.
 
 ## Migration sequence
 
@@ -254,7 +293,13 @@ preserve the hand-mirrored Kotlin protocol layer.
    denials become synthesized error tool_results in one batch.
    `examples/drivers/auto_mode_checker.lua` is the working exercise
    case, tested end-to-end (deny and allow paths) in the scheduler
-   harness. Presentation vocabulary (7b) not started.
+   harness.
+   **Presentation half (7b) ratified 2026-08-01, in progress:** pure
+   `present(state)` (see Presentation), additive wire tier with
+   client-side composition (see Clients), `ThreadSummary` weave tags for
+   list nesting, and scope through a minimal damascene-ui weave view
+   (primary transcript + status + auxiliary thread list) so the
+   vocabulary is shaped by a real renderer.
 8. Move compaction onto weave machinery: head-advance along a `compaction`
    edge; delete the compaction-specific in-flight bit, internal originator,
    state hook, lineage field, and wire lifecycle.
@@ -267,11 +312,11 @@ preserve the hand-mirrored Kotlin protocol layer.
   vs. a pod-level entry store with threads as ordered entry-refs plus
   rendering directives (recovers deduplication; revisit if duplication
   bites).
-- Final presentation block vocabulary beyond the minimal set.
-- Wire shape for weave subscription/streaming (clients subscribe to a weave;
-  thread events route into presentation slots via run/participant ids).
+- Presentation block vocabulary growth beyond the ratified minimal three
+  (markdown panel, entry-range references) as drivers demand.
 - Final naming ("weave" provisional; protocol `Conversation` struct may want
   a `Transcript` rename if "conversation" is ever surfaced for the tier).
+  The weave-first client protocol rework belongs to the same step.
 
 ## Non-negotiable invariants
 

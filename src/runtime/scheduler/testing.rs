@@ -20,6 +20,7 @@ use crate::runtime::driver::{
 use crate::runtime::thread::{IoResult, ThreadInternalState};
 use crate::runtime::weave::WeaveThreadRole;
 use std::sync::atomic::{AtomicU64, Ordering};
+use whisper_agent_protocol::weave::PresentationBlock;
 use whisper_agent_protocol::{
     AllowMap, ContentBlock, GenerationContext, Message, PodAllow, PodConfig, PodLimits,
     PodModifyCap, ThreadConfigOverride, ThreadDefaultCaps, ThreadDefaults, ThreadDriverConfig,
@@ -664,6 +665,19 @@ async fn checker_driver_denies_tools_and_the_cycle_continues() {
     let weave_id = h.weave_of(&primary);
     let mut pending_io = FuturesUnordered::new();
 
+    // A weave subscriber (step 7b): receives the full snapshot on each
+    // refresh. Before any activation, the cache is empty and the wire
+    // snapshot degrades to the degenerate primary-transcript form.
+    let (weave_tx, mut weave_rx) = tokio::sync::mpsc::unbounded_channel();
+    h.sched.router.register_client(77, weave_tx);
+    h.sched.router.subscribe_weave(77, &weave_id);
+    assert_eq!(
+        h.sched.weaves[&weave_id].wire_snapshot().presentation,
+        vec![PresentationBlock::PrimaryTranscript {
+            thread_id: primary.clone()
+        }]
+    );
+
     // Turn 1: the driver runs the primary.
     h.sched.send_user_message(
         &primary,
@@ -734,6 +748,46 @@ async fn checker_driver_denies_tools_and_the_cycle_continues() {
         "checker was asked about the requested call"
     );
 
+    // Mid-check presentation: the driver's present(state) composed the
+    // head, a status line, and the in-flight checker — validated,
+    // cached on the weave, and pushed to the weave subscriber.
+    let mid_check = vec![
+        PresentationBlock::PrimaryTranscript {
+            thread_id: primary.clone(),
+        },
+        PresentationBlock::Status {
+            text: "permission check in flight (1 tool calls)".into(),
+        },
+        PresentationBlock::ThreadList {
+            thread_ids: vec![checker.clone()],
+        },
+    ];
+    assert_eq!(h.sched.weaves[&weave_id].presentation, mid_check);
+    let mut pushed = None;
+    while let Ok(event) = weave_rx.try_recv() {
+        if let ServerToClient::WeaveSnapshot { snapshot, .. } = event {
+            pushed = Some(snapshot);
+        }
+    }
+    let pushed = pushed.expect("subscriber got a weave snapshot");
+    assert_eq!(pushed.presentation, mid_check);
+    assert_eq!(pushed.threads.len(), 2);
+
+    // List-tier decoration: both threads carry the weave id; the
+    // derived checker is tagged auxiliary.
+    let decorated = h.sched.decorate_summary(h.sched.tasks[&checker].summary());
+    assert_eq!(decorated.weave_id.as_deref(), Some(weave_id.as_str()));
+    assert_eq!(
+        decorated.weave_role,
+        Some(whisper_agent_protocol::weave::WeaveThreadRole::Auxiliary)
+    );
+    let decorated = h.sched.decorate_summary(h.sched.tasks[&primary].summary());
+    assert_eq!(decorated.weave_id.as_deref(), Some(weave_id.as_str()));
+    assert_eq!(
+        decorated.weave_role,
+        Some(whisper_agent_protocol::weave::WeaveThreadRole::Primary)
+    );
+
     // The checker denies. The checker finishes; the primary's tool
     // request is closed with a synthesized error result and the cycle
     // continues into turn 2 without executing anything.
@@ -767,6 +821,21 @@ async fn checker_driver_denies_tools_and_the_cycle_continues() {
         journal
             .iter()
             .any(|r| matches!(&r.effect, PersistedDriverEffect::DeriveThread { .. }))
+    );
+
+    // Check resolved: the display drops the finished checker and
+    // returns to the bare head (the checker stays in the drill-down
+    // refs — curate, never conceal).
+    let after_check = h.sched.weaves[&weave_id].wire_snapshot();
+    assert_eq!(
+        after_check.presentation,
+        vec![PresentationBlock::PrimaryTranscript {
+            thread_id: primary.clone()
+        }]
+    );
+    assert!(
+        after_check.threads.iter().any(|r| r.thread_id == checker),
+        "finished checker still reachable via drill-down"
     );
 
     // Turn 2 responds without tools: the driver finishes the cycle.
