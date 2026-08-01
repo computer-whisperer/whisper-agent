@@ -3053,11 +3053,31 @@ impl Scheduler {
         // Register weaves before their threads so the ticker index is
         // populated by the time any thread becomes steppable. The
         // persister guarantees every loaded thread has a weave (loaded
-        // or synthesized).
-        for weave in state.weaves {
-            for thread_ref in &weave.threads {
-                self.thread_ticker
-                    .insert(thread_ref.thread_id.clone(), weave.id.clone());
+        // or synthesized). Only refs with `ticks` claim the ticker; a
+        // second claim on the same thread violates the single-ticker
+        // invariant and is healed by demoting the later ref to
+        // non-ticking (first weave wins, deterministically by the
+        // persister's load order).
+        for mut weave in state.weaves {
+            for thread_ref in &mut weave.threads {
+                if !thread_ref.ticks {
+                    continue;
+                }
+                match self.thread_ticker.entry(thread_ref.thread_id.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(weave.id.clone());
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        warn!(
+                            thread_id = %thread_ref.thread_id,
+                            winner = %entry.get(),
+                            loser = %weave.id,
+                            "two weaves claim one thread's ticker; demoting the later ref"
+                        );
+                        thread_ref.ticks = false;
+                        self.dirty_weaves.insert(weave.id.clone());
+                    }
+                }
             }
             self.weaves.insert(weave.id.clone(), weave);
         }
@@ -3466,6 +3486,10 @@ impl Scheduler {
         // dispatch, compaction) pass `None` and inherit the pod's
         // `thread_defaults.tool_surface`.
         tool_surface_override: Option<whisper_agent_protocol::ToolSurface>,
+        // `Some` marks a `derive_thread` effect: the named weave
+        // references and ticks the new thread instead of a minted
+        // singleton. See `register_new_task`.
+        ticked_by_weave: Option<(String, crate::runtime::driver::ThreadRelationship)>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
         // Resolve which pod this thread lands in. None routes to the
@@ -3762,7 +3786,8 @@ impl Scheduler {
             task = task.with_dispatched_by(parent_id, parent_depth);
         }
 
-        let thread_id = self.register_new_task(task, requester, correlation_id, pending_io);
+        let thread_id =
+            self.register_new_task(task, requester, correlation_id, ticked_by_weave, pending_io);
         self.seed_thread_setup(&thread_id, system_prompt_choice.as_ref());
         info!(thread_id = %thread_id, pod_id = %pod_id, "task created");
         Ok(thread_id)
@@ -4129,26 +4154,54 @@ impl Scheduler {
         task: Thread,
         requester: Option<ConnId>,
         correlation_id: Option<String>,
+        // `Some((weave_id, relationship))` marks a thread derived by an
+        // existing weave (the `derive_thread` effect): that weave
+        // references and ticks it, and no singleton is minted. `None` is
+        // every legacy creation path.
+        ticked_by_weave: Option<(String, crate::runtime::driver::ThreadRelationship)>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> String {
         let thread_id = task.id.clone();
         let pod_id = task.pod_id.clone();
 
-        // Every new thread gets its singleton ticking weave (created here
-        // rather than per creation path so forks, compaction
-        // continuations, dispatches, and behavior spawns all pass
-        // through). Load-path registration happens in `load_state`; a
-        // ticker entry that already exists is respected.
-        if !self.thread_ticker.contains_key(&thread_id) {
-            let weave = crate::runtime::weave::Weave::singleton_for_thread(
-                thread_id.clone(),
-                pod_id.clone(),
-                task.config.driver.clone(),
-            );
-            self.thread_ticker
-                .insert(thread_id.clone(), weave.id.clone());
-            self.mark_weave_dirty(&weave.id);
-            self.weaves.insert(weave.id.clone(), weave);
+        // Coordination: derived threads attach to the deriving weave;
+        // every other new thread gets its singleton ticking weave
+        // (created here rather than per creation path so forks,
+        // compaction continuations, dispatches, and behavior spawns all
+        // pass through). Load-path registration happens in `load_state`;
+        // a ticker entry that already exists is respected.
+        match ticked_by_weave {
+            Some((weave_id, relationship)) if self.weaves.contains_key(&weave_id) => {
+                let weave = self.weaves.get_mut(&weave_id).expect("checked above");
+                weave.add_derived(thread_id.clone(), relationship);
+                self.thread_ticker
+                    .insert(thread_id.clone(), weave_id.clone());
+                self.mark_weave_dirty(&weave_id);
+            }
+            other => {
+                if let Some((weave_id, _)) = other {
+                    // Defensive: the derive executor validates the weave
+                    // and the scheduler is single-writer, so this should
+                    // be unreachable — but an unticked thread would wedge
+                    // at its first boundary, so fall back to a singleton.
+                    warn!(
+                        weave_id = %weave_id,
+                        thread_id = %thread_id,
+                        "deriving weave vanished during registration; minting singleton"
+                    );
+                }
+                if !self.thread_ticker.contains_key(&thread_id) {
+                    let weave = crate::runtime::weave::Weave::singleton_for_thread(
+                        thread_id.clone(),
+                        pod_id.clone(),
+                        task.config.driver.clone(),
+                    );
+                    self.thread_ticker
+                        .insert(thread_id.clone(), weave.id.clone());
+                    self.mark_weave_dirty(&weave.id);
+                    self.weaves.insert(weave.id.clone(), weave);
+                }
+            }
         }
 
         let backend_names: std::collections::BTreeSet<_> = std::iter::once(&task.bindings)
@@ -4328,7 +4381,7 @@ impl Scheduler {
             }
         }
 
-        let new_id = self.register_new_task(task, requester, correlation_id, pending_io);
+        let new_id = self.register_new_task(task, requester, correlation_id, None, pending_io);
         self.mark_dirty(&new_id);
         info!(
             new_thread_id = %new_id,
@@ -4405,6 +4458,19 @@ impl Scheduler {
         attachments: Vec<whisper_agent_protocol::Attachment>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
+        // A dormant thread (no ticking weave) can't run the turn this
+        // input would kick — reject gracefully here rather than letting
+        // the first boundary fail the thread. Unreachable until a driver
+        // releases a ticker (every legacy thread has its singleton).
+        if !self.thread_ticker.contains_key(thread_id) {
+            self.router.dispatch_events(
+                thread_id,
+                vec![crate::runtime::thread::ThreadEvent::Error {
+                    message: "thread is dormant (no weave ticks it); input rejected".into(),
+                }],
+            );
+            return;
+        }
         self.mark_dirty(thread_id);
         let _ = pending_io;
         // If the thread was mid tool-call-cycle (AwaitingTools) when
@@ -4500,6 +4566,18 @@ impl Scheduler {
         text: String,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
+        // Same dormant-thread guard as `send_user_message`: this text
+        // kicks a turn, and a thread with no ticking weave has nothing
+        // to route the resulting boundary.
+        if !self.thread_ticker.contains_key(thread_id) {
+            self.router.dispatch_events(
+                thread_id,
+                vec![crate::runtime::thread::ThreadEvent::Error {
+                    message: "thread is dormant (no weave ticks it); input rejected".into(),
+                }],
+            );
+            return;
+        }
         self.mark_dirty(thread_id);
         let _ = pending_io;
         // Deliberately don't derive a title from this text — a
@@ -5235,6 +5313,288 @@ impl Scheduler {
         self.weave_interrupt_pending(thread_id, "cancelled");
     }
 
+    // ---------- cross-thread effect executors (migration step 6) ----------
+    //
+    // The `append_entry` / `derive_thread` / `adopt_ticker` /
+    // `release_ticker` vocabulary from docs/design_configurable_threads.md.
+    // Admission is scheduler-owned; every request — admitted or refused —
+    // lands in the weave's effect journal. Their first emitter is the
+    // scripted-driver effect loop of migration step 7; until it lands the
+    // executors have no production caller (hence the dead_code allowance,
+    // removed in step 7).
+
+    /// Execute an `append_entry` effect: pollute a referenced thread's
+    /// transcript with one authored entry. Pure transcript growth — the
+    /// target is not woken (running a thread is `run_agent` / input-path
+    /// business, not append's). Refused while the target is
+    /// mid-generation so the materialized log never carries an entry
+    /// sequenced before output that was produced without seeing it, and
+    /// never splits an assistant tool_use from its tool_result.
+    #[allow(dead_code)]
+    pub(super) fn weave_append_entry(
+        &mut self,
+        weave_id: &str,
+        target_thread_id: &str,
+        message: whisper_agent_protocol::Message,
+        source: Option<crate::runtime::driver::EntryRef>,
+    ) -> Result<usize, String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        if !self.weaves.contains_key(weave_id) {
+            return Err(format!("unknown weave `{weave_id}`"));
+        }
+        let Some(author) = message.author.clone() else {
+            // No author means no provenance to journal the request under;
+            // this is a caller-contract violation, not a driver decision.
+            return Err("append_entry requires an authored message".into());
+        };
+        let run_id = message.run_id.clone();
+
+        let admission = (|| -> Result<(), String> {
+            let weave = &self.weaves[weave_id];
+            if !weave.references(target_thread_id) {
+                return Err(format!(
+                    "weave does not reference thread `{target_thread_id}`"
+                ));
+            }
+            let task = self
+                .tasks
+                .get(target_thread_id)
+                .ok_or_else(|| format!("unknown thread `{target_thread_id}`"))?;
+            if task.pod_id != weave.pod_id {
+                return Err(format!(
+                    "thread `{target_thread_id}` is outside weave pod `{}`",
+                    weave.pod_id
+                ));
+            }
+            if task.is_mid_generation() {
+                return Err(format!(
+                    "thread `{target_thread_id}` is mid-generation; retry at its next boundary"
+                ));
+            }
+            Ok(())
+        })();
+
+        let entry_index = match admission {
+            Ok(()) => {
+                let (index, snapshot) = {
+                    let task = self.tasks.get_mut(target_thread_id).expect("checked above");
+                    task.conversation.push(message);
+                    task.touch();
+                    (task.conversation.messages().len() - 1, task.snapshot())
+                };
+                self.mark_dirty(target_thread_id);
+                self.router.broadcast_to_subscribers(
+                    target_thread_id,
+                    ServerToClient::ThreadSnapshot {
+                        thread_id: target_thread_id.to_string(),
+                        snapshot,
+                    },
+                );
+                Ok(index)
+            }
+            Err(message) => Err(message),
+        };
+
+        let effect = PersistedDriverEffect::AppendEntry {
+            target_thread_id: target_thread_id.to_string(),
+            entry_index: entry_index.as_ref().ok().copied(),
+            author,
+            run_id,
+            source,
+        };
+        let weave = self.weaves.get_mut(weave_id).expect("checked above");
+        match &entry_index {
+            Ok(_) => weave.record_completed_effect(effect),
+            Err(message) => weave.record_failed_effect(effect, message.clone()),
+        }
+        self.mark_weave_dirty(weave_id);
+        entry_index
+    }
+
+    /// Execute a `derive_thread` effect: create a new thread in the
+    /// weave's pod, seeded with authored entries, referenced and ticked
+    /// by the deriving weave (an explicit `release_ticker` makes it
+    /// dormant). Scope containment: the derived thread's base scope is
+    /// the primary thread's active scope — the weave acts with the
+    /// authority of the context it coordinates — narrowed further by the
+    /// definition override; absent a live primary, the pod ceiling.
+    #[allow(dead_code)]
+    pub(super) fn weave_derive_thread(
+        &mut self,
+        weave_id: &str,
+        config_override: Option<ThreadConfigOverride>,
+        bindings_request: Option<ThreadBindingsRequest>,
+        seed: Vec<whisper_agent_protocol::Message>,
+        relationship: crate::runtime::driver::ThreadRelationship,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<String, String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        let Some(weave) = self.weaves.get(weave_id) else {
+            return Err(format!("unknown weave `{weave_id}`"));
+        };
+        let pod_id = weave.pod_id.clone();
+        let base_scope_override = weave
+            .primary_thread_id()
+            .and_then(|tid| self.tasks.get(tid))
+            .map(|task| task.scope.clone());
+
+        let seed_entries = seed.len();
+        let created = if let Some(bad) = seed.iter().position(|m| m.author.is_none()) {
+            Err(format!(
+                "derive_thread seed entry {bad} has no author (pollution must carry provenance)"
+            ))
+        } else {
+            self.create_task(
+                None,
+                None,
+                Some(pod_id),
+                config_override,
+                bindings_request,
+                None,
+                None,
+                base_scope_override,
+                None,
+                Some((weave_id.to_string(), relationship.clone())),
+                pending_io,
+            )
+        };
+
+        if let Ok(thread_id) = &created
+            && seed_entries > 0
+        {
+            let task = self.tasks.get_mut(thread_id).expect("just created");
+            for entry in seed {
+                task.conversation.push(entry);
+            }
+            task.touch();
+            self.mark_dirty(thread_id);
+        }
+
+        let effect = PersistedDriverEffect::DeriveThread {
+            thread_id: created.as_ref().ok().cloned(),
+            relationship,
+            seed_entries,
+        };
+        if let Some(weave) = self.weaves.get_mut(weave_id) {
+            match &created {
+                Ok(_) => weave.record_completed_effect(effect),
+                Err(message) => weave.record_failed_effect(effect, message.clone()),
+            }
+            self.mark_weave_dirty(weave_id);
+        }
+        created
+    }
+
+    /// Execute an `adopt_ticker` effect: take over driving a dormant
+    /// thread's turns. Refused when any weave (including the caller)
+    /// already ticks the thread — ticker transfer is an explicit
+    /// release-then-adopt pair, each journaled on its own weave.
+    #[allow(dead_code)]
+    pub(super) fn weave_adopt_ticker(
+        &mut self,
+        weave_id: &str,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        if !self.weaves.contains_key(weave_id) {
+            return Err(format!("unknown weave `{weave_id}`"));
+        }
+        let admission = (|| -> Result<(), String> {
+            let weave = &self.weaves[weave_id];
+            let task = self
+                .tasks
+                .get(thread_id)
+                .ok_or_else(|| format!("unknown thread `{thread_id}`"))?;
+            if task.pod_id != weave.pod_id {
+                return Err(format!(
+                    "thread `{thread_id}` is outside weave pod `{}`",
+                    weave.pod_id
+                ));
+            }
+            match self.thread_ticker.get(thread_id) {
+                Some(current) if current == weave_id => {
+                    Err(format!("weave already ticks thread `{thread_id}`"))
+                }
+                Some(_) => Err(format!(
+                    "thread `{thread_id}` is already ticked by another weave"
+                )),
+                None => Ok(()),
+            }
+        })();
+
+        let effect = PersistedDriverEffect::AdoptTicker {
+            thread_id: thread_id.to_string(),
+        };
+        let weave = self.weaves.get_mut(weave_id).expect("checked above");
+        let result = match admission {
+            Ok(()) => {
+                weave.adopt(thread_id);
+                weave.record_completed_effect(effect);
+                self.thread_ticker
+                    .insert(thread_id.to_string(), weave_id.to_string());
+                Ok(())
+            }
+            Err(message) => {
+                weave.record_failed_effect(effect, message.clone());
+                Err(message)
+            }
+        };
+        self.mark_weave_dirty(weave_id);
+        result
+    }
+
+    /// Execute a `release_ticker` effect: stop driving a thread's turns,
+    /// leaving it dormant but still referenced (readable, appendable).
+    /// Refused while the thread has an active cycle — releasing
+    /// mid-cycle would strand its next boundary with no weave to route
+    /// it.
+    #[allow(dead_code)]
+    pub(super) fn weave_release_ticker(
+        &mut self,
+        weave_id: &str,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        if !self.weaves.contains_key(weave_id) {
+            return Err(format!("unknown weave `{weave_id}`"));
+        }
+        let admission = (|| -> Result<(), String> {
+            if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
+                return Err(format!("weave does not tick thread `{thread_id}`"));
+            }
+            if self
+                .tasks
+                .get(thread_id)
+                .is_some_and(|task| task.is_in_flight())
+            {
+                return Err(format!(
+                    "thread `{thread_id}` has an active cycle; release at idle"
+                ));
+            }
+            Ok(())
+        })();
+
+        let effect = PersistedDriverEffect::ReleaseTicker {
+            thread_id: thread_id.to_string(),
+        };
+        let weave = self.weaves.get_mut(weave_id).expect("checked above");
+        let result = match admission {
+            Ok(()) => {
+                let released = weave.release(thread_id);
+                debug_assert!(released);
+                weave.record_completed_effect(effect);
+                self.thread_ticker.remove(thread_id);
+                Ok(())
+            }
+            Err(message) => {
+                weave.record_failed_effect(effect, message.clone());
+                Err(message)
+            }
+        };
+        self.mark_weave_dirty(weave_id);
+        result
+    }
+
     /// Apply a driver `Finish` to the thread and broadcast the events.
     fn finish_thread_cycle(&mut self, thread_id: &str) {
         let mut events = Vec::new();
@@ -5468,25 +5828,29 @@ impl Scheduler {
         self.tasks.remove(thread_id);
         self.cancel_tokens.remove(thread_id);
         self.dirty.remove(thread_id);
-        // Weave teardown: drop the ticker entry, unreference the thread,
-        // and retire the weave entirely once it references nothing (the
-        // singleton case today).
-        let mut weave_to_remove: Option<String> = None;
-        if let Some(weave_id) = self.thread_ticker.remove(thread_id) {
-            let now_empty = match self.weaves.get_mut(&weave_id) {
-                Some(weave) => {
-                    weave.threads.retain(|r| r.thread_id != thread_id);
-                    weave.threads.is_empty()
-                }
-                None => false,
-            };
-            if now_empty {
-                self.weaves.remove(&weave_id);
-                self.dirty_weaves.remove(&weave_id);
-                weave_to_remove = Some(weave_id);
-            } else {
-                self.mark_weave_dirty(&weave_id);
+        // Weave teardown: drop the ticker entry, unreference the thread
+        // from EVERY weave (derived threads can be referenced beyond
+        // their ticker), and retire each weave that ends up referencing
+        // nothing.
+        self.thread_ticker.remove(thread_id);
+        let mut weaves_to_remove: Vec<String> = Vec::new();
+        let mut weaves_to_flush: Vec<String> = Vec::new();
+        for (weave_id, weave) in self.weaves.iter_mut() {
+            if !weave.remove_reference(thread_id) {
+                continue;
             }
+            if weave.threads.is_empty() {
+                weaves_to_remove.push(weave_id.clone());
+            } else {
+                weaves_to_flush.push(weave_id.clone());
+            }
+        }
+        for weave_id in &weaves_to_remove {
+            self.weaves.remove(weave_id);
+            self.dirty_weaves.remove(weave_id);
+        }
+        for weave_id in weaves_to_flush {
+            self.mark_weave_dirty(&weave_id);
         }
         // v2 sessions are per-thread (no dedup) so nothing to release-
         // count — drop fires CloseSession to the daemon. In-flight
@@ -5526,7 +5890,7 @@ impl Scheduler {
             if let Err(e) = result {
                 warn!(thread_id = %tid, error = %e, "retention sweep disk op failed");
             }
-            if let Some(weave_id) = weave_to_remove {
+            for weave_id in weaves_to_remove {
                 let result = match action {
                     RetentionAction::Archive => {
                         self::retention::archive_weave_json(&pod_dir, &weave_id).await

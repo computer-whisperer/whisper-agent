@@ -37,7 +37,7 @@ use crate::pod::behaviors::{self as pod_behaviors};
 use crate::pod::fs::MEMORY_DIR;
 use crate::pod::fs::is_readonly_path;
 use crate::pod::{self, POD_STATE_JSON, POD_TOML, Pod, PodId, THREADS_DIR, WEAVES_DIR};
-use crate::runtime::thread::{Thread, ThreadInternalState};
+use crate::runtime::thread::Thread;
 use crate::runtime::weave::Weave;
 use whisper_agent_protocol::{
     FsEntry, PodAllow, PodConfig, PodLimits, PodSnapshot, PodState, PodSummary, ThreadDefaults,
@@ -849,7 +849,7 @@ async fn load_one(path: &Path, pod_id: &str) -> Result<Thread> {
     // treat "user message" and "tool finished" as distinct concepts.
     // Idempotent — a no-op for already-migrated threads.
     task.conversation.normalize_legacy_tool_result_role();
-    if is_in_flight(&task.internal) {
+    if task.is_in_flight() {
         // Heal the conversation before flipping to Failed so an
         // `AwaitingTools` thread's `completed` results (and synthesized
         // errors for pending/in-flight tool_uses) are preserved rather
@@ -1003,18 +1003,6 @@ fn normalize_legacy_tool_schema_blocks(value: &mut serde_json::Value) {
     }
 }
 
-fn is_in_flight(state: &ThreadInternalState) -> bool {
-    matches!(
-        state,
-        ThreadInternalState::WaitingOnResources { .. }
-            | ThreadInternalState::NeedsModelCall
-            | ThreadInternalState::AwaitingModel { .. }
-            | ThreadInternalState::AwaitingTools { .. }
-            | ThreadInternalState::AgentBoundary { .. }
-            | ThreadInternalState::ToolsBoundary { .. }
-    )
-}
-
 /// Move any pre-pod-refactor `<pods_root>/*.json` files into
 /// `<pods_root>/.pre-pod-refactor-<ts>/`. Returns `Some(stash_dir)` when it
 /// actually moved at least one file.
@@ -1101,6 +1089,7 @@ mod tests {
     use whisper_agent_protocol::{AllowMap, ThreadBindings, ThreadConfig};
 
     use crate::permission::Scope;
+    use crate::runtime::thread::ThreadInternalState;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1286,6 +1275,63 @@ mod tests {
         assert_eq!(
             crate::runtime::driver::turns_in_cycle(&weave.driver_state),
             3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multi_ref_weave_round_trips_and_suppresses_singleton_synthesis() {
+        use crate::runtime::driver::{EntryRef, ThreadRelationship};
+        use crate::runtime::weave::WeaveThreadRole;
+
+        let dir = temp_dir();
+        let p = Persister::new(dir.clone()).await.unwrap();
+        // Both threads live in the primary's pod; sample_task pods are
+        // keyed by thread id, so derive the auxiliary into t-multi's pod.
+        let task = sample_task("t-multi");
+        let mut aux = sample_task("t-multi-check");
+        aux.pod_id = task.pod_id.clone();
+
+        let mut weave = crate::runtime::weave::Weave::singleton_for_thread(
+            task.id.clone(),
+            task.pod_id.clone(),
+            task.config.driver.clone(),
+        );
+        weave.add_derived(
+            aux.id.clone(),
+            ThreadRelationship {
+                kind: "check".into(),
+                source: Some(EntryRef {
+                    thread_id: task.id.clone(),
+                    entry_index: Some(4),
+                }),
+            },
+        );
+        assert!(weave.release(&aux.id)); // persist it dormant
+        p.flush(&task).await.unwrap();
+        p.flush(&aux).await.unwrap();
+        p.flush_weave(&weave).await.unwrap();
+
+        let loaded = p.load_all().await.unwrap();
+        // The auxiliary thread is referenced by the multi-ref weave, so
+        // no singleton is synthesized for it.
+        assert_eq!(loaded.weaves.len(), 1);
+        let weave = &loaded.weaves[0];
+        assert_eq!(weave.primary_thread_id(), Some("t-multi"));
+        assert_eq!(
+            weave.ticked_thread_ids().collect::<Vec<_>>(),
+            vec!["t-multi"]
+        );
+        let aux_ref = weave
+            .threads
+            .iter()
+            .find(|r| r.thread_id == "t-multi-check")
+            .expect("auxiliary ref survives the round trip");
+        assert_eq!(aux_ref.role, WeaveThreadRole::Auxiliary);
+        assert!(!aux_ref.ticks);
+        assert_eq!(
+            aux_ref.relationship.as_ref().map(|r| r.kind.as_str()),
+            Some("check")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3052,6 +3052,7 @@ impl Scheduler {
             dispatch_lineage,
             None,
             None,
+            None,
             pending_io,
         );
         let thread_id = match create_result {

@@ -152,6 +152,7 @@ impl Scheduler {
             None,
             Some(behavior_scope),
             tool_surface_override,
+            None,
             pending_io,
         )?;
         self.mark_dirty(&thread_id);

@@ -1,13 +1,15 @@
 # Configurable Threads and Weaves
 
-Status: **steps 1–5 landed** — participant foundation, execution profiles,
-the compatibility driver with its durable effect journal, and the weave
-entity itself: every thread is coordinated by a singleton weave, driver
-policy is inverted out of `Thread` (boundary outcomes routed through the
-ticking weave by the scheduler), and driver state/journal persist at
-`<pod>/weaves/<weave_id>.json`. The architectural target was re-ratified
-2026-07-31 into the pod/weave/thread model below; steps 6+ have not
-started.
+Status: **steps 1–6 landed** — participant foundation, execution profiles,
+the compatibility driver with its durable effect journal, the weave
+entity (singleton coordination, driver policy inverted out of `Thread`,
+persistence at `<pod>/weaves/<weave_id>.json`), and the cross-thread
+effect vocabulary: `append_entry` / `derive_thread` / `adopt_ticker` /
+`release_ticker` executors with scheduler admission, journaled outcomes
+(refusals included), persisted per-ref ticker flags, and dormant-thread
+semantics. The executors' first emitter is the scripted driver of step 7;
+until it lands they are exercised by tests only. The architectural target
+was re-ratified 2026-07-31 into the pod/weave/thread model below.
 
 This document records the migration from the original one-user/one-model
 agent loop to pods hosting materialized model contexts (threads) coordinated
@@ -208,7 +210,16 @@ preserve the hand-mirrored Kotlin protocol layer.
    first real consumers.)
 6. Cross-thread effect vocabulary: `derive_thread`, provenance-carrying
    `append_entry`, single-ticker admission with `adopt_ticker`/
-   `release_ticker`.
+   `release_ticker`. **Landed.** Semantics chosen: a derived thread is
+   referenced and ticked by the deriving weave from birth (release makes
+   it dormant); its base scope is the primary thread's active scope;
+   `append_entry` is pure transcript pollution (no wake) and is refused
+   while the target is mid-generation, preserving the materialized-log
+   forensics rule; input to a dormant thread is rejected at the input
+   path rather than failing the thread; sweeps unreference from every
+   weave and retire emptied ones. Ticker claims persist per-ref
+   (`ticks`, defaulting true for step-5 JSON) and conflicting claims are
+   demoted deterministically at load.
 7. First scripted (Lua) driver plus the minimal presentation vocabulary.
    Exercise case: the auto-mode permission checker — a derived thread with
    curated seed, custom prompt, tools disabled, intercepting tool admission —

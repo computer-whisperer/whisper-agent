@@ -358,6 +358,7 @@ impl Scheduler {
             None,
             None,
             None,
+            None,
             pending_io,
         ) {
             Ok(id) => id,

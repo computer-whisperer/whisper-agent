@@ -1017,6 +1017,31 @@ impl Thread {
         )
     }
 
+    /// Is the task anywhere inside an active cycle (a turn queued, waiting
+    /// on resources, or mid-generation)? Ticker release is refused while
+    /// this holds — releasing would strand the cycle with no weave to
+    /// route its next boundary. Also the persister's in-flight predicate.
+    pub fn is_in_flight(&self) -> bool {
+        !self.is_idle()
+    }
+
+    /// Is a provider request in flight or the tool loop mid-way? Narrower
+    /// than [`Self::is_in_flight`]: a queued-but-unbuilt model call
+    /// (`NeedsModelCall` / `WaitingOnResources`) does not count, because
+    /// the upcoming request is built from the log and will see any entry
+    /// appended now. Cross-thread appends are refused while this holds so
+    /// the materialized log never contains an entry sequenced before
+    /// output that was generated without seeing it.
+    pub fn is_mid_generation(&self) -> bool {
+        matches!(
+            self.internal,
+            ThreadInternalState::AwaitingModel { .. }
+                | ThreadInternalState::AwaitingTools { .. }
+                | ThreadInternalState::AgentBoundary { .. }
+                | ThreadInternalState::ToolsBoundary { .. }
+        )
+    }
+
     /// Advance the state machine. Caller provides `next_op_id` for fresh I/O ops and
     /// `events` as the out-param for task events emitted during this step.
     pub fn step(&mut self, next_op_id: &mut OpId, events: &mut Vec<ThreadEvent>) -> StepOutcome {

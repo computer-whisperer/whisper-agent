@@ -7,11 +7,15 @@
 //! to the threads it coordinates. It holds no tokens of its own; threads
 //! remain the materialized LLM contexts.
 //!
-//! Step 5 scope: every thread is coordinated by a singleton weave (weave id
-//! = thread id) running the compatibility driver. The scheduler routes
-//! thread boundary outcomes through the ticking weave's policy methods here
-//! and executes the returned effects; `Thread` no longer consults driver
-//! policy directly.
+//! Every new thread starts under a singleton weave (weave id = thread id)
+//! running the compatibility driver; the scheduler routes thread boundary
+//! outcomes through the ticking weave's policy methods here and executes
+//! the returned effects — `Thread` never consults driver policy directly.
+//! Beyond the singleton shape, a weave may reference several threads
+//! (primary + auxiliaries from `derive_thread`/`adopt_ticker`) and tick
+//! any subset of them; the cross-thread effect executors live in the
+//! scheduler (`weave_append_entry` and friends), which owns admission and
+//! the single-ticker index.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,23 +23,40 @@ use whisper_agent_protocol::{ParticipantId, ThreadDriverConfig, ThreadParticipan
 
 use crate::runtime::driver::{
     self, DriverEffect, DriverEffectId, DriverEffectJournal, DriverState, PersistedDriverEffect,
+    ThreadRelationship,
 };
 
 pub type WeaveId = String;
 
-/// Role a referenced thread plays in this weave. Step 5 knows only the
-/// primary conversation context; later steps add derived roles (compaction
-/// sources, permission checkers, subagents) carrying relationship metadata.
+/// Role a referenced thread plays in this weave: the primary conversation
+/// context, or an auxiliary thread the weave derived or adopted (compaction
+/// sources, permission checkers, subagents). Provenance detail lives in the
+/// ref's `relationship`, not the role.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WeaveThreadRole {
     Primary,
+    Auxiliary,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WeaveThreadRef {
     pub thread_id: String,
     pub role: WeaveThreadRole,
+    /// Whether this weave ticks the thread — drives its turns. A referenced
+    /// thread with no ticking ref anywhere is dormant: readable,
+    /// appendable, not running. Step-5 weave JSON predates the field and
+    /// described singletons that always ticked, so the default is `true`.
+    #[serde(default = "default_ticks")]
+    pub ticks: bool,
+    /// Relationship metadata for derived threads (`None` on primary and
+    /// adopted refs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<ThreadRelationship>,
+}
+
+const fn default_ticks() -> bool {
+    true
 }
 
 /// Durable driver instance. Persisted at
@@ -84,6 +105,8 @@ impl Weave {
             threads: vec![WeaveThreadRef {
                 thread_id,
                 role: WeaveThreadRole::Primary,
+                ticks: true,
+                relationship: None,
             }],
             created: now,
             last_active: now,
@@ -99,6 +122,71 @@ impl Weave {
 
     pub fn references(&self, thread_id: &str) -> bool {
         self.threads.iter().any(|r| r.thread_id == thread_id)
+    }
+
+    /// Threads whose turns this weave drives — the load path rebuilds the
+    /// scheduler's `thread_ticker` index from exactly these refs.
+    pub fn ticked_thread_ids(&self) -> impl Iterator<Item = &str> {
+        self.threads
+            .iter()
+            .filter(|r| r.ticks)
+            .map(|r| r.thread_id.as_str())
+    }
+
+    /// Record a thread derived by this weave (the `derive_thread` effect):
+    /// an auxiliary ref carrying its relationship, ticked from birth. The
+    /// driver releases the ticker explicitly if it wants the thread dormant.
+    pub fn add_derived(&mut self, thread_id: impl Into<String>, relationship: ThreadRelationship) {
+        self.touch();
+        self.threads.push(WeaveThreadRef {
+            thread_id: thread_id.into(),
+            role: WeaveThreadRole::Auxiliary,
+            ticks: true,
+            relationship: Some(relationship),
+        });
+    }
+
+    /// Mark an existing ref as ticking, or add an auxiliary ticking ref
+    /// for a thread this weave adopted without deriving.
+    pub fn adopt(&mut self, thread_id: &str) {
+        self.touch();
+        match self.threads.iter_mut().find(|r| r.thread_id == thread_id) {
+            Some(r) => r.ticks = true,
+            None => self.threads.push(WeaveThreadRef {
+                thread_id: thread_id.to_string(),
+                role: WeaveThreadRole::Auxiliary,
+                ticks: true,
+                relationship: None,
+            }),
+        }
+    }
+
+    /// Stop ticking a thread while keeping the reference (release ≠
+    /// unreference: the thread stays readable and appendable). Returns
+    /// false when this weave holds no ticking ref for the thread.
+    pub fn release(&mut self, thread_id: &str) -> bool {
+        let Some(r) = self
+            .threads
+            .iter_mut()
+            .find(|r| r.thread_id == thread_id && r.ticks)
+        else {
+            return false;
+        };
+        r.ticks = false;
+        self.touch();
+        true
+    }
+
+    /// Drop every ref to a swept thread. Returns true when a ref was
+    /// removed; the caller retires the weave once `threads` is empty.
+    pub fn remove_reference(&mut self, thread_id: &str) -> bool {
+        let before = self.threads.len();
+        self.threads.retain(|r| r.thread_id != thread_id);
+        let removed = self.threads.len() != before;
+        if removed {
+            self.touch();
+        }
+        removed
     }
 
     pub fn touch(&mut self) {
@@ -179,6 +267,19 @@ impl Weave {
         let effect_id = self.effect_journal.record(effect);
         let completed = self.effect_journal.complete(effect_id);
         debug_assert!(completed);
+    }
+
+    /// Record an effect whose admission was refused — auditable evidence
+    /// that the driver requested something the scheduler would not do.
+    pub fn record_failed_effect(
+        &mut self,
+        effect: PersistedDriverEffect,
+        message: impl Into<String>,
+    ) {
+        self.touch();
+        let effect_id = self.effect_journal.record(effect);
+        let failed = self.effect_journal.fail(effect_id, message);
+        debug_assert!(failed);
     }
 
     /// Resolve a pending record. Zero is the legacy sentinel for internal
@@ -292,6 +393,7 @@ mod tests {
         let mut json = serde_json::to_value(&weave).unwrap();
         assert_eq!(json["id"], "t-1");
         assert_eq!(json["threads"][0]["role"], "primary");
+        assert_eq!(json["threads"][0]["ticks"], true);
 
         // Older/foreign weave JSON without driver fields defaults cleanly.
         let object = json.as_object_mut().unwrap();
@@ -301,5 +403,68 @@ mod tests {
         let decoded: Weave = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.driver, ThreadDriverConfig::BuiltinSingleAgentChat);
         assert!(decoded.effect_journal.records().is_empty());
+    }
+
+    #[test]
+    fn step5_refs_without_ticks_field_default_to_ticking() {
+        // Step-5 weave JSON persisted refs as {thread_id, role} only;
+        // every singleton ticked its thread, so the missing field must
+        // decode as true or restarts leave legacy threads dormant.
+        let r: WeaveThreadRef =
+            serde_json::from_value(serde_json::json!({"thread_id": "t-1", "role": "primary"}))
+                .unwrap();
+        assert!(r.ticks);
+        assert_eq!(r.relationship, None);
+    }
+
+    #[test]
+    fn derive_adopt_release_manage_refs_and_ticker_flags() {
+        let mut weave =
+            Weave::singleton_for_thread("t-1", "pod", ThreadDriverConfig::BuiltinSingleAgentChat);
+        weave.add_derived(
+            "t-check",
+            ThreadRelationship {
+                kind: "check".into(),
+                source: Some(crate::runtime::driver::EntryRef {
+                    thread_id: "t-1".into(),
+                    entry_index: None,
+                }),
+            },
+        );
+        assert!(weave.references("t-check"));
+        assert_eq!(
+            weave.ticked_thread_ids().collect::<Vec<_>>(),
+            vec!["t-1", "t-check"]
+        );
+
+        // Release keeps the reference but stops ticking.
+        assert!(weave.release("t-check"));
+        assert!(weave.references("t-check"));
+        assert_eq!(weave.ticked_thread_ids().collect::<Vec<_>>(), vec!["t-1"]);
+        assert!(!weave.release("t-check")); // already dormant
+
+        // Adopt re-ticks the existing ref rather than duplicating it.
+        weave.adopt("t-check");
+        assert_eq!(weave.threads.len(), 2);
+        assert_eq!(
+            weave.ticked_thread_ids().collect::<Vec<_>>(),
+            vec!["t-1", "t-check"]
+        );
+
+        // Adopting a never-referenced thread adds an auxiliary ref
+        // without relationship metadata.
+        weave.adopt("t-orphan");
+        let aux = weave
+            .threads
+            .iter()
+            .find(|r| r.thread_id == "t-orphan")
+            .unwrap();
+        assert_eq!(aux.role, WeaveThreadRole::Auxiliary);
+        assert_eq!(aux.relationship, None);
+
+        // Sweep teardown drops the ref entirely.
+        assert!(weave.remove_reference("t-check"));
+        assert!(!weave.references("t-check"));
+        assert!(!weave.remove_reference("t-check"));
     }
 }

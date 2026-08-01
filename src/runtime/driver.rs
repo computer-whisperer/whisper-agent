@@ -6,10 +6,34 @@
 
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    GenerationContext, ParticipantId, ThreadDriverConfig, ThreadParticipants,
+    GenerationContext, GenerationRunId, ParticipantId, ThreadDriverConfig, ThreadParticipants,
 };
 
 pub type DriverEffectId = u64;
+
+/// Reference to an entry in another thread — the provenance unit carried by
+/// cross-thread effects. `entry_index` addresses `conversation.messages`;
+/// `None` means the reference is to the thread as a whole (e.g. a derived
+/// thread seeded from a curated summary rather than one specific entry).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EntryRef {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_index: Option<usize>,
+}
+
+/// Relationship metadata stamped on a derived thread. `kind` is
+/// driver-defined vocabulary ("fork", "compaction", "check", ...) rather
+/// than a closed enum: scripted drivers mint kinds and the runtime only
+/// stores and displays them. This metadata generalizes the existing
+/// compaction-lineage and dispatch parent links (migration steps 8-9
+/// fold those onto it).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRelationship {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EntryRef>,
+}
 
 /// Persisted mutable state owned by the selected driver. The enum is tagged so
 /// a future scripted driver can carry a different state shape without making
@@ -80,6 +104,40 @@ pub enum PersistedDriverEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation: Option<GenerationContext>,
         reason: DriverFinishReason,
+    },
+    /// Cross-thread pollution: one entry appended into a referenced
+    /// thread's transcript. The content lives in the target thread's log
+    /// (rendered per-participant by the projection machinery at request
+    /// build); the journal records where it landed and where it came from.
+    /// `entry_index` is `None` on records whose admission failed.
+    AppendEntry {
+        target_thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_index: Option<usize>,
+        author: ParticipantId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<GenerationRunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<EntryRef>,
+    },
+    /// A new thread created by this driver instance. `thread_id` is `None`
+    /// on records whose admission or creation failed.
+    DeriveThread {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id: Option<String>,
+        relationship: ThreadRelationship,
+        #[serde(default)]
+        seed_entries: usize,
+    },
+    /// Ticker admission: this weave took over driving a dormant thread's
+    /// turns.
+    AdoptTicker {
+        thread_id: String,
+    },
+    /// Ticker admission: this weave stopped driving a thread's turns,
+    /// leaving it dormant (still referenced, readable, not running).
+    ReleaseTicker {
+        thread_id: String,
     },
 }
 
@@ -468,6 +526,65 @@ mod tests {
                 reason: DriverFinishReason::TurnLimit,
             }),
             2
+        );
+    }
+
+    #[test]
+    fn cross_thread_effects_have_stable_tagged_wire_shape() {
+        let append = PersistedDriverEffect::AppendEntry {
+            target_thread_id: "t-main".into(),
+            entry_index: Some(7),
+            author: "checker".into(),
+            run_id: None,
+            source: Some(EntryRef {
+                thread_id: "t-check".into(),
+                entry_index: Some(3),
+            }),
+        };
+        let json = serde_json::to_value(&append).unwrap();
+        assert_eq!(json["kind"], "append_entry");
+        assert_eq!(json["target_thread_id"], "t-main");
+        assert_eq!(json["entry_index"], 7);
+        assert_eq!(json["source"]["thread_id"], "t-check");
+        assert!(json.get("run_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<PersistedDriverEffect>(json).unwrap(),
+            append
+        );
+
+        let derive = PersistedDriverEffect::DeriveThread {
+            thread_id: Some("t-check".into()),
+            relationship: ThreadRelationship {
+                kind: "check".into(),
+                source: Some(EntryRef {
+                    thread_id: "t-main".into(),
+                    entry_index: None,
+                }),
+            },
+            seed_entries: 2,
+        };
+        let json = serde_json::to_value(&derive).unwrap();
+        assert_eq!(json["kind"], "derive_thread");
+        assert_eq!(json["relationship"]["kind"], "check");
+        assert_eq!(json["seed_entries"], 2);
+        assert_eq!(
+            serde_json::from_value::<PersistedDriverEffect>(json).unwrap(),
+            derive
+        );
+
+        let adopt = PersistedDriverEffect::AdoptTicker {
+            thread_id: "t-2".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&adopt).unwrap()["kind"],
+            "adopt_ticker"
+        );
+        let release = PersistedDriverEffect::ReleaseTicker {
+            thread_id: "t-2".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&release).unwrap()["kind"],
+            "release_ticker"
         );
     }
 
