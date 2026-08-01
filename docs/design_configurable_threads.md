@@ -7,14 +7,12 @@ persistence at `<pod>/weaves/<weave_id>.json`), and the cross-thread
 effect vocabulary: `append_entry` / `derive_thread` / `adopt_ticker` /
 `release_ticker` executors with scheduler admission, journaled outcomes
 (refusals included), persisted per-ref ticker flags, and dormant-thread
-semantics. The executors' first emitter is the scripted driver of step 7.
-Test coverage honesty: the weave/journal/persistence building blocks are
-unit-tested, but the scheduler-level executors themselves have no test
-harness (constructing a `Scheduler` requires the full dependency
-surface) — their admission logic first runs under test when step 7's
-driver loop exercises it, unless a harness is built first. The
-architectural target was re-ratified 2026-07-31 into the pod/weave/
-thread model below.
+semantics. The executors' first emitter is the scripted driver of step 7;
+their admission/journaling choreography is covered by scheduler-level
+tests in `src/runtime/scheduler/testing.rs` (a real `Scheduler` over an
+empty resource surface — no backends, no persister, lazy I/O futures
+never polled). The architectural target was re-ratified 2026-07-31 into
+the pod/weave/thread model below.
 
 This document records the migration from the original one-user/one-model
 agent loop to pods hosting materialized model contexts (threads) coordinated
