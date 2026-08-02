@@ -4693,7 +4693,7 @@ impl Scheduler {
         // AFTER the submit: a scripted driver's input_accepted handler
         // may immediately run a turn, and the model request is built
         // eagerly — the new message must already be in the transcript.
-        self.weave_input_accepted(thread_id, pending_io);
+        self.weave_input_accepted(thread_id, &text, pending_io);
         // Emit the user message to subscribers BEFORE the state change
         // so the conversation view lands in order: user message first,
         // then the state flips to Working for the model turn it kicks.
@@ -4784,7 +4784,7 @@ impl Scheduler {
         };
         // After the submit, same as send_user_message: the driver's
         // input_accepted effects must see the appended notification.
-        self.weave_input_accepted(thread_id, pending_io);
+        self.weave_input_accepted(thread_id, &text, pending_io);
         self.router.broadcast_to_subscribers(
             thread_id,
             ServerToClient::ThreadToolResultMessage {
@@ -5511,6 +5511,7 @@ impl Scheduler {
     fn weave_input_accepted(
         &mut self,
         thread_id: &str,
+        text: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
@@ -5523,7 +5524,7 @@ impl Scheduler {
             weave.driver,
             whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
         ) {
-            self.scripted_input_accepted(&weave_id, thread_id, pending_io);
+            self.scripted_input_accepted(&weave_id, thread_id, text, pending_io);
             return;
         }
         if let Err(error) = weave.input_accepted() {

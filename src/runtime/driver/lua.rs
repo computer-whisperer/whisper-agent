@@ -51,8 +51,11 @@ const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScriptedEvent {
-    /// External input was accepted into a coordinated thread.
-    InputAccepted { thread_id: String },
+    /// External input was accepted into a coordinated thread. `text`
+    /// is the accepted message's text so coordinating drivers can
+    /// speak it into other threads (the roundtable pattern) — same
+    /// parity argument as `AgentCompleted` carrying the response text.
+    InputAccepted { thread_id: String, text: String },
     /// The thread is at a runnable turn boundary. `turn` counts
     /// model turns since the last external input on this thread.
     TurnStart { thread_id: String, turn: u32 },
@@ -406,6 +409,7 @@ mod tests {
             &out.state,
             &ScriptedEvent::InputAccepted {
                 thread_id: "t-1".into(),
+                text: "again".into(),
             },
         )
         .unwrap();

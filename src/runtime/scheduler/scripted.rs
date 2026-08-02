@@ -121,6 +121,7 @@ impl Scheduler {
         &mut self,
         weave_id: &str,
         thread_id: &str,
+        text: &str,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         if let Some(weave) = self.weaves.get_mut(weave_id) {
@@ -135,6 +136,7 @@ impl Scheduler {
             thread_id,
             ScriptedEvent::InputAccepted {
                 thread_id: thread_id.to_string(),
+                text: text.to_string(),
             },
             pending_io,
         );

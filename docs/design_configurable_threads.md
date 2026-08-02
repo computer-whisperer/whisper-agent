@@ -378,7 +378,55 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    (`*_pending_for`); records persisted before the attribution match
    any thread, and the load path's interrupt-everything remains the
    one legitimate bulk form (every thread heals at startup).
-9. Title generation, autoquery, behavior startup, and dispatch callbacks as
+9. First real multi-agent conversation driver.
+   **Ratified 2026-08-01 (three forks):**
+   - *Tangled-threads first* — each voice is its own thread (private
+     context; per-voice system prompt/model/tools set by
+     `derive_thread`), coordinated by the weave. The primary thread is
+     a driver-maintained minutes view: user input lands there, and
+     every voice reply is pollinated back as an attributed
+     `append_entry`, so the existing transcript UI *is* the merged
+     view and no presentation-vocabulary growth is required
+     (drill-down to each voice's private thread rides the step-7b
+     sidebar nesting). Shared-transcript-first was REJECTED for the
+     first driver: its cast needs a new creation-time mechanism
+     (evaluate the program, freeze a participant roster into
+     `participant_profiles`) whereas tangled needs no new server
+     surface at all; the per-participant projection layer stays
+     landed, and a shared-transcript driver remains a later
+     roster-slice + .lua. Both-in-one-slice REJECTED: doubles the
+     dogfooding surface before either shape is polished.
+   - *Cast is program-declared* — a table in the Lua program (voice
+     id, system prompt, optional model) feeding `derive_thread`
+     effects at runtime; picking the driver picks the cast. A UI
+     roster editor (the `ThreadOverrides` participant fields already
+     ride the wire unused) stays open for later; REJECTED as the
+     first mechanism because real UI work would precede any running
+     conversation, and a themed driver with a user-emptied cast is
+     meaningless.
+   - *First policy is one-pass round-robin* — per user input each
+     voice takes one turn in declared order; a voice's thread receives
+     the input plus earlier voices' replies as attributed entries
+     before its `run_agent`, and the round ends with `finish_cycle`
+     on the primary. Multi-round debate and moderator-selected
+     speakers are later .lua files, not architecture.
+   Required UI slice: transcript entries render their `author`
+   (per-entry authorship already rides the wire on every message;
+   no client displays it, and an unattributed minutes view is
+   unreadable).
+   **Code half landed 2026-08-01** (live dogfood pending):
+   damascene-ui renders voice chips (deterministic per-author accent,
+   gutter + caption; the user fill stays reserved for genuine input);
+   `input_accepted` events carry the accepted text (the one event
+   growth the shape needed — parity with `agent_completed`);
+   `examples/drivers/roundtable.lua` implements the ratified policy
+   (voice-tagged `derive_thread` relationships map cast ids to
+   threads; stacked input queues and rounds run back-to-back before
+   one primary `finish_cycle`); the scheduler harness proves two full
+   rounds end-to-end including attribution order in the minutes,
+   cross-pollination into idle voice contexts, presentation status,
+   and cast reuse on the second round.
+10. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 
 ## Open questions (flagged, not ratified)

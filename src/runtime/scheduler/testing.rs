@@ -27,6 +27,7 @@ use whisper_agent_protocol::{
 };
 
 const CHECKER_DRIVER: &str = include_str!("../../../examples/drivers/auto_mode_checker.lua");
+const ROUNDTABLE_DRIVER: &str = include_str!("../../../examples/drivers/roundtable.lua");
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1815,4 +1816,232 @@ end
         outcome_for(&h, &workers[0]).as_slice(),
         [DriverEffectOutcome::Completed]
     ));
+}
+
+/// The shipped roundtable driver (migration step 9, tangled-threads
+/// shape): the primary is a driver-maintained minutes view, each voice
+/// is a derived private-context thread, and one accepted input runs a
+/// one-pass round in CAST order — later voices hear earlier replies
+/// from the same round, every reply lands back in the minutes
+/// attributed to its speaker, and the round closes the primary's
+/// cycle. A second input reuses the derived cast.
+#[tokio::test]
+async fn roundtable_driver_runs_one_pass_rounds() {
+    let mut h = harness().await;
+    h.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    let primary = h.create_scripted_thread("roundtable").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Should we rewrite it in Rust?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    // The cast derived with voice-tagged relationship kinds.
+    let voice_thread = |h: &Harness, id: &str| -> String {
+        let kind = format!("voice:{id}");
+        h.sched.weaves[&weave_id]
+            .threads
+            .iter()
+            .find(|r| r.relationship.as_ref().is_some_and(|rel| rel.kind == kind))
+            .unwrap_or_else(|| panic!("voice `{id}` derived"))
+            .thread_id
+            .clone()
+    };
+    let optimist = voice_thread(&h, "optimist");
+    let skeptic = voice_thread(&h, "skeptic");
+
+    // First voice holds the floor; the second waits; the primary is
+    // parked open at its input boundary (no model runs on the minutes).
+    assert!(matches!(
+        h.internal_of(&optimist),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(matches!(h.internal_of(&skeptic), ThreadInternalState::Idle));
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::NeedsModelCall
+    ));
+
+    // Both voices heard the user's words as genuine user input, after
+    // their own (distinct) setup prefixes.
+    for voice in [&optimist, &skeptic] {
+        let last = h.sched.tasks[voice.as_str()]
+            .conversation
+            .messages()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            last.effective_author().as_str(),
+            whisper_agent_protocol::DEFAULT_INPUT_PARTICIPANT_ID
+        );
+        assert!(matches!(
+            &last.content[0],
+            ContentBlock::Text { text } if text == "Should we rewrite it in Rust?"
+        ));
+    }
+
+    // Mid-round presentation names the floor-holder.
+    assert!(
+        h.sched.weaves[&weave_id].presentation.iter().any(|block| {
+            matches!(block, PresentationBlock::Status { text } if text.contains("optimist"))
+        }),
+        "status block should say optimist is speaking"
+    );
+
+    // The optimist speaks: its reply lands in the minutes and in the
+    // skeptic's context (both attributed), and the floor passes.
+    h.respond_model(
+        &optimist,
+        vec![text_block("Do it - the wins compound.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&optimist),
+        ThreadInternalState::Completed
+    ));
+    assert!(matches!(
+        h.internal_of(&skeptic),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    // Conversation entries (setup-prefix messages are authored by the
+    // thread's own responder and aren't part of the minutes).
+    let authored_tail = |h: &Harness, thread: &str| -> Vec<(String, String)> {
+        h.sched.tasks[thread]
+            .conversation
+            .messages()
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.role,
+                    whisper_agent_protocol::Role::User | whisper_agent_protocol::Role::Assistant
+                )
+            })
+            .filter_map(|m| match m.content.first() {
+                Some(ContentBlock::Text { text }) => {
+                    Some((m.effective_author().as_str().to_string(), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(
+        authored_tail(&h, &primary)
+            .iter()
+            .any(|(author, text)| author == "optimist" && text.contains("wins compound")),
+        "minutes carries the optimist's reply attributed to it"
+    );
+    assert!(
+        authored_tail(&h, &skeptic)
+            .iter()
+            .any(|(author, text)| author == "optimist" && text.contains("wins compound")),
+        "skeptic hears the optimist before speaking"
+    );
+
+    // The skeptic closes the round: reply pollinated to the minutes
+    // and the (idle, un-woken) optimist, and the primary's cycle ends.
+    h.respond_model(
+        &skeptic,
+        vec![text_block("Migration cost says otherwise.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&skeptic),
+        ThreadInternalState::Completed
+    ));
+    assert!(matches!(
+        h.internal_of(&optimist),
+        ThreadInternalState::Completed
+    ));
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    let minutes = authored_tail(&h, &primary);
+    assert_eq!(
+        minutes
+            .iter()
+            .map(|(author, _)| author.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "optimist", "skeptic"],
+        "minutes reads as the full round in speaking order"
+    );
+    assert!(
+        authored_tail(&h, &optimist)
+            .iter()
+            .any(|(author, _)| author == "skeptic"),
+        "optimist's context caught the skeptic's reply for next round"
+    );
+
+    // Journal: 2 derives, 2 voice turns, 3 finishes (2 voices + the
+    // primary's round close), 6 appends (input to 2 voices, then each
+    // reply to minutes + the other voice) — all Completed.
+    let count = |pred: &dyn Fn(&PersistedDriverEffect) -> bool| -> usize {
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .filter(|r| pred(&r.effect) && r.outcome == DriverEffectOutcome::Completed)
+            .count()
+    };
+    assert_eq!(
+        count(&|e| matches!(e, PersistedDriverEffect::DeriveThread { .. })),
+        2
+    );
+    assert_eq!(
+        count(&|e| matches!(e, PersistedDriverEffect::RunAgent { .. })),
+        2
+    );
+    assert_eq!(
+        count(&|e| matches!(e, PersistedDriverEffect::Finish { .. })),
+        3
+    );
+    assert_eq!(
+        count(&|e| matches!(e, PersistedDriverEffect::AppendEntry { .. })),
+        6
+    );
+
+    // Round two reuses the cast: no new derives, same rotation.
+    h.sched.send_user_message(
+        &primary,
+        "What about the team?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        3,
+        "second round derives no new threads"
+    );
+    assert!(matches!(
+        h.internal_of(&optimist),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    h.respond_model(
+        &optimist,
+        vec![text_block("They will learn.")],
+        &mut pending_io,
+    );
+    h.respond_model(
+        &skeptic,
+        vec![text_block("Six months, minimum.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert_eq!(
+        authored_tail(&h, &primary)
+            .iter()
+            .map(|(author, _)| author.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "optimist", "skeptic", "user", "optimist", "skeptic"]
+    );
 }
