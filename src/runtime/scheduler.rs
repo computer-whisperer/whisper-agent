@@ -3383,36 +3383,41 @@ impl Scheduler {
             ) {
                 continue;
             }
+            // "Dead" = Failed (incl. persister-healed) OR Cancelled —
+            // both refuse `run_agent`, and a cancel can reach disk
+            // while the weave's post-notification driver state does
+            // not (threads flush before weaves), leaving the driver
+            // coordinating a corpse it was never told about.
+            let dead_detail = |thread_id: &str| -> Option<String> {
+                let task = self.tasks.get(thread_id)?;
+                task.failure_detail().or_else(|| {
+                    matches!(
+                        task.internal,
+                        crate::runtime::thread::ThreadInternalState::Cancelled
+                    )
+                    .then(|| "cancelled".to_string())
+                })
+            };
             // Primary-role deaths are reported first: a driver told
             // its auxiliary died while the head's death is still
             // unreported would advance stale coordination (e.g. run
             // the next voice of a round whose minutes thread is gone)
             // before learning the whole round is void.
-            let dead_ticked = |r: &&crate::runtime::weave::WeaveThreadRef| {
-                r.ticks
-                    && self
-                        .tasks
-                        .get(&r.thread_id)
-                        .is_some_and(|task| task.failure_detail().is_some())
-            };
-            let notices: Vec<(String, String)> = weave
+            let mut notices: Vec<(bool, String, String)> = weave
                 .threads
                 .iter()
-                .filter(|r| r.role == crate::runtime::weave::WeaveThreadRole::Primary)
-                .filter(dead_ticked)
-                .chain(
-                    weave
-                        .threads
-                        .iter()
-                        .filter(|r| r.role != crate::runtime::weave::WeaveThreadRole::Primary)
-                        .filter(dead_ticked),
-                )
-                .map(|r| {
-                    let message = self.tasks[&r.thread_id]
-                        .failure_detail()
-                        .expect("filtered on failure_detail");
-                    (r.thread_id.clone(), message)
+                .filter(|r| r.ticks)
+                .filter_map(|r| {
+                    dead_detail(&r.thread_id).map(|message| {
+                        let primary = r.role == crate::runtime::weave::WeaveThreadRole::Primary;
+                        (primary, r.thread_id.clone(), message)
+                    })
                 })
+                .collect();
+            notices.sort_by_key(|(primary, _, _)| !*primary);
+            let notices: Vec<(String, String)> = notices
+                .into_iter()
+                .map(|(_, thread_id, message)| (thread_id, message))
                 .collect();
             if !notices.is_empty() {
                 self.scripted_load_notices.insert(weave_id.clone(), notices);
@@ -6295,6 +6300,7 @@ impl Scheduler {
         for weave_id in &weaves_to_remove {
             self.weaves.remove(weave_id);
             self.dirty_weaves.remove(weave_id);
+            self.scripted_load_notices.remove(weave_id);
             self.router.drop_weave(weave_id);
         }
         for weave_id in weaves_to_flush {

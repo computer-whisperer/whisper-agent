@@ -446,7 +446,14 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    first activation replays them as deferred `thread_failed` events
    ahead of the triggering event, primary-role deaths first (an
    auxiliary's death reported while the head's is pending would
-   advance stale coordination). `thread_failed` is therefore an
+   advance stale coordination). Review hardening: "dead" includes
+   `Cancelled` (refuses `run_agent` like Failed, and a cancel can
+   reach the thread's JSON while the weave's post-notification driver
+   state does not — threads flush before weaves); a failed first
+   drain re-stashes undelivered death facts instead of dropping them;
+   weave removal (sweep, pod archive) clears pending notices;
+   driver-fault deaths, suppressed live, DO replay at load (the
+   program may have been fixed in between — contract text updated). `thread_failed` is therefore an
    idempotent FACT ("this thread is dead"), re-reportable across
    restarts — drivers must no-op on already-handled deaths. A
    mid-round restart heals both the parked primary and the in-flight

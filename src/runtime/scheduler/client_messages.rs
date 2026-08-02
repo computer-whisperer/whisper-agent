@@ -1193,6 +1193,7 @@ impl Scheduler {
                 for weave_id in pod_weave_ids {
                     self.weaves.remove(&weave_id);
                     self.dirty_weaves.remove(&weave_id);
+                    self.scripted_load_notices.remove(&weave_id);
                     self.router.drop_weave(&weave_id);
                 }
                 // Broadcast first so every client clears its view before the

@@ -84,14 +84,19 @@ pub enum ScriptedEvent {
     /// model/tool I/O failure, an external cancel, or (delivered at
     /// the weave's first activation after a restart) any ticked
     /// thread found dead at load, including threads the persister
-    /// healed mid-flight. Without this the driver waits forever on an
-    /// `agent_completed` that can never arrive (a Failed thread
-    /// refuses `run_agent`; only external input heals it). Treat it
-    /// as an idempotent fact — "this thread is dead" — not an edge:
-    /// a death the driver already handled live may be re-reported
-    /// after a restart. Deliberately NOT fired for driver-fault
-    /// failures (an erroring program would just error again on the
-    /// notification).
+    /// healed mid-flight and threads found Cancelled. Without this
+    /// the driver waits forever on an `agent_completed` that can
+    /// never arrive (a dead thread refuses `run_agent`; only external
+    /// input heals it). Treat it as an idempotent fact — "this thread
+    /// is dead" — not an edge: a death the driver already handled
+    /// live may be re-reported after a restart. When several deaths
+    /// replay at once they arrive primary-first then in ref order,
+    /// and a PEER's death may still be undelivered when yours
+    /// arrives — don't run a sibling from a death handler unless the
+    /// program can tolerate that sibling being dead too. Not fired
+    /// live for driver-fault failures (an erroring program would just
+    /// error again on the notification), but such deaths DO replay
+    /// after a restart — the program may have been fixed in between.
     ThreadFailed { thread_id: String, message: String },
 }
 

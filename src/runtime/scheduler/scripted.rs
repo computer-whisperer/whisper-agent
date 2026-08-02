@@ -298,8 +298,27 @@ impl Scheduler {
         self.scripted_active.remove(weave_id);
         // Queued leftovers are dropped: after a failure they would run
         // against a failed origin, and a clean drain leaves the queue
-        // empty anyway.
-        self.scripted_events.remove(weave_id);
+        // empty anyway. EXCEPT death facts — dropping an undelivered
+        // `thread_failed` re-opens the waits-forever wedge until the
+        // next restart re-detects it, so they re-stash for the next
+        // activation (queue order preserved keeps primary-first).
+        if let Some(queue) = self.scripted_events.remove(weave_id) {
+            let salvaged: Vec<(String, String)> = queue
+                .into_iter()
+                .filter_map(|event| match event {
+                    ScriptedEvent::ThreadFailed { thread_id, message } => {
+                        Some((thread_id, message))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !salvaged.is_empty() {
+                self.scripted_load_notices
+                    .entry(weave_id.to_string())
+                    .or_default()
+                    .extend(salvaged);
+            }
+        }
         if let Some(message) = failure {
             self.fail_scripted(weave_id, origin_thread, &message);
         }

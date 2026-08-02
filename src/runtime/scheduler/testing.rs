@@ -2340,9 +2340,10 @@ async fn roundtable_recovers_after_restart_mid_round() {
     let skeptic_tail = authored_tail(&fresh, &skeptic);
     assert!(skeptic_tail.iter().any(|(_, t)| t.contains("round one")));
     assert!(skeptic_tail.iter().any(|(_, t)| t.contains("round two")));
-    // A second post-restart round proves the notices drained on the
-    // first activation: no stale death facts re-void the round and no
-    // second replacement derives.
+    // A second post-restart round: no re-derivation and no stale
+    // re-voiding on later rounds. (The drained-once property itself is
+    // pinned by round two above — deliver-on-every-activation would
+    // have replayed the primary's death mid-round and voided it.)
     let mut pending_io2 = FuturesUnordered::new();
     fresh
         .sched
@@ -2356,5 +2357,90 @@ async fn roundtable_recovers_after_restart_mid_round() {
     assert!(matches!(
         fresh.internal_of(&optimist2),
         ThreadInternalState::AwaitingModel { .. }
+    ));
+}
+
+/// A cancel can reach a thread's JSON while the weave's
+/// post-notification driver state does not (threads flush before
+/// weaves): load then finds a ticked Cancelled thread the persisted
+/// driver still coordinates. Cancelled refuses `run_agent` exactly
+/// like Failed, so the dead-at-load rule must treat it as dead —
+/// without the notice the stale floor assignment routes every
+/// post-restart input into the pending queue forever (or, once the
+/// round is otherwise voided, `run_agent` on the mapped corpse fails
+/// the weave).
+#[tokio::test]
+async fn roundtable_restart_notices_a_cancelled_voice() {
+    let mut h = harness().await;
+    h.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    let primary = h.create_scripted_thread("roundtable").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "round one".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let voice_threads = |h: &Harness, id: &str| -> Vec<String> {
+        let kind = format!("voice:{id}");
+        h.sched.weaves[&weave_id]
+            .threads
+            .iter()
+            .filter(|r| r.relationship.as_ref().is_some_and(|rel| rel.kind == kind))
+            .map(|r| r.thread_id.clone())
+            .collect()
+    };
+    let optimist1 = voice_threads(&h, "optimist")[0].clone();
+    let skeptic = voice_threads(&h, "skeptic")[0].clone();
+
+    // Partial-flush window: the weave snapshot predates the cancel
+    // (driver state still holds the floor and the mapping), while the
+    // thread snapshot carries it.
+    let weave = h.sched.weaves[&weave_id].clone();
+    let mut threads = Vec::new();
+    for tid in [&primary, &optimist1, &skeptic] {
+        let mut task = h.sched.tasks[tid.as_str()].clone();
+        if *tid == optimist1 {
+            let mut events = Vec::new();
+            task.cancel(&mut events);
+        } else if task.is_in_flight() {
+            let mut events = Vec::new();
+            task.heal_to_idle("task was in-flight at last shutdown", &mut events);
+            task.fail("resume", "task was in-flight at last shutdown");
+        }
+        threads.push(task);
+    }
+    let mut fresh = harness().await;
+    fresh.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    fresh.sched.load_state(crate::pod::persist::LoadedState {
+        pods: Vec::new(),
+        threads,
+        weaves: vec![weave],
+    });
+    assert!(matches!(
+        fresh.internal_of(&optimist1),
+        ThreadInternalState::Cancelled
+    ));
+
+    // The healing input recovers cleanly: the cancelled voice's death
+    // fact unmaps it, a replacement derives, and the round runs.
+    let mut pending_io = FuturesUnordered::new();
+    fresh
+        .sched
+        .send_user_message(&primary, "round two".into(), Vec::new(), &mut pending_io);
+    fresh.sched.step_until_blocked(&primary, &mut pending_io);
+    let optimist2 = voice_threads(&fresh, "optimist")
+        .into_iter()
+        .find(|t| *t != optimist1)
+        .expect("replacement for the cancelled voice derived");
+    assert!(matches!(
+        fresh.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    fresh.respond_model(&optimist2, vec![text_block("Recovered.")], &mut pending_io);
+    fresh.respond_model(&skeptic, vec![text_block("Noted.")], &mut pending_io);
+    assert!(matches!(
+        fresh.internal_of(&primary),
+        ThreadInternalState::Completed
     ));
 }
