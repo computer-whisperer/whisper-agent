@@ -15,13 +15,21 @@
 -- its compose box. Input stacked while a round runs queues, and
 -- rounds run back-to-back until it drains.
 --
+-- Failure: a voice thread dying mid-round (provider failure, cancel —
+-- the scheduler delivers `thread_failed`) skips its turn; the dead
+-- thread is unmapped and the next round derives a replacement with a
+-- fresh context (a Failed thread refuses run_agent, so replacement is
+-- the only revival; the replacement does not remember earlier
+-- rounds). A server restart mid-round still strands the round —
+-- drivers don't run during load-path healing (known gap, needs a
+-- resume event).
+--
 -- The cast is program-declared: edit CAST, copy this file under
 -- <pod>/drivers/, and pick it at thread creation. Per voice: `id`
 -- (the attribution everyone sees), `prompt` (its private system
 -- prompt), and optional `model` (nil = the pod default).
 --
--- v1 limits: voices run with tools disabled; a voice thread failing
--- mid-round stalls the round (fresh input starts a new one).
+-- v1 limits: voices run with tools disabled.
 
 local CAST = {
   {
@@ -61,7 +69,7 @@ local function speak(state, speaker, text, from_thread, effects)
     thread_id = state.primary, author = speaker, text = text,
     source_thread_id = from_thread }
   for _, voice in ipairs(CAST) do
-    if voice.id ~= speaker then
+    if voice.id ~= speaker and state.voices[voice.id] then
       effects[#effects + 1] = { kind = "append_entry",
         thread_id = state.voices[voice.id], author = speaker, text = text,
         source_thread_id = from_thread }
@@ -70,7 +78,7 @@ local function speak(state, speaker, text, from_thread, effects)
 end
 
 -- Give every voice the user's words, then hand the first voice the
--- floor.
+-- floor. Only called with a complete cast (ensure_cast).
 local function start_round(state, text)
   local effects = {}
   state.queue = {}
@@ -83,7 +91,54 @@ local function start_round(state, text)
   state.speaking = table.remove(state.queue, 1)
   effects[#effects + 1] = { kind = "run_agent",
     thread_id = state.voices[state.speaking] }
-  return { effects = effects, state = state }
+  return effects
+end
+
+-- Derive any missing voice threads (first round, or replacements for
+-- dead voices), or start the round directly when the cast is whole.
+-- When derives are needed the input waits in state.awaiting until
+-- thread_derived drains them.
+local function ensure_cast(state, text)
+  state.voices = state.voices or {}
+  local derives = {}
+  for _, voice in ipairs(CAST) do
+    if not state.voices[voice.id] then
+      derives[#derives + 1] = { kind = "derive_thread",
+        relationship = "voice:" .. voice.id,
+        system_prompt = voice.prompt,
+        model = voice.model,
+        disable_tools = true,
+        source_thread_id = state.primary }
+    end
+  end
+  if #derives > 0 then
+    state.deriving = #derives
+    state.awaiting = text
+    return derives
+  end
+  return start_round(state, text)
+end
+
+-- Advance the floor after the current speaker's turn resolved (reply
+-- or death): run the next voice, or close the round — opening the
+-- next one immediately if input stacked up (the primary's cycle stays
+-- open across back-to-back rounds; one finish closes however many
+-- stacked submissions opened it).
+local function advance_floor(state, effects)
+  state.speaking = table.remove(state.queue, 1)
+  if state.speaking then
+    effects[#effects + 1] = { kind = "run_agent",
+      thread_id = state.voices[state.speaking] }
+    return
+  end
+  if state.pending and #state.pending > 0 then
+    for _, e in ipairs(ensure_cast(state, table.remove(state.pending, 1))) do
+      effects[#effects + 1] = e
+    end
+  else
+    effects[#effects + 1] = { kind = "finish_cycle",
+      thread_id = state.primary }
+  end
 end
 
 function on_event(state, event)
@@ -101,24 +156,7 @@ function on_event(state, event)
       state.pending[#state.pending + 1] = event.text
       return { state = state }
     end
-    if not state.voices then
-      -- First input: derive one thread per voice; the round starts
-      -- once the whole cast exists.
-      state.voices = {}
-      state.deriving = #CAST
-      state.pending = { event.text }
-      local effects = {}
-      for _, voice in ipairs(CAST) do
-        effects[#effects + 1] = { kind = "derive_thread",
-          relationship = "voice:" .. voice.id,
-          system_prompt = voice.prompt,
-          model = voice.model,
-          disable_tools = true,
-          source_thread_id = state.primary }
-      end
-      return { effects = effects, state = state }
-    end
-    return start_round(state, event.text)
+    return { effects = ensure_cast(state, event.text), state = state }
   end
 
   if k == "thread_derived" then
@@ -127,7 +165,9 @@ function on_event(state, event)
       state.voices[voice_id] = event.thread_id
       state.deriving = state.deriving - 1
       if state.deriving == 0 then
-        return start_round(state, table.remove(state.pending, 1))
+        local text = state.awaiting
+        state.awaiting = nil
+        return { effects = start_round(state, text), state = state }
       end
     end
     return { state = state }
@@ -135,32 +175,52 @@ function on_event(state, event)
 
   if k == "agent_completed" then
     local speaker = voice_of(state, event.thread_id)
-    if not speaker or speaker ~= state.speaking then
-      -- Not the floor-holding voice (or a re-delivered boundary).
-      return { state = state }
+    if not speaker then return { state = state } end
+    if speaker ~= state.speaking then
+      -- A superseded voice's reply — its round died under it (primary
+      -- cancelled). Close its cycle so a later round can run it
+      -- again; the floor has moved on and the reply is dropped.
+      return { effects = { { kind = "finish_cycle", thread_id = event.thread_id } },
+               state = state }
     end
     local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
     speak(state, speaker, event.text, event.thread_id, effects)
-    state.speaking = table.remove(state.queue, 1)
-    if state.speaking then
-      effects[#effects + 1] = { kind = "run_agent",
-        thread_id = state.voices[state.speaking] }
-    elseif state.pending and #state.pending > 0 then
-      -- Stacked input: the next round starts without closing the
-      -- primary's cycle (one finish closes however many stacked
-      -- submissions opened it).
-      local nxt = start_round(state, table.remove(state.pending, 1))
-      for _, e in ipairs(nxt.effects) do effects[#effects + 1] = e end
-    else
-      effects[#effects + 1] = { kind = "finish_cycle",
-        thread_id = state.primary }
-    end
+    advance_floor(state, effects)
     return { effects = effects, state = state }
   end
 
+  if k == "thread_failed" then
+    if event.thread_id == state.primary then
+      -- The minutes thread died (cancel or failure): the round is
+      -- void. Fresh input heals the primary and starts a new round;
+      -- queued input rides along until then.
+      state.speaking = nil
+      state.queue = nil
+      return { state = state }
+    end
+    local voice_id = voice_of(state, event.thread_id)
+    if not voice_id then return { state = state } end
+    -- The voice's thread is dead: unmap it so the next round derives
+    -- a replacement, drop it from this round's rotation, and if it
+    -- held the floor, move on without its reply.
+    state.voices[voice_id] = nil
+    if state.queue then
+      for i, id in ipairs(state.queue) do
+        if id == voice_id then table.remove(state.queue, i) break end
+      end
+    end
+    if voice_id == state.speaking then
+      local effects = {}
+      advance_floor(state, effects)
+      return { effects = effects, state = state }
+    end
+    return { state = state }
+  end
+
   -- turn_start re-fires while the primary is parked at its input
-  -- boundary; the conversation is driven off input_accepted and
-  -- agent_completed, so every other boundary parks.
+  -- boundary; the conversation is driven off input_accepted,
+  -- agent_completed, and thread_failed, so every other boundary
+  -- parks.
   return { state = state }
 end
 

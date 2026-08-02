@@ -80,6 +80,15 @@ pub enum ScriptedEvent {
         thread_id: String,
         relationship: String,
     },
+    /// A coordinated thread died outside the driver's own effects — a
+    /// model/tool I/O failure or an external cancel. Without this the
+    /// driver waits forever on an `agent_completed` that can never
+    /// arrive (a Failed thread refuses `run_agent`; only external
+    /// input heals it). Deliberately NOT fired for driver-fault
+    /// failures (an erroring program would just error again on the
+    /// notification) or during load-path healing (drivers don't run
+    /// at load).
+    ThreadFailed { thread_id: String, message: String },
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]

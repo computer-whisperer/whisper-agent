@@ -243,6 +243,34 @@ impl Harness {
             .apply_io_result(op_id, IoResult::ModelCall(Ok(response)), &mut events);
         self.sched.step_until_blocked(thread_id, pending_io);
     }
+
+    /// Fail the thread's in-flight model call through the scheduler's
+    /// real io-completion path — unlike [`Self::respond_model`], which
+    /// applies straight to the task, this exercises the layer that
+    /// resolves journal records and notifies scripted drivers of the
+    /// death.
+    fn fail_model(
+        &mut self,
+        thread_id: &str,
+        message: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let op_id = match self.internal_of(thread_id) {
+            ThreadInternalState::AwaitingModel { op_id, .. } => *op_id,
+            other => panic!("thread `{thread_id}` is not awaiting a model call: {other:?}"),
+        };
+        self.sched.apply_io_completion(
+            crate::runtime::io_dispatch::IoCompletion {
+                thread_id: thread_id.to_string(),
+                op_id,
+                result: IoResult::ModelCall(Err(message.to_string())),
+                pod_update: None,
+                scheduler_command: None,
+                knowledge_hit_keys: Vec::new(),
+            },
+            pending_io,
+        );
+    }
 }
 
 fn text_block(text: &str) -> ContentBlock {
@@ -1818,6 +1846,30 @@ end
     ));
 }
 
+/// Conversation entries of a thread as (author, text) pairs —
+/// setup-prefix messages (system prompt, tool manifest) are authored
+/// by the thread's own responder and aren't part of the transcript
+/// proper, so only User/Assistant roles count.
+fn authored_tail(h: &Harness, thread: &str) -> Vec<(String, String)> {
+    h.sched.tasks[thread]
+        .conversation
+        .messages()
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.role,
+                whisper_agent_protocol::Role::User | whisper_agent_protocol::Role::Assistant
+            )
+        })
+        .filter_map(|m| match m.content.first() {
+            Some(ContentBlock::Text { text }) => {
+                Some((m.effective_author().as_str().to_string(), text.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The shipped roundtable driver (migration step 9, tangled-threads
 /// shape): the primary is a driver-maintained minutes view, each voice
 /// is a derived private-context thread, and one accepted input runs a
@@ -1909,27 +1961,6 @@ async fn roundtable_driver_runs_one_pass_rounds() {
         h.internal_of(&skeptic),
         ThreadInternalState::AwaitingModel { .. }
     ));
-    // Conversation entries (setup-prefix messages are authored by the
-    // thread's own responder and aren't part of the minutes).
-    let authored_tail = |h: &Harness, thread: &str| -> Vec<(String, String)> {
-        h.sched.tasks[thread]
-            .conversation
-            .messages()
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m.role,
-                    whisper_agent_protocol::Role::User | whisper_agent_protocol::Role::Assistant
-                )
-            })
-            .filter_map(|m| match m.content.first() {
-                Some(ContentBlock::Text { text }) => {
-                    Some((m.effective_author().as_str().to_string(), text.clone()))
-                }
-                _ => None,
-            })
-            .collect()
-    };
     assert!(
         authored_tail(&h, &primary)
             .iter()
@@ -2043,5 +2074,140 @@ async fn roundtable_driver_runs_one_pass_rounds() {
             .map(|(author, _)| author.as_str())
             .collect::<Vec<_>>(),
         vec!["user", "optimist", "skeptic", "user", "optimist", "skeptic"]
+    );
+}
+
+/// A voice dying mid-round must not wedge the roundtable: the
+/// `thread_failed` event advances the floor past the dead voice, the
+/// round completes with the survivors, and the next round derives a
+/// fresh replacement (a Failed thread refuses `run_agent`). Also pins
+/// the stacked-input path: input sent mid-round queues and runs as a
+/// back-to-back round before the primary's single cycle close. Fails
+/// against the pre-`thread_failed` vocabulary — the driver waited
+/// forever on the dead voice and swallowed all future input.
+#[tokio::test]
+async fn roundtable_survives_voice_failure_and_stacked_input() {
+    let mut h = harness().await;
+    h.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    let primary = h.create_scripted_thread("roundtable").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "round one".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let voice_threads = |h: &Harness, id: &str| -> Vec<String> {
+        let kind = format!("voice:{id}");
+        h.sched.weaves[&weave_id]
+            .threads
+            .iter()
+            .filter(|r| r.relationship.as_ref().is_some_and(|rel| rel.kind == kind))
+            .map(|r| r.thread_id.clone())
+            .collect()
+    };
+    let optimist1 = voice_threads(&h, "optimist")[0].clone();
+    let skeptic = voice_threads(&h, "skeptic")[0].clone();
+    assert!(matches!(
+        h.internal_of(&optimist1),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // The optimist's backend dies mid-turn: the floor advances to the
+    // skeptic instead of waiting forever, and the round still closes.
+    h.fail_model(&optimist1, "backend 500", &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&optimist1),
+        ThreadInternalState::Failed { .. }
+    ));
+    assert!(matches!(
+        h.internal_of(&skeptic),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    h.respond_model(
+        &skeptic,
+        vec![text_block("Alone this round.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    // Round two: a fresh replacement optimist derives; the dead
+    // thread stays referenced for drill-down but unmapped.
+    h.sched
+        .send_user_message(&primary, "round two".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        4,
+        "replacement derived, dead voice still referenced"
+    );
+    let optimist2 = voice_threads(&h, "optimist")
+        .into_iter()
+        .find(|t| *t != optimist1)
+        .expect("replacement optimist derived");
+    assert!(matches!(
+        h.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // Stacked input mid-round: queues without disturbing the voice in
+    // flight.
+    h.sched
+        .send_user_message(&primary, "round three".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    h.respond_model(&optimist2, vec![text_block("Fresh eyes.")], &mut pending_io);
+    h.respond_model(&skeptic, vec![text_block("Costs.")], &mut pending_io);
+    // Round two closed and round three began immediately: the
+    // primary's cycle spans back-to-back rounds (one finish closes
+    // both stacked submissions).
+    assert!(
+        !matches!(h.internal_of(&primary), ThreadInternalState::Completed),
+        "primary's cycle must span back-to-back rounds"
+    );
+    assert!(matches!(
+        h.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    h.respond_model(
+        &optimist2,
+        vec![text_block("Still worth it.")],
+        &mut pending_io,
+    );
+    h.respond_model(
+        &skeptic,
+        vec![text_block("Agreed, cautiously.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    // Minutes: the dead optimist is absent from round one; the
+    // stacked input lands at submit time (before the replies of the
+    // round it interrupted).
+    assert_eq!(
+        authored_tail(&h, &primary)
+            .iter()
+            .map(|(author, _)| author.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "user", "skeptic", "user", "user", "optimist", "skeptic", "optimist", "skeptic"
+        ]
+    );
+    // The replacement's context is fresh — it never saw round one.
+    assert!(
+        !authored_tail(&h, &optimist2)
+            .iter()
+            .any(|(_, text)| text.contains("round one") || text.contains("Alone this round")),
+        "replacement voice must not inherit the dead voice's history"
     );
 }

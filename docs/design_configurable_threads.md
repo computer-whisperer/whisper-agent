@@ -417,15 +417,38 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    **Code half landed 2026-08-01** (live dogfood pending):
    damascene-ui renders voice chips (deterministic per-author accent,
    gutter + caption; the user fill stays reserved for genuine input);
-   `input_accepted` events carry the accepted text (the one event
-   growth the shape needed — parity with `agent_completed`);
-   `examples/drivers/roundtable.lua` implements the ratified policy
-   (voice-tagged `derive_thread` relationships map cast ids to
-   threads; stacked input queues and rounds run back-to-back before
-   one primary `finish_cycle`); the scheduler harness proves two full
-   rounds end-to-end including attribution order in the minutes,
-   cross-pollination into idle voice contexts, presentation status,
-   and cast reuse on the second round.
+   `input_accepted` events carry the accepted text (parity with
+   `agent_completed`); `examples/drivers/roundtable.lua` implements
+   the ratified policy (voice-tagged `derive_thread` relationships map
+   cast ids to threads; stacked input queues and rounds run
+   back-to-back before one primary `finish_cycle`); the scheduler
+   harness proves two full rounds end-to-end including attribution
+   order in the minutes, cross-pollination into idle voice contexts,
+   presentation status, and cast reuse on the second round.
+   **Review-driven vocabulary growth:** `thread_failed` — a
+   coordinated thread dying outside the driver's own effects
+   (model/tool I/O failure on the Failed transition, external cancel)
+   is reported to scripted ticking weaves; without it a coordinating
+   driver waits forever on a completion that can never arrive (the
+   review's one HIGH: a mid-round voice failure permanently wedged
+   the weave, and a Failed thread refuses `run_agent`, so the dead
+   voice could never speak again). Deliberately NOT fired for
+   driver-fault failures (an erroring program would error again on
+   the notification) or during load-path healing (drivers don't run
+   at load). The roundtable skips the dead voice's turn, unmaps it,
+   and derives a fresh-context replacement next round; the harness
+   pins the failure path and the stacked-input path through the real
+   io-completion layer.
+   Accepted gaps at step-9 close: restart mid-round strands that
+   round (driver state persists `speaking` but load-path healing
+   fires no driver events — the likely future shape is a
+   `weave_resumed` event, unratified); `input_accepted` cannot
+   distinguish human input from `send_tool_result_text`'s
+   machine-rendered callbacks (unreachable for the roundtable —
+   voices are tools-off and the primary never dispatches — wants a
+   `source` field before a driver both coordinates and dispatches);
+   a replacement voice does not inherit the dead voice's private
+   history (fresh context; entry-copy vocabulary would be needed).
 10. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 

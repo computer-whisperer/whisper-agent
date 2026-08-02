@@ -3365,6 +3365,10 @@ impl Scheduler {
         let mut cancel_events = Vec::new();
         task.cancel(&mut cancel_events);
         self.weave_cancelled(thread_id);
+        // A scripted ticking weave hears about the death the same way
+        // it would for an I/O failure — a cancelled voice must not
+        // leave its coordinator waiting on a completion forever.
+        self.scripted_thread_failed(thread_id, "cancelled", pending_io);
         // Fire the per-thread cancel signal so any in-flight
         // model/tool/MCP HTTP request aborts at the wire instead of
         // running to completion and having its result discarded.

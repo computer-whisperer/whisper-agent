@@ -142,6 +142,41 @@ impl Scheduler {
         );
     }
 
+    /// Tell a scripted ticking weave that a coordinated thread died
+    /// outside the driver's own effects (model/tool I/O failure,
+    /// external cancel) — otherwise a coordinating driver waits
+    /// forever on a completion that can never arrive. Builtin weaves
+    /// have no program to inform; driver-fault failures and load-path
+    /// healing deliberately fire nothing (see `ScriptedEvent`).
+    pub(super) fn scripted_thread_failed(
+        &mut self,
+        thread_id: &str,
+        message: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
+            return;
+        };
+        let is_scripted = self.weaves.get(&weave_id).is_some_and(|weave| {
+            matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            )
+        });
+        if !is_scripted {
+            return;
+        }
+        self.run_scripted_driver(
+            &weave_id,
+            thread_id,
+            ScriptedEvent::ThreadFailed {
+                thread_id: thread_id.to_string(),
+                message: message.to_string(),
+            },
+            pending_io,
+        );
+    }
+
     /// Feed events through the driver program until the queue drains,
     /// executing each returned effect in order. Any driver error —
     /// unreadable program, VM failure, malformed outcome, refused

@@ -4859,25 +4859,34 @@ impl Scheduler {
             } => Some((tool_use_id.clone(), tc_result.clone())),
             _ => None,
         };
-        if let Some(task) = self.tasks.get_mut(&thread_id) {
+        let failed_before = if let Some(task) = self.tasks.get_mut(&thread_id) {
+            let failed_before = task.failure_detail().is_some();
             task.apply_io_result(op_id, result, &mut events);
             if !knowledge_hit_keys.is_empty() {
                 task.seen_knowledge_hits.extend(knowledge_hit_keys);
             }
+            failed_before
         } else {
             warn!(%thread_id, op_id, "io completion for unknown task");
             return;
-        }
+        };
         // A model-call error fails the thread inside `apply_io_result`;
         // the thread no longer owns the journal, so resolve the pending
         // `RunAgent` record on its ticking weave here. Idempotent — only
-        // Pending records are touched.
+        // Pending records are touched. A scripted ticking weave is then
+        // told the thread died (on the Failed TRANSITION only — a
+        // thread with several in-flight ops gets one completion per
+        // op): without the event a coordinating driver waits forever
+        // on a completion that can never arrive.
         if let Some(message) = self
             .tasks
             .get(&thread_id)
             .and_then(|task| task.failure_detail())
         {
             self.weave_fail_pending(&thread_id, &message);
+            if !failed_before {
+                self.scripted_thread_failed(&thread_id, &message, pending_io);
+            }
         }
         let suppress_knowledge_nudge = events.iter().any(|event| {
             matches!(
