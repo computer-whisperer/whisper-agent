@@ -439,10 +439,20 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    and derives a fresh-context replacement next round; the harness
    pins the failure path and the stacked-input path through the real
    io-completion layer.
-   Accepted gaps at step-9 close: restart mid-round strands that
-   round (driver state persists `speaking` but load-path healing
-   fires no driver events — the likely future shape is a
-   `weave_resumed` event, unratified); `input_accepted` cannot
+   **Restart healing (ratified as the arc closer):** no new event
+   kind — `load_state` collects every ticked thread of a scripted
+   weave found dead after persister healing (durable facts, so a
+   restart-before-first-activation re-detects them) and the weave's
+   first activation replays them as deferred `thread_failed` events
+   ahead of the triggering event, primary-role deaths first (an
+   auxiliary's death reported while the head's is pending would
+   advance stale coordination). `thread_failed` is therefore an
+   idempotent FACT ("this thread is dead"), re-reportable across
+   restarts — drivers must no-op on already-handled deaths. A
+   mid-round restart heals both the parked primary and the in-flight
+   voice, so the roundtable voids the stale round and the healing
+   input runs clean; surviving voices keep their contexts.
+   Accepted gaps at step-9 close: `input_accepted` cannot
    distinguish human input from `send_tool_result_text`'s
    machine-rendered callbacks (unreachable for the roundtable —
    voices are tools-off and the primary never dispatches — wants a

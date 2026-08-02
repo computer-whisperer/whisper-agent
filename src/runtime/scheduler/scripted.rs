@@ -146,8 +146,10 @@ impl Scheduler {
     /// outside the driver's own effects (model/tool I/O failure,
     /// external cancel) — otherwise a coordinating driver waits
     /// forever on a completion that can never arrive. Builtin weaves
-    /// have no program to inform; driver-fault failures and load-path
-    /// healing deliberately fire nothing (see `ScriptedEvent`).
+    /// have no program to inform; driver-fault failures deliberately
+    /// fire nothing (see `ScriptedEvent`). Deaths at load are not
+    /// fired here — `load_state` collects them and the weave's first
+    /// activation replays them ahead of its triggering event.
     pub(super) fn scripted_thread_failed(
         &mut self,
         thread_id: &str,
@@ -196,6 +198,19 @@ impl Scheduler {
         event: ScriptedEvent,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
+        // First activation since load: deliver the deferred death
+        // facts collected by `load_state` BEFORE the triggering event,
+        // so the driver's world-model catches up with the restart
+        // before it decides anything new.
+        if let Some(notices) = self.scripted_load_notices.remove(weave_id) {
+            let queue = self
+                .scripted_events
+                .entry(weave_id.to_string())
+                .or_default();
+            for (thread_id, message) in notices {
+                queue.push_back(ScriptedEvent::ThreadFailed { thread_id, message });
+            }
+        }
         self.scripted_events
             .entry(weave_id.to_string())
             .or_default()

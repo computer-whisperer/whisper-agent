@@ -20,9 +20,12 @@
 -- thread is unmapped and the next round derives a replacement with a
 -- fresh context (a Failed thread refuses run_agent, so replacement is
 -- the only revival; the replacement does not remember earlier
--- rounds). A server restart mid-round still strands the round —
--- drivers don't run during load-path healing (known gap, needs a
--- resume event).
+-- rounds). A restart mid-round heals in-flight threads to Failed and
+-- the scheduler replays those deaths as thread_failed facts at the
+-- weave's first activation — the primary's death voids the stale
+-- round, so the next input starts cleanly. thread_failed may
+-- re-report a death this driver already handled; every handler here
+-- is a no-op for unmapped threads.
 --
 -- The cast is program-declared: edit CAST, copy this file under
 -- <pod>/drivers/, and pick it at thread creation. Per voice: `id`

@@ -853,6 +853,15 @@ pub struct Scheduler {
     scripted_active: HashSet<String>,
     scripted_events:
         HashMap<String, std::collections::VecDeque<crate::runtime::driver::lua::ScriptedEvent>>,
+    /// Deferred `thread_failed` facts collected at load: ticked threads
+    /// of scripted weaves found dead after persister healing. Drivers
+    /// don't run at load, so `run_scripted_driver` delivers these at
+    /// the weave's first activation, ahead of the triggering event —
+    /// otherwise a coordinator whose thread died across a restart
+    /// waits forever on a completion that cannot arrive. In-memory
+    /// only: rebuilt from durable thread state at every load, so a
+    /// restart-before-first-activation re-detects the same facts.
+    scripted_load_notices: HashMap<String, Vec<(String, String)>>,
     /// Behavior ids whose `state.json` needs writeback. Keyed by
     /// `(pod_id, behavior_id)`. Serialization through this set (rather
     /// than tokio::spawn per update) means two rapid state changes
@@ -1079,6 +1088,7 @@ impl Scheduler {
                 dirty_weaves: HashSet::new(),
                 scripted_active: HashSet::new(),
                 scripted_events: HashMap::new(),
+                scripted_load_notices: HashMap::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
                 usage_tx,
@@ -3354,6 +3364,58 @@ impl Scheduler {
                     pod_id = %task.pod_id,
                     "loaded thread references unknown pod; dropping",
                 );
+            }
+        }
+        // A scripted weave's driver believes whatever its persisted
+        // state says, and drivers don't run at load — so ticked
+        // threads found dead here (persister-healed mid-flight, or
+        // failed before shutdown) must be reported at the weave's
+        // first activation, or a coordinator waits forever on
+        // completions that cannot arrive (the roundtable's mid-round
+        // restart wedge). Collect the facts; `run_scripted_driver`
+        // delivers them as deferred `thread_failed` events ahead of
+        // the triggering event. Re-reporting a death the driver
+        // already handled live is harmless: the event states a fact.
+        for (weave_id, weave) in &self.weaves {
+            if !matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            ) {
+                continue;
+            }
+            // Primary-role deaths are reported first: a driver told
+            // its auxiliary died while the head's death is still
+            // unreported would advance stale coordination (e.g. run
+            // the next voice of a round whose minutes thread is gone)
+            // before learning the whole round is void.
+            let dead_ticked = |r: &&crate::runtime::weave::WeaveThreadRef| {
+                r.ticks
+                    && self
+                        .tasks
+                        .get(&r.thread_id)
+                        .is_some_and(|task| task.failure_detail().is_some())
+            };
+            let notices: Vec<(String, String)> = weave
+                .threads
+                .iter()
+                .filter(|r| r.role == crate::runtime::weave::WeaveThreadRole::Primary)
+                .filter(dead_ticked)
+                .chain(
+                    weave
+                        .threads
+                        .iter()
+                        .filter(|r| r.role != crate::runtime::weave::WeaveThreadRole::Primary)
+                        .filter(dead_ticked),
+                )
+                .map(|r| {
+                    let message = self.tasks[&r.thread_id]
+                        .failure_detail()
+                        .expect("filtered on failure_detail");
+                    (r.thread_id.clone(), message)
+                })
+                .collect();
+            if !notices.is_empty() {
+                self.scripted_load_notices.insert(weave_id.clone(), notices);
             }
         }
     }

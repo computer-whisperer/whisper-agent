@@ -2211,3 +2211,150 @@ async fn roundtable_survives_voice_failure_and_stacked_input() {
         "replacement voice must not inherit the dead voice's history"
     );
 }
+
+/// Restart mid-round: the persister heals in-flight threads to Failed
+/// and drivers don't run at load, so the persisted driver state still
+/// holds the floor assignment. `load_state` collects the dead ticked
+/// threads and the weave's first activation replays them as deferred
+/// `thread_failed` facts (primary first) ahead of the triggering
+/// event: the roundtable voids the stale round, re-derives the dead
+/// voice, keeps the surviving voice's context, and the healing input
+/// runs a clean round. Fails against the pre-notice behavior — the
+/// driver queued all post-restart input forever.
+#[tokio::test]
+async fn roundtable_recovers_after_restart_mid_round() {
+    let mut h = harness().await;
+    h.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    let primary = h.create_scripted_thread("roundtable").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "round one".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let voice_threads = |h: &Harness, id: &str| -> Vec<String> {
+        let kind = format!("voice:{id}");
+        h.sched.weaves[&weave_id]
+            .threads
+            .iter()
+            .filter(|r| r.relationship.as_ref().is_some_and(|rel| rel.kind == kind))
+            .map(|r| r.thread_id.clone())
+            .collect()
+    };
+    let optimist1 = voice_threads(&h, "optimist")[0].clone();
+    let skeptic = voice_threads(&h, "skeptic")[0].clone();
+    assert!(matches!(
+        h.internal_of(&optimist1),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // "Restart": apply the persister's in-flight heal to cloned state
+    // and load it into a fresh scheduler (same recovery `load_one`
+    // performs — see pod/persist.rs).
+    let weave = h.sched.weaves[&weave_id].clone();
+    let mut threads = Vec::new();
+    for tid in [&primary, &optimist1, &skeptic] {
+        let mut task = h.sched.tasks[tid.as_str()].clone();
+        if task.is_in_flight() {
+            let mut events = Vec::new();
+            task.heal_to_idle("task was in-flight at last shutdown", &mut events);
+            task.fail("resume", "task was in-flight at last shutdown");
+        }
+        threads.push(task);
+    }
+    let mut fresh = harness().await;
+    fresh.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    fresh.sched.load_state(crate::pod::persist::LoadedState {
+        pods: Vec::new(),
+        threads,
+        weaves: vec![weave],
+    });
+    // The parked primary and the in-flight voice both healed to
+    // Failed; the idle voice survived.
+    assert!(matches!(
+        fresh.internal_of(&primary),
+        ThreadInternalState::Failed { .. }
+    ));
+    assert!(matches!(
+        fresh.internal_of(&optimist1),
+        ThreadInternalState::Failed { .. }
+    ));
+    assert!(matches!(
+        fresh.internal_of(&skeptic),
+        ThreadInternalState::Idle
+    ));
+
+    // Fresh input heals the primary; the driver hears the deferred
+    // deaths first (round voided, dead voice unmapped), then the
+    // input — deriving a replacement optimist and running a clean
+    // round with the surviving skeptic.
+    let mut pending_io = FuturesUnordered::new();
+    fresh
+        .sched
+        .send_user_message(&primary, "round two".into(), Vec::new(), &mut pending_io);
+    fresh.sched.step_until_blocked(&primary, &mut pending_io);
+
+    assert_eq!(
+        fresh.sched.weaves[&weave_id].threads.len(),
+        4,
+        "replacement optimist derived; dead voice still referenced"
+    );
+    let optimist2 = voice_threads(&fresh, "optimist")
+        .into_iter()
+        .find(|t| *t != optimist1)
+        .expect("replacement optimist derived");
+    assert!(matches!(
+        fresh.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    fresh.respond_model(
+        &optimist2,
+        vec![text_block("Back online.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        fresh.internal_of(&skeptic),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    fresh.respond_model(
+        &skeptic,
+        vec![text_block("Prove it lasts.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        fresh.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    // Minutes: round one's input never got replies (the round died
+    // with the restart); round two ran cleanly.
+    assert_eq!(
+        authored_tail(&fresh, &primary)
+            .iter()
+            .map(|(author, _)| author.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "user", "optimist", "skeptic"]
+    );
+    // The surviving skeptic kept its context across the restart: it
+    // heard round one's input AND round two's.
+    let skeptic_tail = authored_tail(&fresh, &skeptic);
+    assert!(skeptic_tail.iter().any(|(_, t)| t.contains("round one")));
+    assert!(skeptic_tail.iter().any(|(_, t)| t.contains("round two")));
+    // A second post-restart round proves the notices drained on the
+    // first activation: no stale death facts re-void the round and no
+    // second replacement derives.
+    let mut pending_io2 = FuturesUnordered::new();
+    fresh
+        .sched
+        .send_user_message(&primary, "round three".into(), Vec::new(), &mut pending_io2);
+    fresh.sched.step_until_blocked(&primary, &mut pending_io2);
+    assert_eq!(
+        fresh.sched.weaves[&weave_id].threads.len(),
+        4,
+        "no re-derivation on the second post-restart round"
+    );
+    assert!(matches!(
+        fresh.internal_of(&optimist2),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+}

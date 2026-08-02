@@ -81,13 +81,17 @@ pub enum ScriptedEvent {
         relationship: String,
     },
     /// A coordinated thread died outside the driver's own effects — a
-    /// model/tool I/O failure or an external cancel. Without this the
-    /// driver waits forever on an `agent_completed` that can never
-    /// arrive (a Failed thread refuses `run_agent`; only external
-    /// input heals it). Deliberately NOT fired for driver-fault
+    /// model/tool I/O failure, an external cancel, or (delivered at
+    /// the weave's first activation after a restart) any ticked
+    /// thread found dead at load, including threads the persister
+    /// healed mid-flight. Without this the driver waits forever on an
+    /// `agent_completed` that can never arrive (a Failed thread
+    /// refuses `run_agent`; only external input heals it). Treat it
+    /// as an idempotent fact — "this thread is dead" — not an edge:
+    /// a death the driver already handled live may be re-reported
+    /// after a restart. Deliberately NOT fired for driver-fault
     /// failures (an erroring program would just error again on the
-    /// notification) or during load-path healing (drivers don't run
-    /// at load).
+    /// notification).
     ThreadFailed { thread_id: String, message: String },
 }
 
