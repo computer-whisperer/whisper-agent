@@ -121,9 +121,18 @@ enum DisplayItem {
         /// next index past the current `view.items`' last seen User
         /// — see `view_user_msg_index_for_streaming`.
         msg_index: usize,
+        /// Voice attribution for entries spoken by someone other than
+        /// the thread's own input participant — weave pollution
+        /// (`append_entry`) carries the speaking voice's id here.
+        /// `None` renders as a plain user turn.
+        author: Option<String>,
     },
     Assistant {
         text: String,
+        /// Voice attribution for model turns spoken by a non-default
+        /// participant (shared-transcript threads). `None` renders as
+        /// the thread's own agent voice.
+        author: Option<String>,
     },
     Reasoning {
         text: String,
@@ -4238,6 +4247,7 @@ impl ChatApp {
                         view.items.push(DisplayItem::User {
                             text,
                             msg_index: view.next_msg_index,
+                            author: None,
                         });
                     }
                     // Inline-render any image attachments the user
@@ -4280,10 +4290,13 @@ impl ChatApp {
                     // there is one — same shape as the egui sibling
                     // so a long generation doesn't fan out into one
                     // card per delta.
-                    if let Some(DisplayItem::Assistant { text }) = view.items.last_mut() {
+                    if let Some(DisplayItem::Assistant { text, .. }) = view.items.last_mut() {
                         text.push_str(&delta);
                     } else {
-                        view.items.push(DisplayItem::Assistant { text: delta });
+                        view.items.push(DisplayItem::Assistant {
+                            text: delta,
+                            author: None,
+                        });
                     }
                 }
             }
@@ -6089,16 +6102,39 @@ fn chat_user_row_key(idx: usize) -> String {
     format!("chat:user-row:{idx}")
 }
 
+/// Deterministic accent for a voice's attribution chip and gutter.
+/// Named tokens (like the diff colors) so themes can restyle; the
+/// palette deliberately avoids the INFO / SUCCESS hues that already
+/// mean "user input" / "own agent voice" in the log gutter.
+const VOICE_COLORS: [Color; 4] = [
+    Color::srgb_token("voice-amber", 235, 190, 120, 255),
+    Color::srgb_token("voice-violet", 190, 150, 235, 255),
+    Color::srgb_token("voice-cyan", 120, 210, 220, 255),
+    Color::srgb_token("voice-rose", 235, 140, 170, 255),
+];
+
+fn voice_color(author: &str) -> Color {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    author.hash(&mut h);
+    VOICE_COLORS[(h.finish() as usize) % VOICE_COLORS.len()]
+}
+
 fn chat_virtual_row_key(_idx: usize, item: &DisplayItem) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let kind = match item {
-        DisplayItem::User { text, msg_index } => {
+        DisplayItem::User {
+            text,
+            msg_index,
+            author,
+        } => {
             msg_index.hash(&mut h);
             text.hash(&mut h);
+            author.hash(&mut h);
             "user"
         }
-        DisplayItem::Assistant { text } => {
+        DisplayItem::Assistant { text, author } => {
             text.hash(&mut h);
+            author.hash(&mut h);
             "assistant"
         }
         DisplayItem::Reasoning { text } => {
@@ -17516,7 +17552,9 @@ impl ChatApp {
             return;
         };
         let Some(seed_text) = view.items.iter().find_map(|it| match it {
-            DisplayItem::User { text, msg_index: m } if *m == msg_index => Some(text.clone()),
+            DisplayItem::User {
+                text, msg_index: m, ..
+            } if *m == msg_index => Some(text.clone()),
             _ => None,
         }) else {
             return;
@@ -22219,7 +22257,11 @@ impl ChatApp {
         hovered_key: Option<&str>,
     ) -> El {
         match item {
-            DisplayItem::User { text: t, msg_index } => {
+            DisplayItem::User {
+                text: t,
+                msg_index,
+                author,
+            } => {
                 // Wrap the body in a keyed container so
                 // `is_hovering_within` can answer "is the cursor on
                 // this row?" — the fork affordance fades in based on
@@ -22247,7 +22289,7 @@ impl ChatApp {
                 // present.
                 let text_key = chat_text_key(idx, "user");
                 let text_el = selectable_paragraph(text_key, t).width(Size::Fill(1.0));
-                let inner = if hovered {
+                let body = if hovered {
                     // `git-branch` ships in damascene's built-in icon
                     // registry — close enough to a "fork" semantic
                     // for v1 without bundling a `git-fork` SVG.
@@ -22259,19 +22301,36 @@ impl ChatApp {
                         .gap(tokens::SPACE_2)
                         .align(Align::Start)
                         .width(Size::Fill(1.0))
-                        .key(row_key)
                 } else {
-                    column([text_el]).width(Size::Fill(1.0)).key(row_key)
+                    column([text_el]).width(Size::Fill(1.0))
                 };
-                // Upstream README's worked example uses
-                // `with_alpha_u8(18)` (~7%) for the user fill — too low
-                // to be visible against the dark zinc-950 background.
-                // Bump to ~25% so user turns actually break up a long
-                // assistant stream. Subtle enough to still read as
-                // "log entry, not card".
-                log_row(tokens::INFO, Some(tokens::INFO.with_alpha_u8(64)), inner)
+                match author {
+                    // A voice speaking into this transcript (weave
+                    // pollution): chip + voice-colored gutter, no
+                    // fill — the fill stays reserved for genuine
+                    // user input so the two never read alike.
+                    Some(name) => {
+                        let color = voice_color(name);
+                        let inner = column([text(name.clone()).caption().color(color), body])
+                            .gap(tokens::SPACE_1)
+                            .width(Size::Fill(1.0))
+                            .key(row_key);
+                        log_row(color, None, inner)
+                    }
+                    // Upstream README's worked example uses
+                    // `with_alpha_u8(18)` (~7%) for the user fill — too low
+                    // to be visible against the dark zinc-950 background.
+                    // Bump to ~25% so user turns actually break up a long
+                    // assistant stream. Subtle enough to still read as
+                    // "log entry, not card".
+                    None => log_row(
+                        tokens::INFO,
+                        Some(tokens::INFO.with_alpha_u8(64)),
+                        column([body]).width(Size::Fill(1.0)).key(row_key),
+                    ),
+                }
             }
-            DisplayItem::Assistant { text: t } => {
+            DisplayItem::Assistant { text: t, author } => {
                 // Markdown rendering for assistant content. The egui
                 // sibling renders user input verbatim and assistant
                 // output as markdown — same pattern here.
@@ -22280,7 +22339,19 @@ impl ChatApp {
                     damascene_markdown::MarkdownOptions::default().math(true),
                 );
                 let body = prefix_selectable_keys(body, &chat_text_key(idx, "assistant"));
-                log_row(tokens::SUCCESS, None, body)
+                match author {
+                    // Non-default participant's model turn
+                    // (shared-transcript threads): same voice chip +
+                    // gutter treatment as attributed user entries.
+                    Some(name) => {
+                        let color = voice_color(name);
+                        let inner = column([text(name.clone()).caption().color(color), body])
+                            .gap(tokens::SPACE_1)
+                            .width(Size::Fill(1.0));
+                        log_row(color, None, inner)
+                    }
+                    None => log_row(tokens::SUCCESS, None, body),
+                }
             }
             DisplayItem::Reasoning { text: t } => {
                 let preview = first_line_preview(t, 80);
@@ -23518,6 +23589,22 @@ fn first_line_preview(s: &str, max_chars: usize) -> String {
 /// assistant turn. Older threads (pre-turn-log) load with empty
 /// entries; trailing turns past the entries vec just don't get a
 /// stats row, which is the right fallback.
+///
+/// Voice attribution: entries whose effective author differs from the
+/// role's legacy default ("user" for input, "agent" for model turns)
+/// carry the author onto their display item — weave pollution and
+/// non-default participants render with a voice chip, everything else
+/// stays a plain turn.
+fn foreign_author(msg: &whisper_agent_protocol::Message) -> Option<String> {
+    let default = match msg.role {
+        Role::User => whisper_agent_protocol::DEFAULT_INPUT_PARTICIPANT_ID,
+        Role::Assistant => whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
+        _ => return None,
+    };
+    let author = msg.effective_author();
+    (author.as_str() != default).then(|| author.as_str().to_string())
+}
+
 fn conversation_to_display_items(
     conv: &whisper_agent_protocol::Conversation,
     turn_log: &whisper_agent_protocol::TurnLog,
@@ -23563,13 +23650,15 @@ fn conversation_to_display_items(
                 }
             }
             Role::User => {
+                let author = foreign_author(msg);
                 for block in &msg.content {
-                    push_block(block, true, msg_index, &mut out);
+                    push_block(block, true, msg_index, author.as_deref(), &mut out);
                 }
             }
             Role::Assistant => {
+                let author = foreign_author(msg);
                 for block in &msg.content {
-                    push_block(block, false, msg_index, &mut out);
+                    push_block(block, false, msg_index, author.as_deref(), &mut out);
                 }
                 // Pull the next turn-log entry — one per assistant
                 // response — and append the usage row so it lands
@@ -23605,7 +23694,13 @@ fn conversation_to_display_items(
     out
 }
 
-fn push_block(block: &ContentBlock, user_role: bool, msg_index: usize, out: &mut Vec<DisplayItem>) {
+fn push_block(
+    block: &ContentBlock,
+    user_role: bool,
+    msg_index: usize,
+    author: Option<&str>,
+    out: &mut Vec<DisplayItem>,
+) {
     match block {
         ContentBlock::Text { text } => {
             if !text.is_empty() {
@@ -23613,9 +23708,13 @@ fn push_block(block: &ContentBlock, user_role: bool, msg_index: usize, out: &mut
                     out.push(DisplayItem::User {
                         text: text.clone(),
                         msg_index,
+                        author: author.map(str::to_string),
                     });
                 } else {
-                    out.push(DisplayItem::Assistant { text: text.clone() });
+                    out.push(DisplayItem::Assistant {
+                        text: text.clone(),
+                        author: author.map(str::to_string),
+                    });
                 }
             }
         }
