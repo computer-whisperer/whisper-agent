@@ -628,6 +628,34 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    clippy needless-borrow errors in the knob form (the session had
    been running clippy without `-- -D warnings`; CI would have
    refused 70d3add/840399a).
+   **Reviewed (fixes in da79a4e), verdict sound, no HIGH findings.**
+   Clean traces confirmed: last-write-wins ordering (truncation fires
+   only on `title.is_none()`, before the driver sees input);
+   `turn_start` cannot reach the title thread (fires only from
+   NeedsModelCall; auxiliary input refused; hallucinated tool_use
+   closed by finish_cycle's orphan synthesis); input mid-title-flight
+   is per-thread isolated; no double-finish (mechanical max_turns
+   triggers only on a second run_agent neither driver issues);
+   restart heals a mid-flight title thread via the dead-ticked
+   collection and both drivers' thread_failed checks the title branch
+   first. Fixes taken: dispatch-tools coverage (new `respond_tool`
+   harness helper; the titled_chat test now runs a full
+   dispatch→respond→continue round-trip — previously NO scheduler
+   test exercised `ScriptedEffect::DispatchTools`); clean_title
+   re-trims after unquoting so the Lua emptiness guard agrees with
+   the scheduler's trim-then-refuse (a whitespace-only quoted title
+   would have failed the effect and flipped the Completed title
+   thread to Failed); defensive pod check on set_title (parity with
+   append_entry/adopt_ticker; invariant already held by
+   construction); un-spliced adopt_ticker's rustdoc (the set_title
+   insertion had split doc from body) and dropped its vestigial
+   `#[allow(dead_code)]`; restart-test wording. Accepted, recorded:
+   a failing derive at the roundtable's round close drops the
+   remaining effects and fails the origin voice without a
+   thread_failed (driver-fault deaths fire nothing live) — a
+   PRE-EXISTING hazard class shared with replacement-voice derives in
+   the same position, deserving its own consideration; codepoint
+   clip can split grapheme clusters (cosmetic).
 
 ## Open questions (flagged, not ratified)
 

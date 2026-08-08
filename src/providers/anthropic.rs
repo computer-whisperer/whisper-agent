@@ -348,6 +348,16 @@ fn build_request_body<'a>(req: &'a ModelRequest<'a>) -> CreateMessageRequest<'a>
 ///   provider is meaningless and the server 400s on unknown fields).
 fn message_to_value(m: &Message, cache_last_block: bool) -> Value {
     let mut v = serde_json::to_value(m).expect("Message is serializable");
+    // Transcript metadata, not wire fields: `author` (participant
+    // identity — set on every user entry since the step-1 foundation)
+    // and `run_id` (generation identity on assistant entries). The
+    // Anthropic API validates request shapes strictly and 400s on
+    // unknown message fields ("messages.0.author: Extra inputs are
+    // not permitted"), so they must never leave the process.
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("author");
+        obj.remove("run_id");
+    }
     if let Some(role) = v.get_mut("role") {
         match role.as_str() {
             Some("tool_result") => *role = Value::String("user".into()),
@@ -1197,6 +1207,47 @@ mod tests {
         assert_eq!(image["type"], "image");
         assert_eq!(image["source"]["type"], "url");
         assert_eq!(image["source"]["url"], "https://example.com/cat.jpg");
+    }
+
+    #[test]
+    fn transcript_metadata_never_reaches_the_wire() {
+        // Regression (found by the first Anthropic call in weeks, via
+        // the roundtable's knob-configured cast): `Message.author` is
+        // set on every user entry since participant identity landed,
+        // and `run_id` on every assistant entry — serde passthrough
+        // rode both into the request body, and the API refuses
+        // strictly ("messages.0.author: Extra inputs are not
+        // permitted"). The adapter must strip transcript metadata.
+        let mut fanout = Message::user_text("Alright, does this seem to work?");
+        fanout.author = Some("optimist".into());
+        let mut reply = Message::assistant_blocks(vec![ContentBlock::Text {
+            text: "It compiles.".into(),
+        }]);
+        reply.author = Some("agent".into());
+        reply.run_id = Some(whisper_agent_protocol::GenerationRunId::new("run-1"));
+        let messages = vec![fanout, reply];
+
+        let tools = make_tools();
+        let tunables = empty_tunables();
+        let req = ModelRequest {
+            run_id: "test-run",
+            participant_id: whisper_agent_protocol::DEFAULT_MODEL_PARTICIPANT_ID,
+            model: "claude-opus-4-6",
+            max_tokens: 1024,
+            system_prompt: "you are helpful",
+            tools: &tools,
+            messages: &messages,
+            cache_breakpoints: &[],
+            tunables: &tunables,
+            request_cache_key: None,
+            session_id: None,
+            installation_id: None,
+            turn_routing_token: None,
+        };
+        let body = serde_json::to_value(build_request_body(&req)).unwrap();
+        let wire = body["messages"].to_string();
+        assert!(!wire.contains("\"author\""), "author leaked: {wire}");
+        assert!(!wire.contains("\"run_id\""), "run_id leaked: {wire}");
     }
 
     #[test]
