@@ -194,6 +194,10 @@ pub enum PersistedDriverEffect {
         #[serde(default)]
         seed_entries: usize,
     },
+    /// A referenced thread's display title was set by this driver
+    /// (step 11) — the record explains where a model-generated title
+    /// came from after the fact.
+    SetTitle { thread_id: String, title: String },
     /// Head-advance: a referenced thread this weave ticks was promoted to
     /// primary; the previous primary (if any) was demoted to a dormant
     /// auxiliary. This is the journaled `compaction`-roll primitive —

@@ -198,6 +198,16 @@ pub enum ScriptedEffect {
         #[serde(default)]
         source_thread_id: Option<String>,
     },
+    /// Set a referenced thread's display title (step 11). Last-write-
+    /// wins: a driver's model-generated title overwrites the
+    /// scheduler's first-input truncation placeholder, and a failed
+    /// title model simply leaves the placeholder standing. The target
+    /// only has to be referenced, not ticked — titling is metadata
+    /// curation, not coordination.
+    SetTitle {
+        thread_id: String,
+        title: String,
+    },
     /// Promote a referenced, self-ticked thread to primary; the previous
     /// primary becomes a dormant auxiliary. The compaction-roll primitive.
     AdvanceHead {

@@ -28,6 +28,7 @@ use whisper_agent_protocol::{
 
 const CHECKER_DRIVER: &str = include_str!("../../../examples/drivers/auto_mode_checker.lua");
 const ROUNDTABLE_DRIVER: &str = include_str!("../../../examples/drivers/roundtable.lua");
+const TITLED_CHAT_DRIVER: &str = include_str!("../../../examples/drivers/titled_chat.lua");
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2024,9 +2025,11 @@ async fn roundtable_driver_runs_one_pass_rounds() {
         "optimist's context caught the skeptic's reply for next round"
     );
 
-    // Journal: 2 derives, 2 voice turns, 3 finishes (2 voices + the
-    // primary's round close), 6 appends (input to 2 voices, then each
-    // reply to minutes + the other voice) — all Completed.
+    // Journal: 3 derives (2 voices + the round-close title thread), 2
+    // completed runs (the voice turns — the title turn is in flight,
+    // its record still Pending), 3 finishes (2 voices + the primary's
+    // round close), 6 appends (input to 2 voices, then each reply to
+    // minutes + the other voice).
     let count = |pred: &dyn Fn(&PersistedDriverEffect) -> bool| -> usize {
         h.sched.weaves[&weave_id]
             .effect_journal
@@ -2037,7 +2040,7 @@ async fn roundtable_driver_runs_one_pass_rounds() {
     };
     assert_eq!(
         count(&|e| matches!(e, PersistedDriverEffect::DeriveThread { .. })),
-        2
+        3
     );
     assert_eq!(
         count(&|e| matches!(e, PersistedDriverEffect::RunAgent { .. })),
@@ -2052,6 +2055,40 @@ async fn roundtable_driver_runs_one_pass_rounds() {
         6
     );
 
+    // The round close derived the title thread (step 11): the
+    // truncation placeholder stands until the title model replies,
+    // then set_title overwrites it with the cleaned text.
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "title")
+        })
+        .expect("title thread derived at round close")
+        .thread_id
+        .clone();
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("Should we rewrite it in Rust?"),
+        "truncation placeholder before the title model replies"
+    );
+    h.respond_model(
+        &title_thread,
+        vec![text_block("  \"Rust Rewrite Debate.\"  ")],
+        &mut pending_io,
+    );
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("Rust Rewrite Debate"),
+        "model title cleaned (unquoted, no trailing period) onto the minutes"
+    );
+    assert!(matches!(
+        h.internal_of(&title_thread),
+        ThreadInternalState::Completed
+    ));
+
     // Round two reuses the cast: no new derives, same rotation.
     h.sched.send_user_message(
         &primary,
@@ -2062,8 +2099,8 @@ async fn roundtable_driver_runs_one_pass_rounds() {
     h.sched.step_until_blocked(&primary, &mut pending_io);
     assert_eq!(
         h.sched.weaves[&weave_id].threads.len(),
-        3,
-        "second round derives no new threads"
+        4,
+        "second round derives no new threads (primary, 2 voices, lingering title)"
     );
     assert!(matches!(
         h.internal_of(&optimist),
@@ -2156,8 +2193,8 @@ async fn roundtable_survives_voice_failure_and_stacked_input() {
     h.sched.step_until_blocked(&primary, &mut pending_io);
     assert_eq!(
         h.sched.weaves[&weave_id].threads.len(),
-        4,
-        "replacement derived, dead voice still referenced"
+        5,
+        "replacement derived; dead voice and round-one title thread still referenced"
     );
     let optimist2 = voice_threads(&h, "optimist")
         .into_iter()
@@ -2366,8 +2403,8 @@ async fn roundtable_recovers_after_restart_mid_round() {
     fresh.sched.step_until_blocked(&primary, &mut pending_io2);
     assert_eq!(
         fresh.sched.weaves[&weave_id].threads.len(),
-        4,
-        "no re-derivation on the second post-restart round"
+        5,
+        "no re-derivation on the second post-restart round (title thread from round one included)"
     );
     assert!(matches!(
         fresh.internal_of(&optimist2),
@@ -2617,4 +2654,181 @@ async fn roundtable_model_knobs_configure_seats_and_outlive_voices() {
         .expect("replacement derived");
     assert_eq!(h.sched.tasks[&optimist2].config.model, "gpt-5");
     assert_eq!(h.sched.tasks[&optimist2].bindings.backend, "openai");
+}
+
+/// titled_chat.lua (step 11, slice 1): the degenerate single-agent
+/// chat loop in Lua plus model titling. Pins: the chat turn runs and
+/// the cycle closes like the builtin; the first completed reply
+/// derives a one-turn tools-off title thread on the knob's backend +
+/// model; the truncation placeholder stands until the title model
+/// replies, then `set_title` lands the cleaned text and journals it;
+/// the title thread lingers referenced (drill-down provenance) and a
+/// second exchange derives nothing new.
+#[tokio::test]
+async fn titled_chat_titles_the_thread_from_its_knob_model() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config(
+            "titled_chat",
+            [(
+                "title.model".to_string(),
+                serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Explain the borrow checker to a C programmer".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    h.respond_model(
+        &primary,
+        vec![text_block("It is a compile-time owner tracker.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "title")
+        })
+        .expect("title thread derived after the first reply")
+        .thread_id
+        .clone();
+    assert_eq!(h.sched.tasks[&title_thread].config.model, "gpt-5-nano");
+    assert_eq!(h.sched.tasks[&title_thread].bindings.backend, "openai");
+    assert!(matches!(
+        h.internal_of(&title_thread),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("Explain the borrow checker to a C programmer"),
+        "truncation placeholder until the title model replies"
+    );
+
+    h.respond_model(
+        &title_thread,
+        vec![text_block("'Borrow Checker for C Programmers.'")],
+        &mut pending_io,
+    );
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("Borrow Checker for C Programmers")
+    );
+    assert!(matches!(
+        h.internal_of(&title_thread),
+        ThreadInternalState::Completed
+    ));
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                &r.effect,
+                PersistedDriverEffect::SetTitle { thread_id, title }
+                    if thread_id == &primary && title == "Borrow Checker for C Programmers"
+            )),
+        "the journal explains where the title came from"
+    );
+
+    // Second exchange: plain chat, no second title job, title thread
+    // lingers as the referenced provenance record.
+    h.sched.send_user_message(
+        &primary,
+        "And lifetimes?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![text_block("Scopes with names.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        2,
+        "primary + lingering title thread; nothing new derived"
+    );
+}
+
+/// A dead title model must not wedge the chat or clobber the title:
+/// `thread_failed` unmaps the title thread, the truncation placeholder
+/// stands (set_title never fired), and the conversation continues
+/// without a retry.
+#[tokio::test]
+async fn titled_chat_keeps_the_placeholder_when_the_title_model_dies() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched
+        .send_user_message(&primary, "hello there".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Hi.")], &mut pending_io);
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "title")
+        })
+        .expect("title thread derived")
+        .thread_id
+        .clone();
+
+    h.fail_model(
+        &title_thread,
+        "title model quota exhausted",
+        &mut pending_io,
+    );
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("hello there"),
+        "placeholder survives the dead title model"
+    );
+
+    h.sched
+        .send_user_message(&primary, "still alive?".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Very.")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    let derives = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .filter(|r| matches!(&r.effect, PersistedDriverEffect::DeriveThread { .. }))
+        .count();
+    assert_eq!(derives, 1, "no title retry after the model died");
 }

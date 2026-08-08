@@ -5988,6 +5988,67 @@ impl Scheduler {
     /// already ticks the thread — ticker transfer is an explicit
     /// release-then-adopt pair, each journaled on its own weave.
     #[allow(dead_code)]
+    /// Execute a `set_title` effect (step 11): set a referenced
+    /// thread's display title. Last-write-wins — a model-generated
+    /// title overwrites the first-input truncation placeholder. The
+    /// target only has to be referenced by the weave, not ticked:
+    /// titling is metadata curation, not coordination. Refusals
+    /// (unknown/unreferenced thread, empty title) journal Failed like
+    /// every effect.
+    pub(super) fn weave_set_title(
+        &mut self,
+        weave_id: &str,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        if !self.weaves.contains_key(weave_id) {
+            return Err(format!("unknown weave `{weave_id}`"));
+        }
+        let title = title.trim().to_string();
+        let admission = (|| -> Result<(), String> {
+            if title.is_empty() {
+                return Err("set_title: empty title".into());
+            }
+            let weave = &self.weaves[weave_id];
+            if !weave.threads.iter().any(|r| r.thread_id == thread_id) {
+                return Err(format!(
+                    "set_title: thread `{thread_id}` is not referenced by weave `{weave_id}`"
+                ));
+            }
+            if !self.tasks.contains_key(thread_id) {
+                return Err(format!("set_title: unknown thread `{thread_id}`"));
+            }
+            Ok(())
+        })();
+
+        let effect = PersistedDriverEffect::SetTitle {
+            thread_id: thread_id.to_string(),
+            title: title.clone(),
+        };
+        let weave = self.weaves.get_mut(weave_id).expect("checked above");
+        let result = match admission {
+            Ok(()) => {
+                weave.record_completed_effect(effect);
+                let task = self.tasks.get_mut(thread_id).expect("checked above");
+                task.title = Some(title.clone());
+                self.mark_dirty(thread_id);
+                self.router
+                    .broadcast_task_list(ServerToClient::ThreadTitleUpdated {
+                        thread_id: thread_id.to_string(),
+                        title,
+                    });
+                Ok(())
+            }
+            Err(message) => {
+                weave.record_failed_effect(effect, message.clone());
+                Err(message)
+            }
+        };
+        self.mark_weave_dirty(weave_id);
+        result
+    }
+
     pub(super) fn weave_adopt_ticker(
         &mut self,
         weave_id: &str,

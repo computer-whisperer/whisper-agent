@@ -60,6 +60,27 @@ local CAST = {
   },
 }
 
+local TITLE_PROMPT = "You write conversation titles. Reply with the "
+  .. "title only: 3 to 8 words, no quotes, no trailing punctuation."
+
+-- Truncate to `limit` characters on a UTF-8 boundary.
+local function clip(text, limit)
+  text = text or ""
+  if utf8.len(text) and utf8.len(text) > limit then
+    return string.sub(text, 1, utf8.offset(text, limit + 1) - 1)
+  end
+  return text
+end
+
+-- Trim, unquote, collapse whitespace, drop a trailing period, clip.
+local function clean_title(text)
+  local t = string.match(text or "", "^%s*(.-)%s*$")
+  t = string.match(t, '^"(.*)"$') or string.match(t, "^'(.*)'$") or t
+  t = string.gsub(t, "%s+", " ")
+  if string.sub(t, -1) == "." then t = string.sub(t, 1, -2) end
+  return clip(t, 60)
+end
+
 local function voice_of(state, thread_id)
   if not state.voices then return nil end
   for _, voice in ipairs(CAST) do
@@ -141,6 +162,24 @@ local function advance_floor(state, effects, config)
       thread_id = state.voices[state.speaking] }
     return
   end
+  -- First round closed: ask a (knob-configured) model to title the
+  -- minutes. One shot — a dead title thread is not replaced; the
+  -- truncation placeholder stands (set_title is last-write-wins).
+  if not state.title_requested then
+    state.title_requested = true
+    local knob = config and config["title.model"]
+    effects[#effects + 1] = { kind = "derive_thread",
+      relationship = "title",
+      system_prompt = TITLE_PROMPT,
+      model = knob and knob.model or nil,
+      backend = knob and knob.backend or nil,
+      disable_tools = true,
+      max_turns = 1,
+      seed = { { author = "user", text = "Title this conversation:\n\n"
+        .. "User: " .. (state.opening or "") .. "\n\n"
+        .. "Panelist: " .. (state.first_reply or "") } },
+      source_thread_id = state.primary }
+  end
   if state.pending and #state.pending > 0 then
     for _, e in ipairs(ensure_cast(state, table.remove(state.pending, 1), config)) do
       effects[#effects + 1] = e
@@ -161,6 +200,9 @@ function on_event(state, event, config)
       -- guard anyway.
       return { state = state }
     end
+    if not state.opening then
+      state.opening = clip(event.text, 500)
+    end
     if state.speaking or (state.deriving or 0) > 0 then
       state.pending = state.pending or {}
       state.pending[#state.pending + 1] = event.text
@@ -170,6 +212,11 @@ function on_event(state, event, config)
   end
 
   if k == "thread_derived" then
+    if event.relationship == "title" then
+      state.title_thread = event.thread_id
+      return { effects = { { kind = "run_agent", thread_id = event.thread_id } },
+               state = state }
+    end
     local voice_id = string.match(event.relationship or "", "^voice:(.+)$")
     if voice_id and state.voices then
       state.voices[voice_id] = event.thread_id
@@ -184,6 +231,15 @@ function on_event(state, event, config)
   end
 
   if k == "agent_completed" then
+    if state.title_thread and event.thread_id == state.title_thread then
+      local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
+      local title = clean_title(event.text)
+      if #title > 0 then
+        effects[#effects + 1] = { kind = "set_title",
+          thread_id = state.primary, title = title }
+      end
+      return { effects = effects, state = state }
+    end
     local speaker = voice_of(state, event.thread_id)
     if not speaker then return { state = state } end
     if speaker ~= state.speaking then
@@ -194,12 +250,21 @@ function on_event(state, event, config)
                state = state }
     end
     local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
+    if not state.first_reply then
+      state.first_reply = clip(event.text, 500)
+    end
     speak(state, speaker, event.text, event.thread_id, effects)
     advance_floor(state, effects, config)
     return { effects = effects, state = state }
   end
 
   if k == "thread_failed" then
+    if state.title_thread and event.thread_id == state.title_thread then
+      -- The title model died; keep the truncation placeholder and
+      -- don't retry (title_requested stays set).
+      state.title_thread = nil
+      return { state = state }
+    end
     if event.thread_id == state.primary then
       -- The minutes thread died (cancel or failure): the round is
       -- void. Fresh input heals the primary and starts a new round;
@@ -247,6 +312,11 @@ function describe()
       type = "model",
     }
   end
+  knobs[#knobs + 1] = {
+    id = "title.model",
+    label = "Title model",
+    type = "model",
+  }
   return {
     label = "Roundtable",
     description = "One-pass round-robin panel: each voice keeps a "

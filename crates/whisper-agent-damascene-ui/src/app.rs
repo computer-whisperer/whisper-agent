@@ -9160,8 +9160,8 @@ impl ChatApp {
                         .map(str::to_owned)
                         .unwrap_or_else(|| "Model…".into());
                     row([
-                        select_trigger(&format!("{base}:backend"), backend_label),
-                        select_trigger(&format!("{base}:model"), model_label),
+                        select_trigger(format!("{base}:backend"), backend_label),
+                        select_trigger(format!("{base}:model"), model_label),
                     ])
                     .gap(tokens::SPACE_2)
                 }

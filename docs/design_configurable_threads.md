@@ -543,8 +543,72 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    named refusal is the backstop); a model knob's model menu opens
    empty until its backend is picked; knob values are not counted in
    the overrides-modal count (they render in the main pane).
+   **Reviewed (fixes in 840399a), verdict sound, no HIGH findings.**
+   The review verified the load-bearing structure: every creation path
+   that can carry `Scripted{config}` flows through create_task's
+   validation (behavior startup and derive_thread cannot carry it;
+   compaction is gated off scripted weaves; fork copies an
+   already-frozen map), both VM call sites deliver the frozen config on
+   every activation including restart-healing replays, and the
+   child-within-parent-scope invariant holds on the new derive-backend
+   plumbing because `weave_derive_thread` supplies the primary's scope
+   as `base_scope_override`, which errors on out-of-scope backends.
+   Hardening taken: `validate_declaration` at describe() evaluation
+   (ids non-empty/unique/colon-free — UI route keys are string-glued
+   from ids; selects must declare options); `run_describe` normalizes
+   `knobs = {}` (previously a type error — empty Lua tables are
+   ambiguous) and loudly refuses map-shaped knobs (previously silently
+   zero knobs); integer knobs accept whole-valued floats (Lua `/`
+   always yields floats — a computed default refused every creation);
+   the create-time model-knob check also enforces the dispatching
+   parent's `scope.backends` (was pod-allow only — a dispatched
+   scripted thread's bad knob refused only at the eventual derive);
+   UI same-driver re-pick refetches describe() (the retry path after
+   a failed eval or program edit). Reviewer-accepted lows: forking a
+   scripted primary whose program was deleted mints a weave that fails
+   at first event, and fork's `reset_capabilities` silently resets the
+   driver to builtin (both pre-existing fork semantics); a derive from
+   a scripted weave whose primary was archived out from under it
+   resolves bindings against full pod scope (pre-existing structure,
+   unexercised); `DescribeDriver` is the first client-triggerable Lua
+   eval — synchronous on the scheduler thread, bounded by the sandbox
+   budgets, same exposure class as per-activation loads; the knob
+   backend menu lists the full server catalog rather than pod allow
+   (consistent with the existing backend picker; the named refusal
+   covers it).
 11. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
+   **Slice 1 ratified 2026-08-08** (three forks via AskUserQuestion):
+   model-based title generation via the driver contract. Ground truth
+   that shaped the slice: the pre-existing "title generation" is
+   `derive_title` — a pure truncation of the first user message, no
+   model call anywhere — so this slice ADDS model titling rather than
+   migrating machinery. New effect `set_title(thread, title)`:
+   admission is reference-only (the target must be a thread the weave
+   references — curate-what-you-coordinate; ticking not required),
+   last-write-wins, journaled. Last-write-wins is load-bearing: the
+   scheduler's truncation title fires on first input for scripted
+   primaries too, so a driver's model title overwrites the placeholder
+   and a failed title model gracefully leaves the truncation in place.
+   **Carrying case ratified: `examples/drivers/titled_chat.lua`** — the
+   degenerate single-agent chat loop in Lua (turn_start→run_agent,
+   dispatch_tools, continue, finish — the "builtin compatibility driver
+   is the degenerate program" made literal) plus titling: on the first
+   completed reply, derive a one-turn tools-off title thread seeded
+   with the opening exchange, model from an optional `title.model`
+   knob (unset = pod default), and `set_title` the primary with the
+   cleaned reply. Doubles as the builtin-parity proof the rest of step
+   11 needs before any builtin converts. REJECTED for this slice:
+   converting the builtin chat driver now (forces the pod-config model
+   surface and builtin-driver-state questions before the vocabulary is
+   proven); roundtable-only titling (leaves no chat-shaped driver).
+   **Lifecycle ratified: the title thread lingers as a referenced
+   auxiliary** (relationship `title`) — the title's provenance stays
+   inspectable in drill-down, consistent with curate-never-conceal; no
+   unref/archive vocabulary pulled in (front-3 item stays deferred).
+   **Roundtable rider ratified**: the roundtable gains the same
+   optional `title.model` knob and titles its minutes when the first
+   round closes.
 
 ## Open questions (flagged, not ratified)
 

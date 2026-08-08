@@ -476,6 +476,9 @@ impl Scheduler {
                     });
                 Ok(())
             }
+            ScriptedEffect::SetTitle { thread_id, title } => {
+                self.weave_set_title(weave_id, &thread_id, &title)
+            }
             ScriptedEffect::AdvanceHead { thread_id } => {
                 self.weave_advance_head(weave_id, &thread_id)
             }
