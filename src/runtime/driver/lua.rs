@@ -4,13 +4,23 @@
 //! defining one global function:
 //!
 //! ```lua
-//! function on_event(state, event)
+//! function on_event(state, event, config)
 //!   -- state: the driver's persisted table (empty {} on first event)
 //!   -- event: { kind = "turn_start" | "agent_completed" | ..., ... }
+//!   -- config: knob values frozen at creation (step 10) — the map the
+//!   --         server validated against describe(); {} when knob-less.
+//!   --         A program edited after creation may find knobs missing;
+//!   --         read them like any table (absent = nil).
 //!   return { effects = { { kind = "run_agent", thread_id = ... } },
 //!            state = state }
 //! end
 //! ```
+//!
+//! Two further entry points are optional: `present(state, config) ->
+//! blocks` (step 7b — the pure presentation function) and `describe() ->
+//! { label?, description?, knobs? }` (step 10 — the configuration
+//! declaration the new-thread form renders; evaluated at listing and
+//! creation time, never during coordination).
 //!
 //! The handler is a pure policy step in the same sense as the builtin
 //! driver's functions: durable thread events in, requested effects out,
@@ -170,6 +180,13 @@ pub enum ScriptedEffect {
         system_prompt: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        /// Backend catalog name for the derived thread (step 10 — the
+        /// cross-provider cast case). `None` inherits the pod-default
+        /// resolution like any created thread; a name is validated
+        /// against the pod's `allow.backends` by the bindings resolver,
+        /// so an unknown or disallowed choice refuses the derive.
+        #[serde(default)]
+        backend: Option<String>,
         /// Strip the tool surface: the derived thread's model sees no
         /// tools at all (the permission-checker shape).
         #[serde(default)]
@@ -297,6 +314,7 @@ pub fn run_event(
     chunk_name: &str,
     state: &serde_json::Value,
     event: &ScriptedEvent,
+    config: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<ScriptedOutcome, String> {
     let lua = sandboxed_vm()?;
     lua.load(source)
@@ -314,8 +332,11 @@ pub fn run_event(
     let event_value = lua
         .to_value(event)
         .map_err(|e| format!("driver event to lua: {e}"))?;
+    let config_value = lua
+        .to_value(config)
+        .map_err(|e| format!("driver config to lua: {e}"))?;
     let returned: mlua::Value = handler
-        .call((state_value, event_value))
+        .call((state_value, event_value, config_value))
         .map_err(|e| format!("driver `{chunk_name}` on_event: {e}"))?;
 
     if returned.is_nil() {
@@ -334,10 +355,11 @@ pub fn run_event(
     })
 }
 
-/// Evaluate the program's optional `present(state) -> blocks` entry
-/// point (migration step 7b): a pure function of persisted driver state
-/// composing the weave's presentation structure — replayable by
-/// construction, since it can see nothing else.
+/// Evaluate the program's optional `present(state, config) -> blocks`
+/// entry point (migration step 7b): a pure function of persisted driver
+/// state (plus the creation-frozen knob config) composing the weave's
+/// presentation structure — replayable by construction, since it can see
+/// nothing else.
 ///
 /// `Ok(None)` means the program defines no `present`; the caller
 /// synthesizes the degenerate presentation. Errors degrade the display
@@ -348,6 +370,7 @@ pub fn run_present(
     source: &str,
     chunk_name: &str,
     state: &serde_json::Value,
+    config: &std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Option<Vec<whisper_agent_protocol::weave::PresentationBlock>>, String> {
     let lua = sandboxed_vm()?;
     lua.load(source)
@@ -360,8 +383,11 @@ pub fn run_present(
     let state_value = lua
         .to_value(state)
         .map_err(|e| format!("driver state to lua: {e}"))?;
+    let config_value = lua
+        .to_value(config)
+        .map_err(|e| format!("driver config to lua: {e}"))?;
     let returned: mlua::Value = presenter
-        .call(state_value)
+        .call((state_value, config_value))
         .map_err(|e| format!("driver `{chunk_name}` present: {e}"))?;
     if returned.is_nil() {
         return Ok(None);
@@ -370,6 +396,42 @@ pub fn run_present(
         .from_value(returned)
         .map_err(|e| format!("driver `{chunk_name}` returned malformed presentation: {e}"))?;
     Ok(Some(blocks))
+}
+
+/// Evaluate the program's optional `describe()` declaration (migration
+/// step 10): a pure, argument-free entry point returning the driver's
+/// display metadata and typed configuration knobs. Runs at listing time
+/// (the `DescribeDriver` request feeding the new-thread form) and at
+/// creation time (validating submitted knob values) — never during
+/// coordination.
+///
+/// `Ok(None)` means the program defines no `describe` (or it returned
+/// nil); the caller treats that as the empty declaration — no knobs, the
+/// pre-step-10 contract. Errors here refuse thread creation the same way
+/// an unloadable program does: a driver whose declaration can't be
+/// evaluated shouldn't get a weave that will fail at its first event.
+pub fn run_describe(
+    source: &str,
+    chunk_name: &str,
+) -> Result<Option<whisper_agent_protocol::driver::DriverDescription>, String> {
+    let lua = sandboxed_vm()?;
+    lua.load(source)
+        .set_name(chunk_name)
+        .exec()
+        .map_err(|e| format!("driver `{chunk_name}` failed to load: {e}"))?;
+    let Ok(describer) = lua.globals().get::<mlua::Function>("describe") else {
+        return Ok(None);
+    };
+    let returned: mlua::Value = describer
+        .call(())
+        .map_err(|e| format!("driver `{chunk_name}` describe: {e}"))?;
+    if returned.is_nil() {
+        return Ok(None);
+    }
+    let description: whisper_agent_protocol::driver::DriverDescription =
+        lua.from_value(returned)
+            .map_err(|e| format!("driver `{chunk_name}` returned a malformed description: {e}"))?;
+    Ok(Some(description))
 }
 
 /// Content hash stamped on the weave when a scripted driver starts
@@ -390,6 +452,26 @@ pub fn program_hash(source: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Config-less shims: these tests predate step-10 knobs and their
+    /// drivers ignore the third argument, exactly like production
+    /// drivers written before it existed.
+    fn run_event(
+        source: &str,
+        chunk_name: &str,
+        state: &serde_json::Value,
+        event: &ScriptedEvent,
+    ) -> Result<ScriptedOutcome, String> {
+        super::run_event(source, chunk_name, state, event, &Default::default())
+    }
+
+    fn run_present(
+        source: &str,
+        chunk_name: &str,
+        state: &serde_json::Value,
+    ) -> Result<Option<Vec<whisper_agent_protocol::weave::PresentationBlock>>, String> {
+        super::run_present(source, chunk_name, state, &Default::default())
+    }
 
     fn event_turn_start(thread: &str, turn: u32) -> ScriptedEvent {
         ScriptedEvent::TurnStart {
@@ -670,5 +752,88 @@ mod tests {
         "#;
         let err = run_present(runaway, "d", &json!({})).unwrap_err();
         assert!(err.contains("instruction budget"), "got: {err}");
+    }
+
+    #[test]
+    fn config_reaches_on_event_and_present() {
+        let src = r#"
+            function on_event(state, event, config)
+              local voice = config["voice.model"]
+              state.model = voice and voice.model or "unset"
+              return { effects = {}, state = state }
+            end
+            function present(state, config)
+              return { { kind = "status", text = "motto: " .. (config.motto or "?") } }
+            end
+        "#;
+        let config: std::collections::BTreeMap<String, serde_json::Value> = [
+            (
+                "voice.model".to_string(),
+                json!({"backend": "anthropic", "model": "claude-sonnet-5"}),
+            ),
+            ("motto".to_string(), json!("onward")),
+        ]
+        .into_iter()
+        .collect();
+        let out =
+            super::run_event(src, "d", &json!({}), &event_turn_start("t", 1), &config).unwrap();
+        assert_eq!(out.state["model"], "claude-sonnet-5");
+        let blocks = super::run_present(src, "d", &json!({}), &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            blocks,
+            vec![whisper_agent_protocol::weave::PresentationBlock::Status {
+                text: "motto: onward".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn describe_declares_typed_knobs() {
+        let src = r#"
+            function on_event(state, event) return nil end
+            function describe()
+              return {
+                label = "Test driver",
+                knobs = {
+                  { id = "voice.model", label = "Voice", type = "model", required = true },
+                  { id = "rounds", type = "integer", default = 2, min = 1, max = 9 },
+                },
+              }
+            end
+        "#;
+        let description = run_describe(src, "d").unwrap().unwrap();
+        assert_eq!(description.label.as_deref(), Some("Test driver"));
+        let knobs = &description.knobs;
+        assert_eq!(knobs.len(), 2);
+        assert_eq!(
+            knobs[0].kind,
+            whisper_agent_protocol::driver::KnobKind::Model
+        );
+        assert!(knobs[0].required);
+        assert_eq!(knobs[1].default, Some(json!(2)));
+        assert_eq!((knobs[1].min, knobs[1].max), (Some(1.0), Some(9.0)));
+    }
+
+    #[test]
+    fn describe_absent_nil_and_malformed() {
+        let absent = "function on_event(state, event) return nil end";
+        assert_eq!(run_describe(absent, "d").unwrap(), None);
+
+        let nil_return = r#"
+            function on_event(state, event) return nil end
+            function describe() return nil end
+        "#;
+        assert_eq!(run_describe(nil_return, "d").unwrap(), None);
+
+        let malformed = r#"
+            function on_event(state, event) return nil end
+            function describe()
+              return { knobs = { { id = "x", type = "mystery" } } }
+            end
+        "#;
+        let err = run_describe(malformed, "d").unwrap_err();
+        assert!(err.contains("malformed description"), "got: {err}");
     }
 }

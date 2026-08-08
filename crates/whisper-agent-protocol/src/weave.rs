@@ -99,6 +99,7 @@ mod tests {
             pod_id: "pod".into(),
             driver: ThreadDriverConfig::Scripted {
                 name: "auto_mode_checker".into(),
+                config: Default::default(),
             },
             driver_program_hash: Some("abc123".into()),
             threads: vec![

@@ -10,6 +10,7 @@
 
 pub mod behavior;
 pub mod conversation;
+pub mod driver;
 pub mod permission;
 pub mod pod;
 pub mod sandbox;
@@ -329,7 +330,7 @@ impl ThreadConfig {
 /// Persisted driver selection for a thread definition. Struct variants keep
 /// the wire extensible with per-driver configuration while giving old threads
 /// a deterministic compatibility default.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThreadDriverConfig {
     #[default]
@@ -338,7 +339,18 @@ pub enum ThreadDriverConfig {
     /// The weave snapshots the program's content hash when it starts
     /// coordinating, so persisted behavior stays explainable after the
     /// program file changes.
-    Scripted { name: String },
+    Scripted {
+        name: String,
+        /// Knob values for the program's `describe()` declaration
+        /// (migration step 10). Clients submit the user's choices here;
+        /// the server validates them against the declaration, refuses
+        /// creation on mismatch, and rewrites this map with declaration
+        /// defaults materialized before it freezes onto the weave. The
+        /// driver receives the frozen map as the third argument of every
+        /// `on_event`/`present` call. Empty for knob-less drivers.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        config: std::collections::BTreeMap<String, serde_json::Value>,
+    },
 }
 
 /// Creation-time, inheritable execution choices for one model participant.
@@ -2040,6 +2052,21 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+    /// Evaluate a scripted driver's optional `describe()` declaration
+    /// (migration step 10) so the new-thread form can render its
+    /// configuration knobs when the driver picker selects it. The reply
+    /// is always `DriverDescribed`: load/eval/shape failures ride its
+    /// in-band `error` so the form can surface authoring mistakes next
+    /// to the picker, and a program without `describe()` yields the
+    /// empty description (no knobs — the pre-step-10 contract).
+    DescribeDriver {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        /// Driver name as in `ThreadDriverConfig::Scripted` — the file
+        /// stem under `<pod>/drivers/`.
+        driver: String,
+    },
     /// Read one text file under a pod. Used by the webui's generic
     /// file viewer for paths that don't route to a specialized editor
     /// (pod.toml and behaviors/* go to their own modals). The server
@@ -2830,6 +2857,21 @@ pub enum ServerToClient {
         pod_id: String,
         path: String,
         entries: Vec<FsEntry>,
+    },
+    /// Reply to `DescribeDriver`. Exactly one of `description`/`error`
+    /// is set: `description` carries the evaluated declaration (empty
+    /// when the program defines no `describe()`), `error` carries the
+    /// load/eval/shape failure in-band so the new-thread form can show
+    /// it beside the picker instead of a disconnected toast.
+    DriverDescribed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        driver: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<driver::DriverDescription>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Reply to `ReadPodFile`. `readonly` mirrors `FsEntry.readonly`
     /// so the viewer can hide the Save button without having to

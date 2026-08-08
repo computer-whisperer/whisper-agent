@@ -3682,11 +3682,47 @@ impl Scheduler {
             .validate()
             .map_err(|e| format!("invalid thread participants: {e}"))?;
         validate_participant_profile_requests(&config.participants, &participant_profile_requests)?;
-        // A scripted driver must load at creation time — a bad name or
-        // unreadable program should reject the create, not fail the
-        // thread at its first boundary.
-        if let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = &config.driver {
-            self.load_driver_program(&pod_id, name)?;
+        // A scripted driver must load — and its declared knob config must
+        // validate — at creation time: a bad name, unreadable or
+        // unparseable program, or mismatched knob value should reject
+        // the create, not fail the thread at its first boundary. The
+        // validated map (declaration defaults materialized) replaces the
+        // submitted one, so the weave freezes exactly what the driver
+        // will be handed on every activation.
+        if let whisper_agent_protocol::ThreadDriverConfig::Scripted {
+            name,
+            config: knob_values,
+        } = &config.driver
+        {
+            let source = self.load_driver_program(&pod_id, name)?;
+            let description =
+                crate::runtime::driver::lua::run_describe(&source, name)?.unwrap_or_default();
+            let frozen = description
+                .validate_config(knob_values)
+                .map_err(|e| format!("driver `{name}` config: {e}"))?;
+            // `model` knobs get the same pod-ceiling check the bindings
+            // resolver applies to the thread's own backend, so a
+            // disallowed provider surfaces at the form instead of at
+            // the eventual derive.
+            for spec in &description.knobs {
+                if spec.kind == whisper_agent_protocol::driver::KnobKind::Model
+                    && let Some(backend) = frozen
+                        .get(&spec.id)
+                        .and_then(|value| value.get("backend"))
+                        .and_then(|value| value.as_str())
+                    && !pod.config.allow.backends.iter().any(|b| b == backend)
+                {
+                    return Err(format!(
+                        "knob `{}`: backend `{backend}` not in pod `{pod_id}`'s allow.backends ({})",
+                        spec.id,
+                        pod.config.allow.backends.join(", ")
+                    ));
+                }
+            }
+            config.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
+                name: name.clone(),
+                config: frozen,
+            };
         }
 
         // Resolve the binding choices (backend / sandbox / shared MCP hosts):

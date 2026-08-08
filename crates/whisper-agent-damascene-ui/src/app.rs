@@ -7781,10 +7781,12 @@ impl ChatApp {
         });
         let config_override = ThreadConfigOverride {
             participants: None,
-            driver: self
-                .picker_driver
-                .clone()
-                .map(|name| whisper_agent_protocol::ThreadDriverConfig::Scripted { name }),
+            driver: self.picker_driver.clone().map(|name| {
+                whisper_agent_protocol::ThreadDriverConfig::Scripted {
+                    name,
+                    config: Default::default(),
+                }
+            }),
             participant_profiles: None,
             model,
             max_tokens: self.new_thread_max_tokens,
@@ -10095,7 +10097,8 @@ impl ChatApp {
         let weave_id = self.threads.get(thread_id)?.weave_id.as_deref()?;
         let snapshot = self.weaves.get(weave_id)?;
         let mut chips: Vec<El> = Vec::new();
-        if let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = &snapshot.driver {
+        if let whisper_agent_protocol::ThreadDriverConfig::Scripted { name, .. } = &snapshot.driver
+        {
             chips.push(badge(format!("driver: {name}")).muted());
         }
         let relationship_of = |id: &str| -> Option<String> {

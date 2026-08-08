@@ -840,6 +840,33 @@ impl Scheduler {
                     }
                 });
             }
+            ClientToServer::DescribeDriver {
+                correlation_id,
+                pod_id,
+                driver,
+            } => {
+                // Synchronous by design: describe() runs in the same
+                // sandboxed VM as driver activations, which already
+                // execute on this thread — and the reply must carry
+                // eval failures in-band so the new-thread form can pin
+                // them to the picker.
+                let outcome = self
+                    .load_driver_program(&pod_id, &driver)
+                    .and_then(|source| crate::runtime::driver::lua::run_describe(&source, &driver));
+                let (description, error) = match outcome {
+                    Ok(found) => (Some(found.unwrap_or_default()), None),
+                    Err(message) => (None, Some(message)),
+                };
+                if let Some(outbound) = self.router.outbound(conn_id) {
+                    let _ = outbound.send(ServerToClient::DriverDescribed {
+                        correlation_id,
+                        pod_id,
+                        driver,
+                        description,
+                        error,
+                    });
+                }
+            }
             ClientToServer::ReadPodFile {
                 correlation_id,
                 pod_id,

@@ -235,7 +235,7 @@ impl Scheduler {
             let Some(weave) = self.weaves.get(weave_id) else {
                 break;
             };
-            let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } =
+            let whisper_agent_protocol::ThreadDriverConfig::Scripted { name, config } =
                 weave.driver.clone()
             else {
                 failure = Some(
@@ -265,7 +265,7 @@ impl Scheduler {
                 }
                 self.mark_weave_dirty(weave_id);
             }
-            let outcome = match lua::run_event(&source, &name, &data, &event) {
+            let outcome = match lua::run_event(&source, &name, &data, &event, &config) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     failure = Some(error);
@@ -334,7 +334,8 @@ impl Scheduler {
         let Some(weave) = self.weaves.get(weave_id) else {
             return;
         };
-        let whisper_agent_protocol::ThreadDriverConfig::Scripted { name } = weave.driver.clone()
+        let whisper_agent_protocol::ThreadDriverConfig::Scripted { name, config } =
+            weave.driver.clone()
         else {
             return;
         };
@@ -344,7 +345,7 @@ impl Scheduler {
         };
         let data = data.clone();
         let blocks = match self.load_driver_program(&pod_id, &name) {
-            Ok(source) => match lua::run_present(&source, &name, &data) {
+            Ok(source) => match lua::run_present(&source, &name, &data, &config) {
                 Ok(Some(blocks)) => blocks,
                 Ok(None) => Vec::new(),
                 Err(error) => {
@@ -428,6 +429,7 @@ impl Scheduler {
                 relationship,
                 system_prompt,
                 model,
+                backend,
                 disable_tools,
                 max_turns,
                 seed,
@@ -440,6 +442,11 @@ impl Scheduler {
                     tools: disable_tools.then(AllowMap::deny_all),
                     ..Default::default()
                 };
+                let bindings_request =
+                    backend.map(|backend| whisper_agent_protocol::ThreadBindingsRequest {
+                        backend: Some(backend),
+                        ..Default::default()
+                    });
                 let seed_messages: Vec<Message> = seed
                     .into_iter()
                     .map(|entry| Message::user_text(entry.text).with_author(entry.author))
@@ -454,7 +461,7 @@ impl Scheduler {
                 let new_id = self.weave_derive_thread(
                     weave_id,
                     Some(config_override),
-                    None,
+                    bindings_request,
                     seed_messages,
                     relationship_meta,
                     None,

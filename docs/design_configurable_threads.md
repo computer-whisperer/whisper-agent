@@ -152,10 +152,15 @@ Target effect vocabulary (supersedes the earlier single-thread list):
 
 ```text
 append_entry(thread, author, content, provenance)   -- pollution included
-run_agent(thread, participant?, limits)             -- tick one turn; which
+run_agent(thread, participant?)                     -- tick one turn; which
                                                     -- registered Model voice
                                                     -- speaks (default: the
-                                                    -- thread's responder)
+                                                    -- thread's responder).
+                                                    -- (Earlier drafts listed a
+                                                    -- `limits` arg; never
+                                                    -- implemented — per-cycle
+                                                    -- caps come from max_turns
+                                                    -- on the thread.)
 call_tool(thread, tool, arguments)
 derive_thread(definition, seed, relationship)       -- fork/compact/check/...
 advance_head(thread)                                -- promote to primary (step 8)
@@ -466,7 +471,49 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    `source` field before a driver both coordinates and dispatches);
    a replacement voice does not inherit the dead voice's private
    history (fresh context; entry-copy vocabulary would be needed).
-10. Title generation, autoquery, behavior startup, and dispatch callbacks as
+10. Driver-declared configuration knobs (ratified 2026-08-08, three forks
+   via AskUserQuestion — pulled ahead of builtins-as-drivers because both
+   pending consumers demand it: title generation wants a dedicated model,
+   and the roundtable wants per-voice "provider x, model y" casts).
+   A driver optionally defines a third pure entry point beside
+   `on_event`/`present`: `describe() -> { label?, description?, knobs }`,
+   evaluated in the same sandbox with no state. **Declaration source
+   ratified: in-program `describe()`** — this deliberately reverses step
+   9's deferral of creation-time program evaluation, now that a consumer
+   demands it; being code, it keeps one source of truth (the roundtable
+   generates one model knob per CAST entry) and needs no repeated-group
+   schema machinery. REJECTED: sidecar schema file (`<name>.knobs.json`)
+   — two sources of truth that drift, and no dynamic knob generation.
+   **Schema language ratified: a typed knob vocabulary**, a flat list of
+   `{ id, label, type, default, constraints }` with v1 types `model`
+   (value is a `{backend, model}` pair, rendered by the client's existing
+   backend/model pickers and validated against the backend catalog),
+   `string` (optional `multiline` for prompts), `boolean`,
+   `integer`/`number` (min/max), `select` (static options). REJECTED:
+   CDDL / JSON-Schema subset — structural expressiveness a generic form
+   cannot render, no domain types (`model` would degrade to a bare string,
+   losing catalog validation and the picker widget), plus a parser
+   dependency; validation errors also stop mapping cleanly onto form
+   fields. **Lifecycle ratified: values frozen at creation** — collected
+   by the new-thread form (a `DescribeDriver` request fetches the knob
+   list when the picker selects a scripted driver), submitted inside
+   `ThreadDriverConfig::Scripted { name, config }`, validated server-side
+   against the declaration (refusing creation on mismatch), and
+   snapshotted onto the `Weave` beside `driver_program_hash` per the
+   "weave snapshots what explains its behavior" invariant. REJECTED for
+   now: editable knobs with a `config_changed` event — deferred until
+   demanded; the escape hatch is starting a new weave. Delivery: config
+   rides every activation as an extra argument — `on_event(state, event,
+   config)` and `present(state, config)` — never seeded into driver
+   state (state stays purely driver-computed; Lua ignores extra
+   arguments, so existing drivers are untouched). Creation-time
+   validation is the only validation: a program edited after creation may
+   see stale or missing knob values and must tolerate `nil` like any
+   table access. Companion effect growth: `derive_thread` gains an
+   optional `backend`, mapped onto the `ThreadBindingsRequest` parameter
+   `weave_derive_thread` already accepts — without it a knob-configured
+   cross-provider voice has no way to land on its provider.
+11. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 
 ## Open questions (flagged, not ratified)

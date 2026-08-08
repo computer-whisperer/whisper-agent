@@ -44,7 +44,10 @@ fn test_pod_config() -> PodConfig {
         description: None,
         created_at: "2026-07-31T10:00:00Z".into(),
         allow: PodAllow {
-            backends: vec!["anthropic".into()],
+            // Two names so cross-backend knob/derive paths are testable;
+            // the harness registry tolerates unknown backend ids and no
+            // model call ever leaves the building (respond_model).
+            backends: vec!["anthropic".into(), "openai".into()],
             mcp_hosts: Vec::new(),
             host_env: Vec::new(),
             knowledge_buckets: Vec::new(),
@@ -192,6 +195,16 @@ impl Harness {
 
     /// Create a thread coordinated by the named scripted driver.
     fn create_scripted_thread(&mut self, driver: &str) -> Result<String, String> {
+        self.create_scripted_thread_with_config(driver, Default::default())
+    }
+
+    /// Create a scripted thread with submitted knob values (step 10) —
+    /// the harness stand-in for the new-thread form's config controls.
+    fn create_scripted_thread_with_config(
+        &mut self,
+        driver: &str,
+        config: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<String, String> {
         let mut pending_io = FuturesUnordered::new();
         self.sched.create_task(
             None,
@@ -200,6 +213,7 @@ impl Harness {
             Some(ThreadConfigOverride {
                 driver: Some(ThreadDriverConfig::Scripted {
                     name: driver.into(),
+                    config,
                 }),
                 ..Default::default()
             }),
@@ -1578,6 +1592,7 @@ end
             Some(ThreadConfigOverride {
                 driver: Some(ThreadDriverConfig::Scripted {
                     name: "dialogue".into(),
+                    config: Default::default(),
                 }),
                 participants: Some(participants),
                 participant_profiles: Some(profiles),
@@ -2443,4 +2458,163 @@ async fn roundtable_restart_notices_a_cancelled_voice() {
         fresh.internal_of(&primary),
         ThreadInternalState::Completed
     ));
+}
+
+/// Step-10 knobs, end to end on a purpose-built driver: creation
+/// validates submitted values against the program's `describe()`
+/// (refusing mismatches with the knob named), freezes the validated map
+/// — declaration defaults materialized — onto the weave's driver
+/// config, hands it to every activation as `on_event`'s third argument,
+/// and a `model` knob's backend flows through `derive_thread` onto the
+/// derived thread's bindings.
+#[tokio::test]
+async fn knob_config_validates_freezes_and_reaches_the_driver() {
+    const KNOBBED: &str = r#"
+        function describe()
+          return {
+            label = "Knobbed",
+            knobs = {
+              { id = "voice.model", type = "model", required = true },
+              { id = "rounds", type = "integer", default = 2, min = 1, max = 5 },
+            },
+          }
+        end
+        function on_event(state, event, config)
+          if event.kind == "input_accepted" and not state.derived then
+            state.derived = true
+            local voice = config["voice.model"]
+            return { effects = { { kind = "derive_thread",
+              relationship = "voice:one",
+              system_prompt = "you are the voice",
+              model = voice.model,
+              backend = voice.backend,
+              disable_tools = true,
+              source_thread_id = event.thread_id } }, state = state }
+          end
+          return { state = state }
+        end
+    "#;
+    let mut h = harness().await;
+    h.install_driver("knobbed", KNOBBED);
+    let model_knob = |backend: &str| -> std::collections::BTreeMap<String, serde_json::Value> {
+        [(
+            "voice.model".to_string(),
+            serde_json::json!({"backend": backend, "model": "gpt-5"}),
+        )]
+        .into_iter()
+        .collect()
+    };
+
+    // Refusals name the offending knob: missing required value, a key
+    // describe() never declared, and a backend outside the pod ceiling.
+    let err = h.create_scripted_thread("knobbed").unwrap_err();
+    assert!(err.contains("`voice.model` is required"), "{err}");
+    let mut with_unknown = model_knob("openai");
+    with_unknown.insert("mystery".into(), serde_json::json!(true));
+    let err = h
+        .create_scripted_thread_with_config("knobbed", with_unknown)
+        .unwrap_err();
+    assert!(err.contains("unknown knob `mystery`"), "{err}");
+    let err = h
+        .create_scripted_thread_with_config("knobbed", model_knob("nonexistent"))
+        .unwrap_err();
+    assert!(err.contains("not in pod"), "{err}");
+
+    // A valid submission creates; the frozen map on the weave carries
+    // the materialized default beside the submitted value.
+    let primary = h
+        .create_scripted_thread_with_config("knobbed", model_knob("openai"))
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let ThreadDriverConfig::Scripted { config, .. } = &h.sched.weaves[&weave_id].driver else {
+        panic!("scripted weave lost its driver config");
+    };
+    assert_eq!(config.get("rounds"), Some(&serde_json::json!(2)));
+    assert_eq!(
+        config["voice.model"]["model"],
+        serde_json::json!("gpt-5"),
+        "submitted knob frozen verbatim"
+    );
+
+    // The activation hands the frozen config to on_event; the driver
+    // derives its voice on the knob's backend + model.
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&primary, "go".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let derived = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "voice:one")
+        })
+        .expect("voice derived")
+        .thread_id
+        .clone();
+    assert_eq!(h.sched.tasks[&derived].config.model, "gpt-5");
+    assert_eq!(h.sched.tasks[&derived].bindings.backend, "openai");
+}
+
+/// The roundtable's `describe()` generates one optional model knob per
+/// cast seat; a configured seat derives on that knob's backend + model
+/// while unconfigured seats keep the pod defaults, and a replacement
+/// for a dead voice re-reads the same frozen knob — a configured seat
+/// keeps its provider across deaths.
+#[tokio::test]
+async fn roundtable_model_knobs_configure_seats_and_outlive_voices() {
+    let mut h = harness().await;
+    h.install_driver("roundtable", ROUNDTABLE_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config(
+            "roundtable",
+            [(
+                "voice.optimist.model".to_string(),
+                serde_json::json!({"backend": "openai", "model": "gpt-5"}),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&primary, "well?".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+
+    let voice_threads = |h: &Harness, id: &str| -> Vec<String> {
+        let kind = format!("voice:{id}");
+        h.sched.weaves[&weave_id]
+            .threads
+            .iter()
+            .filter(|r| r.relationship.as_ref().is_some_and(|rel| rel.kind == kind))
+            .map(|r| r.thread_id.clone())
+            .collect()
+    };
+    let optimist1 = voice_threads(&h, "optimist")[0].clone();
+    let skeptic = voice_threads(&h, "skeptic")[0].clone();
+    assert_eq!(h.sched.tasks[&optimist1].config.model, "gpt-5");
+    assert_eq!(h.sched.tasks[&optimist1].bindings.backend, "openai");
+    assert_eq!(h.sched.tasks[&skeptic].config.model, "claude-sonnet-4-6");
+    assert_eq!(h.sched.tasks[&skeptic].bindings.backend, "anthropic");
+
+    // Kill the configured voice mid-round (it holds the floor), let the
+    // skeptic close the round, then a fresh input derives a
+    // replacement: same knob, same provider, fresh context.
+    h.fail_model(&optimist1, "provider exploded", &mut pending_io);
+    h.respond_model(&skeptic, vec![text_block("Noted.")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    h.sched
+        .send_user_message(&primary, "again".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let optimist2 = voice_threads(&h, "optimist")
+        .into_iter()
+        .find(|t| *t != optimist1)
+        .expect("replacement derived");
+    assert_eq!(h.sched.tasks[&optimist2].config.model, "gpt-5");
+    assert_eq!(h.sched.tasks[&optimist2].bindings.backend, "openai");
 }

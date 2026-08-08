@@ -30,7 +30,10 @@
 -- The cast is program-declared: edit CAST, copy this file under
 -- <pod>/drivers/, and pick it at thread creation. Per voice: `id`
 -- (the attribution everyone sees), `prompt` (its private system
--- prompt), and optional `model` (nil = the pod default).
+-- prompt), and optional `model` (nil = the pod default). At creation
+-- the new-thread form additionally offers one model knob per voice
+-- (describe() below) — a chosen {backend, model} overrides the CAST
+-- entry, so a cross-provider panel needs no program edit.
 --
 -- v1 limits: voices run with tools disabled.
 
@@ -100,16 +103,20 @@ end
 -- Derive any missing voice threads (first round, or replacements for
 -- dead voices), or start the round directly when the cast is whole.
 -- When derives are needed the input waits in state.awaiting until
--- thread_derived drains them.
-local function ensure_cast(state, text)
+-- thread_derived drains them. A per-voice model knob (creation-frozen
+-- config) beats the CAST default; replacements re-read the same knob,
+-- so a configured voice keeps its provider across deaths.
+local function ensure_cast(state, text, config)
   state.voices = state.voices or {}
   local derives = {}
   for _, voice in ipairs(CAST) do
     if not state.voices[voice.id] then
+      local knob = config and config["voice." .. voice.id .. ".model"]
       derives[#derives + 1] = { kind = "derive_thread",
         relationship = "voice:" .. voice.id,
         system_prompt = voice.prompt,
-        model = voice.model,
+        model = knob and knob.model or voice.model,
+        backend = knob and knob.backend or nil,
         disable_tools = true,
         source_thread_id = state.primary }
     end
@@ -127,7 +134,7 @@ end
 -- next one immediately if input stacked up (the primary's cycle stays
 -- open across back-to-back rounds; one finish closes however many
 -- stacked submissions opened it).
-local function advance_floor(state, effects)
+local function advance_floor(state, effects, config)
   state.speaking = table.remove(state.queue, 1)
   if state.speaking then
     effects[#effects + 1] = { kind = "run_agent",
@@ -135,7 +142,7 @@ local function advance_floor(state, effects)
     return
   end
   if state.pending and #state.pending > 0 then
-    for _, e in ipairs(ensure_cast(state, table.remove(state.pending, 1))) do
+    for _, e in ipairs(ensure_cast(state, table.remove(state.pending, 1), config)) do
       effects[#effects + 1] = e
     end
   else
@@ -144,7 +151,7 @@ local function advance_floor(state, effects)
   end
 end
 
-function on_event(state, event)
+function on_event(state, event, config)
   local k = event.kind
 
   if k == "input_accepted" then
@@ -159,7 +166,7 @@ function on_event(state, event)
       state.pending[#state.pending + 1] = event.text
       return { state = state }
     end
-    return { effects = ensure_cast(state, event.text), state = state }
+    return { effects = ensure_cast(state, event.text, config), state = state }
   end
 
   if k == "thread_derived" then
@@ -188,7 +195,7 @@ function on_event(state, event)
     end
     local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
     speak(state, speaker, event.text, event.thread_id, effects)
-    advance_floor(state, effects)
+    advance_floor(state, effects, config)
     return { effects = effects, state = state }
   end
 
@@ -214,7 +221,7 @@ function on_event(state, event)
     end
     if voice_id == state.speaking then
       local effects = {}
-      advance_floor(state, effects)
+      advance_floor(state, effects, config)
       return { effects = effects, state = state }
     end
     return { state = state }
@@ -225,6 +232,27 @@ function on_event(state, event)
   -- agent_completed, and thread_failed, so every other boundary
   -- parks.
   return { state = state }
+end
+
+-- Configuration declaration (step 10): one model knob per cast seat,
+-- generated from CAST so the program stays the single source of truth.
+-- All optional — an unset knob leaves that voice on its CAST `model`
+-- (or the pod default).
+function describe()
+  local knobs = {}
+  for _, voice in ipairs(CAST) do
+    knobs[#knobs + 1] = {
+      id = "voice." .. voice.id .. ".model",
+      label = voice.id .. " model",
+      type = "model",
+    }
+  end
+  return {
+    label = "Roundtable",
+    description = "One-pass round-robin panel: each voice keeps a "
+      .. "private thread, replies pollinate through the minutes view.",
+    knobs = knobs,
+  }
 end
 
 -- Presentation: the minutes is the head; while a voice holds the
