@@ -99,6 +99,33 @@ pub struct DriverDescription {
 }
 
 impl DriverDescription {
+    /// Declaration-level validity, enforced wherever `describe()` is
+    /// evaluated (the listing request and creation alike): knob ids
+    /// must be non-empty, unique, and colon-free — the client's route
+    /// keys are string-glued from ids with `:`-separated suffixes, so
+    /// a colliding or duplicated id silently produces dead or
+    /// cross-wired controls — and a `select` must declare options
+    /// (otherwise no value can ever validate). Refusing here turns
+    /// those states into an authoring error pinned at the picker.
+    pub fn validate_declaration(&self) -> Result<(), String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for spec in &self.knobs {
+            if spec.id.is_empty() {
+                return Err("knob with an empty id".into());
+            }
+            if spec.id.contains(':') {
+                return Err(format!("knob `{}`: ids may not contain `:`", spec.id));
+            }
+            if !seen.insert(&spec.id) {
+                return Err(format!("duplicate knob id `{}`", spec.id));
+            }
+            if spec.kind == KnobKind::Select && spec.options.is_empty() {
+                return Err(format!("knob `{}` is a select with no options", spec.id));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate submitted knob values against this declaration and
     /// materialize defaults, producing the map frozen onto the weave.
     ///
@@ -162,10 +189,18 @@ fn validate_value(spec: &KnobSpec, value: &Value) -> Result<(), String> {
             }
         }
         KnobKind::Integer => {
-            let Some(n) = value.as_i64() else {
+            // Whole-valued floats are accepted: Lua arithmetic (any
+            // `/`) always yields floats, so a computed default like
+            // `6/2` would otherwise refuse every creation while
+            // looking like a whole number.
+            let whole = value
+                .as_i64()
+                .map(|n| n as f64)
+                .or_else(|| value.as_f64().filter(|f| f.fract() == 0.0));
+            let Some(n) = whole else {
                 return Err(format!("knob `{id}` expects a whole number"));
             };
-            check_bounds(spec, n as f64)?;
+            check_bounds(spec, n)?;
         }
         KnobKind::Number => {
             let Some(n) = value.as_f64() else {
@@ -291,6 +326,77 @@ mod tests {
         both.insert("mode".into(), json!("reckless"));
         let err = description.validate_config(&both).unwrap_err();
         assert!(err.contains("one of: fast, careful"));
+    }
+
+    #[test]
+    fn integer_knobs_accept_whole_valued_floats() {
+        let description = DriverDescription {
+            knobs: vec![knob("rounds", KnobKind::Integer)],
+            ..Default::default()
+        };
+        // Lua arithmetic yields floats (`6/2` == 3.0) — whole values
+        // pass, fractional ones refuse.
+        assert!(
+            description
+                .validate_config(&submitted(&[("rounds", json!(3.0))]))
+                .is_ok()
+        );
+        let err = description
+            .validate_config(&submitted(&[("rounds", json!(3.5))]))
+            .unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+    }
+
+    #[test]
+    fn declaration_refuses_bad_ids_and_empty_selects() {
+        let dup = DriverDescription {
+            knobs: vec![knob("x", KnobKind::String), knob("x", KnobKind::Boolean)],
+            ..Default::default()
+        };
+        assert!(
+            dup.validate_declaration()
+                .unwrap_err()
+                .contains("duplicate knob id `x`")
+        );
+
+        let colon = DriverDescription {
+            knobs: vec![knob("x:backend", KnobKind::String)],
+            ..Default::default()
+        };
+        assert!(
+            colon
+                .validate_declaration()
+                .unwrap_err()
+                .contains("may not contain `:`")
+        );
+
+        let empty_id = DriverDescription {
+            knobs: vec![knob("", KnobKind::String)],
+            ..Default::default()
+        };
+        assert!(
+            empty_id
+                .validate_declaration()
+                .unwrap_err()
+                .contains("empty id")
+        );
+
+        let bare_select = DriverDescription {
+            knobs: vec![knob("mode", KnobKind::Select)],
+            ..Default::default()
+        };
+        assert!(
+            bare_select
+                .validate_declaration()
+                .unwrap_err()
+                .contains("select with no options")
+        );
+
+        let fine = DriverDescription {
+            knobs: vec![knob("a", KnobKind::String), knob("b", KnobKind::Model)],
+            ..Default::default()
+        };
+        assert!(fine.validate_declaration().is_ok());
     }
 
     #[test]

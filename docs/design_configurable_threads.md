@@ -513,6 +513,36 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    optional `backend`, mapped onto the `ThreadBindingsRequest` parameter
    `weave_derive_thread` already accepts — without it a knob-configured
    cross-provider voice has no way to land on its provider.
+   **Both halves landed 2026-08-08** (4d58d39 server, 70d3add UI).
+   Protocol: `whisper-agent-protocol/src/driver.rs` (KnobKind/KnobSpec/
+   DriverDescription + structural `validate_config`, flat spec structs
+   by design — internal tagging fought the Lua bridge in step 7);
+   `ThreadDriverConfig::Scripted` gained the `config` map (serde-default
+   empty; `Eq` dropped from the enum for `serde_json::Value`); wire pair
+   `DescribeDriver`/`DriverDescribed` with in-band `error` so the form
+   can pin authoring failures to the picker. Server: `lua::run_describe`
+   beside run_event/run_present (absent function or nil return = empty
+   declaration); creation validates in `create_task` right where the
+   program-load check lived — structural validation plus the pod
+   `allow.backends` check on model knobs — and rewrites the submitted
+   map with defaults materialized before the weave snapshots it via its
+   `driver` field; both activation paths destructure the frozen map and
+   pass it as the third VM argument. `load_driver_program`'s existing
+   name sanitization covers the new request. The roundtable's
+   `describe()` generates one optional model knob per CAST seat;
+   replacements re-read the same frozen knob, so a configured seat keeps
+   its provider across voice deaths (harness-pinned, including refusal
+   messages naming the knob and the materialized-default assertion).
+   UI: knob rows render between the runtime pickers and the message
+   editor; model knobs are chained backend/model menus over the
+   server-known catalog (per-backend model lists fetched on demand),
+   select/boolean are single menus, string/integer/number bind keyed
+   text inputs (multiline strings a text_area) re-parsed per edit;
+   incomplete model pairs are withheld from submission. Accepted gaps
+   at landing: no client-side required/bounds enforcement (the server's
+   named refusal is the backstop); a model knob's model menu opens
+   empty until its backend is picked; knob values are not counted in
+   the overrides-modal count (they render in the main pane).
 11. Title generation, autoquery, behavior startup, and dispatch callbacks as
    weave drivers, as concrete cases justify.
 

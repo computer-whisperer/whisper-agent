@@ -8805,6 +8805,13 @@ impl ChatApp {
                     // driver — drop them and fetch the new one's.
                     self.reset_driver_knobs();
                     self.request_driver_description();
+                } else if new_value.is_some() {
+                    // Re-picking the same driver re-evaluates its
+                    // describe() — the retry path after a failed eval
+                    // or a program edit. Entered values survive; the
+                    // server refuses any that no longer validate.
+                    self.picker_driver_desc = None;
+                    self.request_driver_description();
                 }
                 self.picker_driver_open = false;
             }

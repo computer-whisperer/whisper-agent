@@ -428,9 +428,36 @@ pub fn run_describe(
     if returned.is_nil() {
         return Ok(None);
     }
+    // Deserialize through a self-describing Value first: an empty Lua
+    // table is indistinguishable from an empty map and arrives as `{}`,
+    // which a typed `Vec<KnobSpec>` would reject even though
+    // `knobs = {}` is a perfectly good "no knobs" — while a NON-empty
+    // map (`knobs = { foo = {...} }`, a natural Lua authoring mistake)
+    // would silently deserialize as zero knobs via the sequence path.
+    // Normalize the former, refuse the latter loudly.
+    let mut wire: serde_json::Value = lua
+        .from_value(returned)
+        .map_err(|e| format!("driver `{chunk_name}` returned a malformed description: {e}"))?;
+    if let Some(knobs) = wire.get_mut("knobs") {
+        match knobs {
+            serde_json::Value::Object(map) if map.is_empty() => {
+                *knobs = serde_json::Value::Array(Vec::new());
+            }
+            serde_json::Value::Object(_) => {
+                return Err(format!(
+                    "driver `{chunk_name}` describe(): `knobs` must be an array of knob tables, \
+                     not a map keyed by id"
+                ));
+            }
+            _ => {}
+        }
+    }
     let description: whisper_agent_protocol::driver::DriverDescription =
-        lua.from_value(returned)
+        serde_json::from_value(wire)
             .map_err(|e| format!("driver `{chunk_name}` returned a malformed description: {e}"))?;
+    description
+        .validate_declaration()
+        .map_err(|e| format!("driver `{chunk_name}` describe(): {e}"))?;
     Ok(Some(description))
 }
 
@@ -814,6 +841,44 @@ mod tests {
         assert!(knobs[0].required);
         assert_eq!(knobs[1].default, Some(json!(2)));
         assert_eq!((knobs[1].min, knobs[1].max), (Some(1.0), Some(9.0)));
+    }
+
+    #[test]
+    fn describe_normalizes_empty_knobs_and_refuses_maps_and_bad_declarations() {
+        // `knobs = {}` is ambiguous in Lua (empty array == empty map);
+        // it must land as the empty declaration, not a type error.
+        let empty = r#"
+            function on_event(state, event) return nil end
+            function describe() return { label = "L", knobs = {} } end
+        "#;
+        let description = run_describe(empty, "d").unwrap().unwrap();
+        assert!(description.knobs.is_empty());
+        assert_eq!(description.label.as_deref(), Some("L"));
+
+        // A map keyed by id would silently deserialize as zero knobs
+        // via the sequence path — refuse it loudly instead.
+        let map_shaped = r#"
+            function on_event(state, event) return nil end
+            function describe()
+              return { knobs = { rounds = { type = "integer" } } }
+            end
+        "#;
+        let err = run_describe(map_shaped, "d").unwrap_err();
+        assert!(err.contains("must be an array"), "got: {err}");
+
+        // Declaration validity is enforced at evaluation, so authoring
+        // mistakes pin to the picker instead of minting dead controls.
+        let duplicated = r#"
+            function on_event(state, event) return nil end
+            function describe()
+              return { knobs = {
+                { id = "x", type = "string" },
+                { id = "x", type = "boolean" },
+              } }
+            end
+        "#;
+        let err = run_describe(duplicated, "d").unwrap_err();
+        assert!(err.contains("duplicate knob id `x`"), "got: {err}");
     }
 
     #[test]

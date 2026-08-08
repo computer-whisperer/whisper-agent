@@ -3682,6 +3682,15 @@ impl Scheduler {
             .validate()
             .map_err(|e| format!("invalid thread participants: {e}"))?;
         validate_participant_profile_requests(&config.participants, &participant_profile_requests)?;
+        // The dispatching parent's scope, when there is one — bindings
+        // resolution narrows against it below, and model-knob values
+        // get the same early check so a dispatched scripted thread's
+        // knobs refuse at the form, not at the eventual derive.
+        let parent_scope = dispatched_by_parent
+            .as_ref()
+            .and_then(|(parent_id, _)| self.tasks.get(parent_id))
+            .map(|p| p.scope.clone());
+
         // A scripted driver must load — and its declared knob config must
         // validate — at creation time: a bad name, unreadable or
         // unparseable program, or mismatched knob value should reject
@@ -3700,23 +3709,35 @@ impl Scheduler {
             let frozen = description
                 .validate_config(knob_values)
                 .map_err(|e| format!("driver `{name}` config: {e}"))?;
-            // `model` knobs get the same pod-ceiling check the bindings
-            // resolver applies to the thread's own backend, so a
-            // disallowed provider surfaces at the form instead of at
-            // the eventual derive.
+            // `model` knobs get the same checks the bindings resolver
+            // applies to the thread's own backend — the pod ceiling
+            // plus, for dispatched creations, the parent's scope — so
+            // a disallowed provider surfaces at the form instead of at
+            // the eventual derive. (The derive itself re-enforces both
+            // against the primary's frozen scope; this is the early,
+            // user-facing half.)
             for spec in &description.knobs {
                 if spec.kind == whisper_agent_protocol::driver::KnobKind::Model
                     && let Some(backend) = frozen
                         .get(&spec.id)
                         .and_then(|value| value.get("backend"))
                         .and_then(|value| value.as_str())
-                    && !pod.config.allow.backends.iter().any(|b| b == backend)
                 {
-                    return Err(format!(
-                        "knob `{}`: backend `{backend}` not in pod `{pod_id}`'s allow.backends ({})",
-                        spec.id,
-                        pod.config.allow.backends.join(", ")
-                    ));
+                    if !pod.config.allow.backends.iter().any(|b| b == backend) {
+                        return Err(format!(
+                            "knob `{}`: backend `{backend}` not in pod `{pod_id}`'s allow.backends ({})",
+                            spec.id,
+                            pod.config.allow.backends.join(", ")
+                        ));
+                    }
+                    if let Some(parent) = parent_scope.as_ref()
+                        && !parent.backends.admits(&backend.to_string())
+                    {
+                        return Err(format!(
+                            "knob `{}`: backend `{backend}` not in the dispatching parent's scope.backends",
+                            spec.id
+                        ));
+                    }
                 }
             }
             config.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
@@ -3731,10 +3752,6 @@ impl Scheduler {
         // children, against the dispatching parent's scope. This is the
         // "child bindings must live within parent scope" half of the
         // narrowing invariant; the scope-narrowing below is the other half.
-        let parent_scope = dispatched_by_parent
-            .as_ref()
-            .and_then(|(parent_id, _)| self.tasks.get(parent_id))
-            .map(|p| p.scope.clone());
         let mut resolved = resolve_bindings_choice(pod, bindings_request, parent_scope.as_ref())?;
         // Top-level paths that supply a `base_scope_override` (behavior
         // fires, primarily) need bindings narrowed against the override
