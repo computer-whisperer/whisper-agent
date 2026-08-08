@@ -5983,11 +5983,6 @@ impl Scheduler {
         result
     }
 
-    /// Execute an `adopt_ticker` effect: take over driving a dormant
-    /// thread's turns. Refused when any weave (including the caller)
-    /// already ticks the thread — ticker transfer is an explicit
-    /// release-then-adopt pair, each journaled on its own weave.
-    #[allow(dead_code)]
     /// Execute a `set_title` effect (step 11): set a referenced
     /// thread's display title. Last-write-wins — a model-generated
     /// title overwrites the first-input truncation placeholder. The
@@ -6016,8 +6011,18 @@ impl Scheduler {
                     "set_title: thread `{thread_id}` is not referenced by weave `{weave_id}`"
                 ));
             }
-            if !self.tasks.contains_key(thread_id) {
-                return Err(format!("set_title: unknown thread `{thread_id}`"));
+            let task = self
+                .tasks
+                .get(thread_id)
+                .ok_or_else(|| format!("set_title: unknown thread `{thread_id}`"))?;
+            // Referenced threads are same-pod by construction (derive,
+            // adopt, singleton, load); this is the same defensive
+            // parity check append_entry and adopt_ticker carry.
+            if task.pod_id != weave.pod_id {
+                return Err(format!(
+                    "set_title: thread `{thread_id}` is outside weave pod `{}`",
+                    weave.pod_id
+                ));
             }
             Ok(())
         })();
@@ -6049,6 +6054,10 @@ impl Scheduler {
         result
     }
 
+    /// Execute an `adopt_ticker` effect: take over driving a dormant
+    /// thread's turns. Refused when any weave (including the caller)
+    /// already ticks the thread — ticker transfer is an explicit
+    /// release-then-adopt pair, each journaled on its own weave.
     pub(super) fn weave_adopt_ticker(
         &mut self,
         weave_id: &str,

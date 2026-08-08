@@ -609,6 +609,25 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    **Roundtable rider ratified**: the roundtable gains the same
    optional `title.model` knob and titles its minutes when the first
    round closes.
+   **Slice 1 landed** (07939ed; review pending at time of writing).
+   `ScriptedEffect::SetTitle` + `PersistedDriverEffect::SetTitle
+   {thread_id, title}` (the journal explains where a name came from) +
+   `weave_set_title` executor following the adopt_ticker
+   admission/journal shape (trimmed; empty titles refused; refusals
+   journal Failed). titled_chat.lua and the roundtable both derive the
+   title thread with `max_turns = 1`, clean the reply in Lua
+   (trim/unquote/collapse/strip-period/clip-60 on UTF-8 boundaries;
+   an empty cleaned title skips set_title but still closes the title
+   thread's cycle), never retry a dead title model, and drop the title
+   thread from presentation once done (drill-down keeps it). Roundtable
+   test pins updated for the always-on title thread (ref/journal
+   counts); the flagship test drives the title end-to-end (placeholder
+   → cleaned model title), and titled_chat tests pin the knob's
+   backend+model on the title thread's bindings plus the
+   placeholder-stands failure path. Incidental fix folded in: two
+   clippy needless-borrow errors in the knob form (the session had
+   been running clippy without `-- -D warnings`; CI would have
+   refused 70d3add/840399a).
 
 ## Open questions (flagged, not ratified)
 

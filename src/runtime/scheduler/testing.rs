@@ -259,6 +259,49 @@ impl Harness {
         self.sched.step_until_blocked(thread_id, pending_io);
     }
 
+    /// Complete one in-flight tool call with a synthetic text result
+    /// and pump the step loop — the test-side stand-in for a tool
+    /// executor round trip.
+    fn respond_tool(
+        &mut self,
+        thread_id: &str,
+        tool_use_id: &str,
+        text: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let op_id = match self.internal_of(thread_id) {
+            ThreadInternalState::AwaitingTools {
+                pending_io: ops, ..
+            } => ops
+                .iter()
+                .find(|(_, tid)| tid.as_str() == tool_use_id)
+                .map(|(op, _)| *op)
+                .unwrap_or_else(|| {
+                    panic!("thread `{thread_id}` has no pending tool op for `{tool_use_id}`")
+                }),
+            other => panic!("thread `{thread_id}` is not awaiting tools: {other:?}"),
+        };
+        let mut events = Vec::new();
+        self.sched
+            .tasks
+            .get_mut(thread_id)
+            .unwrap()
+            .apply_io_result(
+                op_id,
+                IoResult::ToolCall {
+                    tool_use_id: tool_use_id.to_string(),
+                    result: Ok(crate::tools::mcp::CallToolResult {
+                        content: vec![crate::tools::mcp::McpContentBlock::Text {
+                            text: text.to_string(),
+                        }],
+                        is_error: false,
+                    }),
+                },
+                &mut events,
+            );
+        self.sched.step_until_blocked(thread_id, pending_io);
+    }
+
     /// Fail the thread's in-flight model call through the scheduler's
     /// real io-completion path — unlike [`Self::respond_model`], which
     /// applies straight to the task, this exercises the layer that
@@ -2396,6 +2439,9 @@ async fn roundtable_recovers_after_restart_mid_round() {
     // re-voiding on later rounds. (The drained-once property itself is
     // pinned by round two above — deliver-on-every-activation would
     // have replayed the primary's death mid-round and voided it.)
+    // Ref count note: the title thread derives at the first COMPLETED
+    // round's close — that's post-restart "round two"; pre-restart
+    // round one was voided before closing.
     let mut pending_io2 = FuturesUnordered::new();
     fresh
         .sched
@@ -2404,7 +2450,7 @@ async fn roundtable_recovers_after_restart_mid_round() {
     assert_eq!(
         fresh.sched.weaves[&weave_id].threads.len(),
         5,
-        "no re-derivation on the second post-restart round (title thread from round one included)"
+        "no re-derivation on the second post-restart round (title thread from the first completed round included)"
     );
     assert!(matches!(
         fresh.internal_of(&optimist2),
@@ -2752,8 +2798,10 @@ async fn titled_chat_titles_the_thread_from_its_knob_model() {
         "the journal explains where the title came from"
     );
 
-    // Second exchange: plain chat, no second title job, title thread
-    // lingers as the referenced provenance record.
+    // Second exchange: a tool round-trip through the degenerate
+    // loop's dispatch half — dispatch_tools without interception,
+    // then tools_completed → continue_cycle — with no second title
+    // job; the title thread lingers as the provenance record.
     h.sched.send_user_message(
         &primary,
         "And lifetimes?".into(),
@@ -2763,6 +2811,23 @@ async fn titled_chat_titles_the_thread_from_its_knob_model() {
     h.sched.step_until_blocked(&primary, &mut pending_io);
     h.respond_model(
         &primary,
+        vec![tool_use_block("toolu-lt", "list_images")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingTools { .. }
+    ));
+    h.respond_tool(&primary, "toolu-lt", "no images here", &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "tools_completed → continue_cycle took another model turn"
+    );
+    h.respond_model(
+        &primary,
         vec![text_block("Scopes with names.")],
         &mut pending_io,
     );
@@ -2770,6 +2835,17 @@ async fn titled_chat_titles_the_thread_from_its_knob_model() {
         h.internal_of(&primary),
         ThreadInternalState::Completed
     ));
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(
+                |r| matches!(&r.effect, PersistedDriverEffect::DispatchTools { .. })
+                    && r.outcome == DriverEffectOutcome::Completed
+            ),
+        "the dispatch ran through the journaled DispatchTools effect"
+    );
     assert_eq!(
         h.sched.weaves[&weave_id].threads.len(),
         2,

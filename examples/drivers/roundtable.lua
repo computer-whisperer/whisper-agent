@@ -73,11 +73,15 @@ local function clip(text, limit)
 end
 
 -- Trim, unquote, collapse whitespace, drop a trailing period, clip.
+-- The FINAL trim matters: unquoting can reveal whitespace ('" "'),
+-- and the scheduler trims before its empty-title refusal — the Lua
+-- emptiness guard must agree or a whitespace title fails the effect.
 local function clean_title(text)
   local t = string.match(text or "", "^%s*(.-)%s*$")
   t = string.match(t, '^"(.*)"$') or string.match(t, "^'(.*)'$") or t
   t = string.gsub(t, "%s+", " ")
   if string.sub(t, -1) == "." then t = string.sub(t, 1, -2) end
+  t = string.match(t, "^%s*(.-)%s*$")
   return clip(t, 60)
 end
 
