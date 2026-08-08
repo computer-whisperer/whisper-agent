@@ -1840,6 +1840,25 @@ pub struct ChatApp {
     /// (lazily fetched on first open), so no dedicated wire query.
     picker_driver: Option<String>,
     picker_driver_open: bool,
+    /// Evaluated `describe()` of the picked scripted driver — `Ok`
+    /// carries the declaration the knob rows render, `Err` the
+    /// load/eval failure surfaced beside the picker. `None` while
+    /// unfetched or when the builtin driver is selected. Reset (and
+    /// re-requested) whenever the driver pick changes; pod-tab changes
+    /// already reset the driver pick itself.
+    picker_driver_desc: Option<Result<whisper_agent_protocol::driver::DriverDescription, String>>,
+    /// Working knob values for the create form, keyed by knob id.
+    /// Model knobs accumulate their `{backend, model}` pair across two
+    /// picks; submission includes only complete values (the server
+    /// validates required/bounds and refuses with the knob named).
+    picker_knob_values: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Draft buffers backing text-entry knobs (string/integer/number),
+    /// keyed by knob id. Parsed into `picker_knob_values` on each edit;
+    /// unparseable or empty drafts leave the knob unset.
+    picker_knob_drafts: std::collections::BTreeMap<String, String>,
+    /// Route key of the open knob select menu (`picker:knob:...`), if
+    /// any — the dynamic peer of the static `*_open` picker bools.
+    picker_knob_open: Option<String>,
     /// Host-env bindings picked for the next `CreateThread`. Empty
     /// is interpreted through `picker_host_env_mode`: inherit ignores
     /// this vec, none sends an explicit empty override, custom sends
@@ -2975,6 +2994,10 @@ impl ChatApp {
             picker_model_open: false,
             picker_driver: None,
             picker_driver_open: false,
+            picker_driver_desc: None,
+            picker_knob_values: Default::default(),
+            picker_knob_drafts: Default::default(),
+            picker_knob_open: None,
             picker_host_env_mode: BindingListMode::Inherit,
             picker_host_envs: Vec::new(),
             picker_host_envs_open: false,
@@ -3966,6 +3989,25 @@ impl ChatApp {
                 self.pod_files.insert(key, entries);
                 if chain_drivers {
                     self.ensure_pod_dir_fetched(&pod, "drivers");
+                }
+            }
+            ServerToClient::DriverDescribed {
+                pod_id,
+                driver,
+                description,
+                error,
+                ..
+            } => {
+                // Guard against a stale reply: only the declaration of
+                // the currently picked (pod, driver) may render knobs.
+                if self.picker_effective_pod_id() == Some(pod_id.as_str())
+                    && self.picker_driver.as_deref() == Some(driver.as_str())
+                {
+                    self.picker_driver_desc = Some(match (description, error) {
+                        (_, Some(message)) => Err(message),
+                        (Some(desc), None) => Ok(desc),
+                        (None, None) => Ok(Default::default()),
+                    });
                 }
             }
             ServerToClient::PodFileContent {
@@ -5804,6 +5846,12 @@ impl App for ChatApp {
             self.handle_driver_pick(action);
             return;
         }
+        // Dynamic knob controls of the picked driver's describe()
+        // declaration — routed by candidate key, so this must come
+        // after the fixed pickers and before generic fallthroughs.
+        if self.handle_knob_event(&event) {
+            return;
+        }
         if let Some(action) = classify_select_event(&event, PICKER_HOST_ENVS) {
             self.handle_host_envs_pick(action);
             return;
@@ -7379,6 +7427,12 @@ fn retention_kind_label(p: &RetentionPolicy) -> &'static str {
 const PICKER_BACKEND: &str = "picker:backend";
 const PICKER_MODEL: &str = "picker:model";
 const PICKER_DRIVER: &str = "picker:driver";
+/// Dynamic per-knob controls of the picked driver's `describe()`
+/// declaration. Select-style knobs route a menu at
+/// `picker:knob:<id>` (model knobs split into `...<id>:backend` and
+/// `...<id>:model`); text-style knobs bind a `text_input` at the same
+/// base key.
+const PICKER_KNOB_PREFIX: &str = "picker:knob:";
 
 /// Routed keys for the multi-select chip pickers — host envs and MCP
 /// hosts. `*_TRIGGER` is the "+ Add" button at the end of the chip
@@ -7784,7 +7838,7 @@ impl ChatApp {
             driver: self.picker_driver.clone().map(|name| {
                 whisper_agent_protocol::ThreadDriverConfig::Scripted {
                     name,
-                    config: Default::default(),
+                    config: self.submitted_knob_config(),
                 }
             }),
             participant_profiles: None,
@@ -7901,6 +7955,16 @@ impl ChatApp {
         self.picker_mcp_hosts_open = false;
         self.picker_driver = None;
         self.picker_driver_open = false;
+        self.reset_driver_knobs();
+    }
+
+    /// Clear everything downstream of the driver pick: the evaluated
+    /// declaration and any knob values/drafts entered against it.
+    fn reset_driver_knobs(&mut self) {
+        self.picker_driver_desc = None;
+        self.picker_knob_values.clear();
+        self.picker_knob_drafts.clear();
+        self.picker_knob_open = None;
     }
 
     fn reset_new_thread_overrides(&mut self) {
@@ -7910,6 +7974,7 @@ impl ChatApp {
         self.picker_model_open = false;
         self.picker_driver = None;
         self.picker_driver_open = false;
+        self.reset_driver_knobs();
         self.picker_host_env_mode = BindingListMode::Inherit;
         self.picker_host_envs.clear();
         self.picker_host_envs_open = false;
@@ -8729,11 +8794,18 @@ impl ChatApp {
             }
             SelectAction::Dismiss => self.picker_driver_open = false,
             SelectAction::Pick(value) => {
-                self.picker_driver = if value == PICKER_INHERIT {
+                let new_value = if value == PICKER_INHERIT {
                     None
                 } else {
                     Some(value)
                 };
+                if self.picker_driver != new_value {
+                    self.picker_driver = new_value;
+                    // Knob values are declarations of the previous
+                    // driver — drop them and fetch the new one's.
+                    self.reset_driver_knobs();
+                    self.request_driver_description();
+                }
                 self.picker_driver_open = false;
             }
             _ => {}
@@ -8826,7 +8898,351 @@ impl ChatApp {
     /// Two open menus at once would visually overlap and confuse the
     /// click-outside dismiss behavior; damascene's popover scrim is per
     /// menu, so we enforce single-open-at-a-time at the app layer.
+    /// Fetch the picked scripted driver's `describe()` declaration so
+    /// the form can render its knobs. Fired on driver pick; the reply
+    /// lands in the `DriverDescribed` arm (guarded against stale
+    /// pod/driver combinations).
+    fn request_driver_description(&mut self) {
+        if let (Some(pod), Some(driver)) = (
+            self.picker_effective_pod_id().map(str::to_owned),
+            self.picker_driver.clone(),
+        ) {
+            self.send(ClientToServer::DescribeDriver {
+                correlation_id: None,
+                pod_id: pod,
+                driver,
+            });
+        }
+    }
+
+    /// Route one UI event against the picked driver's knob controls.
+    /// Returns `true` when consumed. Select-style knobs reuse the
+    /// standard select classification per candidate key; text-style
+    /// knobs bind their draft buffer and re-parse it into
+    /// `picker_knob_values` on every edit.
+    fn handle_knob_event(&mut self, event: &UiEvent) -> bool {
+        use whisper_agent_protocol::driver::KnobKind;
+        let Some(Ok(desc)) = self.picker_driver_desc.as_ref() else {
+            return false;
+        };
+        // Candidate (key, knob-index, role) triples — tiny N, so trying
+        // the classifier per key beats re-deriving its route grammar.
+        enum Role {
+            Menu,
+            ModelBackend,
+            ModelModel,
+            Text,
+        }
+        let mut candidates: Vec<(String, usize, Role)> = Vec::new();
+        for (idx, spec) in desc.knobs.iter().enumerate() {
+            let base = format!("{PICKER_KNOB_PREFIX}{}", spec.id);
+            match spec.kind {
+                KnobKind::Model => {
+                    candidates.push((format!("{base}:backend"), idx, Role::ModelBackend));
+                    candidates.push((format!("{base}:model"), idx, Role::ModelModel));
+                }
+                KnobKind::Select | KnobKind::Boolean => {
+                    candidates.push((base, idx, Role::Menu));
+                }
+                KnobKind::String | KnobKind::Integer | KnobKind::Number => {
+                    candidates.push((base, idx, Role::Text));
+                }
+            }
+        }
+        for (key, idx, role) in candidates {
+            let spec = &desc.knobs[idx];
+            let id = spec.id.clone();
+            let kind = spec.kind;
+            let multiline = spec.multiline;
+            match role {
+                Role::Text => {
+                    if event.target_key() != Some(key.as_str()) {
+                        continue;
+                    }
+                    let mut draft = self.picker_knob_drafts.remove(&id).unwrap_or_default();
+                    if multiline {
+                        text_area::apply_event(&mut draft, &mut self.selection, event, &key);
+                    } else {
+                        text_input::apply_event(&mut draft, &mut self.selection, event, &key);
+                    }
+                    let parsed = match kind {
+                        KnobKind::Integer => draft
+                            .trim()
+                            .parse::<i64>()
+                            .ok()
+                            .map(serde_json::Value::from),
+                        KnobKind::Number => draft
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .map(serde_json::Value::from),
+                        _ => (!draft.is_empty()).then(|| serde_json::Value::from(draft.clone())),
+                    };
+                    match parsed {
+                        Some(value) => {
+                            self.picker_knob_values.insert(id.clone(), value);
+                        }
+                        None => {
+                            self.picker_knob_values.remove(&id);
+                        }
+                    }
+                    self.picker_knob_drafts.insert(id, draft);
+                    return true;
+                }
+                Role::Menu | Role::ModelBackend | Role::ModelModel => {
+                    let Some(action) = classify_select_event(event, &key) else {
+                        continue;
+                    };
+                    match action {
+                        SelectAction::Toggle => {
+                            self.close_other_pickers(&key);
+                            self.picker_knob_open =
+                                if self.picker_knob_open.as_deref() == Some(key.as_str()) {
+                                    None
+                                } else {
+                                    // A knob-model menu lists the chosen
+                                    // backend's catalog — make sure it's
+                                    // fetched before the popover paints.
+                                    if matches!(role, Role::ModelModel)
+                                        && let Some(backend) = self
+                                            .picker_knob_values
+                                            .get(&id)
+                                            .and_then(|v| v.get("backend"))
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_owned)
+                                    {
+                                        self.ensure_models_requested(&backend);
+                                    }
+                                    Some(key.clone())
+                                };
+                        }
+                        SelectAction::Dismiss => self.picker_knob_open = None,
+                        SelectAction::Pick(value) => {
+                            self.picker_knob_open = None;
+                            let unset = value == PICKER_INHERIT;
+                            match role {
+                                Role::ModelBackend => {
+                                    if unset {
+                                        self.picker_knob_values.remove(&id);
+                                    } else {
+                                        // Backend changed → any model
+                                        // pick is stale (ids are
+                                        // backend-scoped).
+                                        self.ensure_models_requested(&value);
+                                        self.picker_knob_values
+                                            .insert(id, serde_json::json!({ "backend": value }));
+                                    }
+                                }
+                                Role::ModelModel => {
+                                    if let Some(serde_json::Value::Object(map)) =
+                                        self.picker_knob_values.get_mut(&id)
+                                    {
+                                        if unset {
+                                            map.remove("model");
+                                        } else {
+                                            map.insert(
+                                                "model".into(),
+                                                serde_json::Value::from(value),
+                                            );
+                                        }
+                                    }
+                                }
+                                Role::Menu => {
+                                    if unset {
+                                        self.picker_knob_values.remove(&id);
+                                    } else if kind == KnobKind::Boolean {
+                                        self.picker_knob_values
+                                            .insert(id, serde_json::Value::from(value == "true"));
+                                    } else {
+                                        self.picker_knob_values
+                                            .insert(id, serde_json::Value::from(value));
+                                    }
+                                }
+                                Role::Text => unreachable!("text knobs never classify"),
+                            }
+                        }
+                        _ => {}
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// The open knob select menu for [`popover_layers`], if any.
+    fn knob_menu_layer(&self) -> Option<El> {
+        use whisper_agent_protocol::driver::KnobKind;
+        let key = self.picker_knob_open.as_deref()?;
+        let desc = match self.picker_driver_desc.as_ref() {
+            Some(Ok(desc)) => desc,
+            _ => return None,
+        };
+        let suffix = key.strip_prefix(PICKER_KNOB_PREFIX)?;
+        for spec in &desc.knobs {
+            let value = self.picker_knob_values.get(&spec.id);
+            let mut options: Vec<(String, String)> = Vec::new();
+            match spec.kind {
+                KnobKind::Model if suffix == format!("{}:backend", spec.id) => {
+                    options.push((PICKER_INHERIT.into(), "Unset".into()));
+                    for b in &self.backends {
+                        options.push((b.name.clone(), format!("{} — {}", b.name, b.kind)));
+                    }
+                }
+                KnobKind::Model if suffix == format!("{}:model", spec.id) => {
+                    let backend = value
+                        .and_then(|v| v.get("backend"))
+                        .and_then(|v| v.as_str())?;
+                    options.push((PICKER_INHERIT.into(), "Unset".into()));
+                    for m in self
+                        .models_by_backend
+                        .get(backend)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                    {
+                        options.push((m.id.clone(), m.id.clone()));
+                    }
+                }
+                KnobKind::Select if suffix == spec.id => {
+                    options.push((PICKER_INHERIT.into(), "Unset".into()));
+                    for o in &spec.options {
+                        options.push((o.clone(), o.clone()));
+                    }
+                }
+                KnobKind::Boolean if suffix == spec.id => {
+                    options.push((PICKER_INHERIT.into(), "Unset".into()));
+                    options.push(("true".into(), "true".into()));
+                    options.push(("false".into(), "false".into()));
+                }
+                _ => continue,
+            }
+            return Some(select_menu(key, options));
+        }
+        None
+    }
+
+    /// Knob rows for the new-thread form: one `form_item` per declared
+    /// knob of the picked driver, rendered from its `describe()`
+    /// declaration. `None` when the picked driver has no knobs (or
+    /// none is picked / the declaration hasn't landed).
+    fn driver_knob_rows(&self) -> Option<El> {
+        use whisper_agent_protocol::driver::KnobKind;
+        self.picker_driver.as_ref()?;
+        let desc = match self.picker_driver_desc.as_ref() {
+            Some(Ok(desc)) => desc,
+            _ => return None,
+        };
+        if desc.knobs.is_empty() {
+            return None;
+        }
+        let mut items: Vec<El> = Vec::new();
+        for spec in &desc.knobs {
+            let base = format!("{PICKER_KNOB_PREFIX}{}", spec.id);
+            let label = spec.label.clone().unwrap_or_else(|| spec.id.clone());
+            let value = self.picker_knob_values.get(&spec.id);
+            let control = match spec.kind {
+                KnobKind::Model => {
+                    let backend_label = value
+                        .and_then(|v| v.get("backend"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "Backend…".into());
+                    let model_label = value
+                        .and_then(|v| v.get("model"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "Model…".into());
+                    row([
+                        select_trigger(&format!("{base}:backend"), backend_label),
+                        select_trigger(&format!("{base}:model"), model_label),
+                    ])
+                    .gap(tokens::SPACE_2)
+                }
+                KnobKind::Select | KnobKind::Boolean => {
+                    let current = match value {
+                        Some(serde_json::Value::Bool(b)) => b.to_string(),
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        _ => "Unset".into(),
+                    };
+                    row([select_trigger(&base, current)])
+                }
+                KnobKind::String | KnobKind::Integer | KnobKind::Number => {
+                    let draft = self
+                        .picker_knob_drafts
+                        .get(&spec.id)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if spec.multiline {
+                        row([text_area(&base, draft, &self.selection).height(Size::Fixed(80.0))])
+                    } else {
+                        row([text_input(&base, draft, &self.selection)])
+                    }
+                }
+            };
+            let mut hints: Vec<String> = vec![match spec.kind {
+                KnobKind::Model => "backend + model".into(),
+                KnobKind::String => "text".into(),
+                KnobKind::Boolean => "boolean".into(),
+                KnobKind::Integer => "whole number".into(),
+                KnobKind::Number => "number".into(),
+                KnobKind::Select => "one of the listed values".into(),
+            }];
+            if let Some(range) = match (spec.min, spec.max) {
+                (Some(min), Some(max)) => Some(format!("{min}–{max}")),
+                (Some(min), None) => Some(format!("≥ {min}")),
+                (None, Some(max)) => Some(format!("≤ {max}")),
+                (None, None) => None,
+            } {
+                hints.push(range);
+            }
+            if let Some(default) = spec.default.as_ref() {
+                hints.push(format!("default {default}"));
+            }
+            if spec.required {
+                hints.push("required".into());
+            }
+            items.push(form_item([
+                form_label(label),
+                form_control(control.width(Size::Fill(1.0))),
+                form_description(hints.join(" · ")),
+            ]));
+        }
+        // Two knobs per row keeps model knobs (two triggers wide)
+        // readable without starving narrower kinds.
+        let mut rows: Vec<El> = Vec::new();
+        for chunk in items.chunks(2) {
+            rows.push(
+                row(chunk.to_vec())
+                    .gap(tokens::SPACE_4)
+                    .width(Size::Fill(1.0))
+                    .align(Align::Start),
+            );
+        }
+        Some(column(rows).gap(tokens::SPACE_3).width(Size::Fill(1.0)))
+    }
+
+    /// Knob values ready for `ThreadDriverConfig::Scripted.config`:
+    /// everything the user set, minus model knobs still missing one of
+    /// their two halves (the server would refuse the fragment; an
+    /// incomplete optional knob simply stays unset, and an incomplete
+    /// required one gets the server's named refusal).
+    fn submitted_knob_config(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.picker_knob_values
+            .iter()
+            .filter(|(_, value)| match value {
+                serde_json::Value::Object(map) => {
+                    !(map.contains_key("backend") ^ map.contains_key("model"))
+                }
+                _ => true,
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     fn close_other_pickers(&mut self, keep_open: &str) {
+        if !keep_open.starts_with(PICKER_KNOB_PREFIX) {
+            self.picker_knob_open = None;
+        }
         if keep_open != PICKER_BACKEND {
             self.picker_backend_open = false;
         }
@@ -10440,6 +10856,15 @@ impl ChatApp {
         .width(Size::Fill(1.0))
         .align(Align::Start);
 
+        // Knob rows of the picked scripted driver's describe()
+        // declaration, when it has any.
+        let mut form_rows: Vec<El> = vec![top_row];
+        if let Some(knob_rows) = self.driver_knob_rows() {
+            form_rows.push(knob_rows);
+        }
+        form_rows.push(self.host_envs_picker_row());
+        form_rows.push(form_item([form_label("Message"), form_control(editor)]));
+
         let body = card([
             card_header([
                 card_title("Start a new conversation"),
@@ -10448,11 +10873,7 @@ impl ChatApp {
                      fall through to the active pod's defaults.",
                 ),
             ]),
-            card_content([form([
-                top_row,
-                self.host_envs_picker_row(),
-                form_item([form_label("Message"), form_control(editor)]),
-            ])]),
+            card_content([form(form_rows)]),
             card_footer([footer]),
         ])
         .width(Size::Fixed(980.0));
@@ -11873,6 +12294,9 @@ impl ChatApp {
         }
         if self.picker_driver_open {
             out.push(Some(self.driver_menu()));
+        }
+        if let Some(menu) = self.knob_menu_layer() {
+            out.push(Some(menu));
         }
         if self.picker_host_envs_open {
             out.push(Some(self.host_envs_menu()));
@@ -21541,7 +21965,19 @@ impl ChatApp {
 
     fn driver_hint(&self) -> String {
         match self.picker_driver.as_deref() {
-            Some(_) => "scripted (Lua) driver from the pod's drivers/ directory".to_string(),
+            Some(_) => match self.picker_driver_desc.as_ref() {
+                // An unevaluable declaration would refuse creation
+                // anyway — surface it right at the picker.
+                Some(Err(message)) => format!("describe() failed: {message}"),
+                Some(Ok(desc)) => desc
+                    .description
+                    .clone()
+                    .or_else(|| desc.label.clone())
+                    .unwrap_or_else(|| {
+                        "scripted (Lua) driver from the pod's drivers/ directory".to_string()
+                    }),
+                None => "scripted (Lua) driver from the pod's drivers/ directory".to_string(),
+            },
             None => "how turns are driven".to_string(),
         }
     }
