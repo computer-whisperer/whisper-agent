@@ -862,6 +862,21 @@ pub struct Scheduler {
     /// only: rebuilt from durable thread state at every load, so a
     /// restart-before-first-activation re-detects the same facts.
     scripted_load_notices: HashMap<String, Vec<(String, String)>>,
+    /// In-flight `query_knowledge` effects keyed by (weave id, driver-
+    /// supplied correlation id) → the pending journal record each will
+    /// resolve. Doubles as the duplicate-id guard: a second query with
+    /// an id already in flight on the same weave refuses.
+    scripted_queries_in_flight: HashMap<(String, String), crate::runtime::driver::DriverEffectId>,
+    /// Deferred `query_failed` facts: `query_knowledge` journal records
+    /// found still pending at load (the process died mid-query — the
+    /// future is gone). Delivered at the weave's first activation,
+    /// after any `scripted_load_notices` deaths; the journal record is
+    /// failed AT DELIVERY, not at the scan, so a crash before the
+    /// first activation re-derives the notice from the still-Pending
+    /// record — the async-effect analogue of that collection, with the
+    /// same in-memory-only rebuild-at-load contract (which is also why
+    /// the shutdown interrupt exempts async non-thread records).
+    scripted_query_notices: HashMap<String, Vec<(String, String)>>,
     /// Behavior ids whose `state.json` needs writeback. Keyed by
     /// `(pod_id, behavior_id)`. Serialization through this set (rather
     /// than tokio::spawn per update) means two rapid state changes
@@ -1089,6 +1104,8 @@ impl Scheduler {
                 scripted_active: HashSet::new(),
                 scripted_events: HashMap::new(),
                 scripted_load_notices: HashMap::new(),
+                scripted_queries_in_flight: HashMap::new(),
+                scripted_query_notices: HashMap::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
                 usage_tx,
@@ -3423,6 +3440,53 @@ impl Scheduler {
                 self.scripted_load_notices.insert(weave_id.clone(), notices);
             }
         }
+        self.heal_pending_scripted_queries();
+    }
+
+    /// `query_knowledge` records still pending at load: the process
+    /// died mid-query and the future died with it. Fail the records
+    /// and queue `query_failed` notices for the weave's first
+    /// activation — the async-effect analogue of `load_state`'s
+    /// dead-ticked scan. (Two passes: the journal mutation needs
+    /// `&mut` the scan can't hold.)
+    fn heal_pending_scripted_queries(&mut self) {
+        // Scan only — the journal records stay Pending until the
+        // notice actually DELIVERS (the drain in `run_scripted_driver`
+        // fails them). Resolving here would break the rebuild-at-load
+        // contract: heal → weave flush → crash before first activation
+        // would leave a resolved record, nothing to re-derive the
+        // notice from, and a driver wedged on a loss it never heard.
+        // The shutdown interrupt exempts async non-thread records
+        // precisely so this scan finds them.
+        for (weave_id, weave) in &self.weaves {
+            if !matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            ) {
+                continue;
+            }
+            let lost: Vec<(String, String)> = weave
+                .effect_journal
+                .records()
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.outcome,
+                        crate::runtime::driver::DriverEffectOutcome::Pending
+                    )
+                })
+                .filter_map(|record| match &record.effect {
+                    crate::runtime::driver::PersistedDriverEffect::QueryKnowledge {
+                        query_id,
+                        ..
+                    } => Some((query_id.clone(), "query lost to restart".to_string())),
+                    _ => None,
+                })
+                .collect();
+            if !lost.is_empty() {
+                self.scripted_query_notices.insert(weave_id.clone(), lost);
+            }
+        }
     }
 
     fn mark_dirty(&mut self, thread_id: &str) {
@@ -5064,6 +5128,25 @@ impl Scheduler {
         if !config.enabled || config.top_k == 0 {
             return;
         }
+        // Scripted-ticked threads own their retrieval through the
+        // `query_knowledge` effect (step 11 slice 3). The ambient
+        // machinery's injection and wait-gates live in
+        // `step_until_blocked`'s loop head, which scripted stepping
+        // bypasses — launching here would pay embed+rerank for nudges
+        // that cannot inject in time.
+        if self
+            .thread_ticker
+            .get(thread_id)
+            .and_then(|weave_id| self.weaves.get(weave_id))
+            .is_some_and(|weave| {
+                matches!(
+                    weave.driver,
+                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                )
+            })
+        {
+            return;
+        }
         let has_tool_use = response
             .content
             .iter()
@@ -5594,6 +5677,7 @@ impl Scheduler {
                             PersistedDriverEffect::Continue {
                                 thread_id: thread_id.to_string(),
                                 generation,
+                                nudge_entry: None,
                             },
                         );
                         let applied = self
@@ -6567,6 +6651,9 @@ impl Scheduler {
                 self.weaves.remove(&weave_id);
                 self.dirty_weaves.remove(&weave_id);
                 self.scripted_load_notices.remove(&weave_id);
+                self.scripted_query_notices.remove(&weave_id);
+                self.scripted_queries_in_flight
+                    .retain(|(w, _), _| w != &weave_id);
                 self.router.drop_weave(&weave_id);
             } else {
                 self.mark_weave_dirty(&weave_id);
@@ -6616,6 +6703,9 @@ impl Scheduler {
             self.weaves.remove(weave_id);
             self.dirty_weaves.remove(weave_id);
             self.scripted_load_notices.remove(weave_id);
+            self.scripted_query_notices.remove(weave_id);
+            self.scripted_queries_in_flight
+                .retain(|(w, _), _| w != weave_id);
             self.router.drop_weave(weave_id);
         }
         for weave_id in weaves_to_flush {
@@ -7185,6 +7275,9 @@ pub async fn run(
                         }
                         SchedulerCompletion::KnowledgeAutoquery(done) => {
                             scheduler.apply_knowledge_autoquery_completion(done, &mut pending_io);
+                        }
+                        SchedulerCompletion::ScriptedQuery(done) => {
+                            scheduler.apply_scripted_query_completion(done, &mut pending_io);
                         }
                         SchedulerCompletion::SharedMcp(done) => {
                             scheduler.apply_shared_mcp_completion(done);

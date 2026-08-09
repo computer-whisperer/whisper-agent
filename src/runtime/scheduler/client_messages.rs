@@ -1221,6 +1221,9 @@ impl Scheduler {
                     self.weaves.remove(&weave_id);
                     self.dirty_weaves.remove(&weave_id);
                     self.scripted_load_notices.remove(&weave_id);
+                    self.scripted_query_notices.remove(&weave_id);
+                    self.scripted_queries_in_flight
+                        .retain(|(w, _), _| w != &weave_id);
                     self.router.drop_weave(&weave_id);
                 }
                 // Broadcast first so every client clears its view before the

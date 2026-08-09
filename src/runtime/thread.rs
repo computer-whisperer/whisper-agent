@@ -1838,6 +1838,7 @@ mod tests {
                             weave.record_completed_effect(PersistedDriverEffect::Continue {
                                 thread_id: task.id.clone(),
                                 generation,
+                                nudge_entry: None,
                             });
                             assert!(task.continue_cycle());
                         }

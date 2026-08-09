@@ -58,7 +58,8 @@ const MEMORY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 /// A durable thread event delivered to `on_event`, tagged with the
 /// thread it came from — a scripted weave may tick several threads.
-#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+// (`Eq` dropped when `QueryCompleted` brought f32 rerank scores.)
+#[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScriptedEvent {
     /// External input was accepted into a coordinated thread. `text`
@@ -70,11 +71,19 @@ pub enum ScriptedEvent {
     /// model turns since the last external input on this thread.
     TurnStart { thread_id: String, turn: u32 },
     /// A model response integrated. `text` is the response's text
-    /// content; `tool_calls` the tools it requested (empty when none).
+    /// content; `reasoning` its thinking content (empty when the model
+    /// produced none — carried for the same parity reason as `text`:
+    /// the builtin autoquery's default query source is
+    /// reasoning-then-text, and a thinking-heavy model's terse text
+    /// would starve a text-only driver); `tool_calls` the tools it
+    /// requested (empty when none). Authoring note: reasoning can be
+    /// large — drivers that stash it into state bloat their persisted
+    /// JSON.
     AgentCompleted {
         thread_id: String,
         participant_id: String,
         text: String,
+        reasoning: String,
         tool_calls: Vec<ScriptedToolCall>,
     },
     /// Every tool requested by the last agent turn has a result.
@@ -108,6 +117,50 @@ pub enum ScriptedEvent {
     /// error again on the notification), but such deaths DO replay
     /// after a restart — the program may have been fixed in between.
     ThreadFailed { thread_id: String, message: String },
+    /// A `query_knowledge` effect resolved (step 11 slice 3). `id`
+    /// echoes the effect's driver-supplied correlation token; `query`
+    /// echoes the query text; `hits` carry rerank scores unfiltered —
+    /// the driver judges relevance in Lua, the scheduler does not
+    /// pre-filter.
+    ///
+    /// Contract for drivers holding a parked boundary on this query:
+    /// STORE the fact in state and let the boundary act. After
+    /// delivery the scheduler steps the weave's ticked threads, so a
+    /// parked boundary re-fires immediately and its handler finds the
+    /// stored fact. Moving the held thread from THIS handler instead
+    /// works live but breaks across a restart, where a healed
+    /// `query_failed` notice and the re-fired boundary share one
+    /// event drain — the boundary event queued behind the notice goes
+    /// stale the moment the notice's handler moves the thread.
+    QueryCompleted {
+        id: String,
+        query: String,
+        hits: Vec<ScriptedKnowledgeHit>,
+    },
+    /// A `query_knowledge` effect failed — an environmental refusal at
+    /// admission (empty scope, nothing hot, missing providers), an
+    /// engine error live, or (delivered at the weave's first
+    /// activation after a restart, ahead of the triggering event) a
+    /// query that was still pending when the process died. Like
+    /// `thread_failed`, an idempotent fact; a driver that still wants
+    /// the material re-issues the query. The store-don't-move contract
+    /// on [`Self::QueryCompleted`] applies here identically.
+    QueryFailed { id: String, message: String },
+}
+
+/// One reranked hit crossing into Lua. `bucket` is the resolved
+/// `scope:name` label; `source_id`/`chunk_id` are the builtin dedup
+/// key material (key on source when present, chunk otherwise);
+/// `snippet` is chunk text clipped to the effect's `snippet_chars`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct ScriptedKnowledgeHit {
+    pub bucket: String,
+    pub source_id: String,
+    pub chunk_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    pub score: f32,
+    pub snippet: String,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -149,9 +202,15 @@ pub enum ScriptedEffect {
         thread_id: String,
         decisions: Vec<ScriptedToolDecision>,
     },
-    /// Take another model turn after tools completed.
+    /// Take another model turn after tools completed. `nudge`
+    /// optionally appends one system-authored message (the
+    /// `submit_server_nudge` shape) atomically before the model call —
+    /// the only mid-cycle injection point; `append_entry` stays
+    /// refused mid-generation.
     ContinueCycle {
         thread_id: String,
+        #[serde(default)]
+        nudge: Option<String>,
     },
     /// End the thread's cycle and yield for input.
     FinishCycle {
@@ -220,6 +279,29 @@ pub enum ScriptedEffect {
         outcome: ScriptedRunOutcome,
         #[serde(default)]
         message: Option<String>,
+    },
+    /// Run one knowledge query asynchronously (step 11 slice 3 — the
+    /// first async non-thread effect). `id` is a driver-supplied
+    /// correlation token echoed by the resolving `query_completed` /
+    /// `query_failed` event; a duplicate id while one is in flight
+    /// refuses. `buckets` uses the config ref grammar (bare,
+    /// `server:name`, `pod:name`; empty = every bucket in the weave's
+    /// pod scope). `top_k` defaults 5, max 20, zero refused (the
+    /// `knowledge_query` tool's bounds); `snippet_chars` clips chunk
+    /// text crossing into Lua (default 500); `hot_only` (default
+    /// true) skips buckets not already loaded — flip it explicitly
+    /// for cold-capable queries (the scheduled-digest shape).
+    QueryKnowledge {
+        id: String,
+        query: String,
+        #[serde(default)]
+        buckets: Vec<String>,
+        #[serde(default)]
+        top_k: Option<u32>,
+        #[serde(default)]
+        snippet_chars: Option<u32>,
+        #[serde(default)]
+        hot_only: Option<bool>,
     },
     /// Promote a referenced, self-ticked thread to primary; the previous
     /// primary becomes a dormant auxiliary. The compaction-roll primitive.
@@ -630,13 +712,19 @@ mod tests {
                 { kind = "adopt_ticker", thread_id = "t-check" },
                 { kind = "dispatch_tools", thread_id = "t-main" },
                 { kind = "continue_cycle", thread_id = "t-main" },
+                { kind = "continue_cycle", thread_id = "t-main",
+                  nudge = "related material surfaced" },
                 { kind = "complete_run" },
                 { kind = "complete_run", outcome = "failed", message = "no quorum" },
+                { kind = "query_knowledge", id = "q1", query = "sharded consensus" },
+                { kind = "query_knowledge", id = "q2", query = "cold archive",
+                  buckets = { "server:wiki" }, top_k = 3, snippet_chars = 200,
+                  hot_only = false },
               } }
             end
         "#;
         let out = run_event(src_ok, "vocab", &json!({}), &event_turn_start("t", 1)).unwrap();
-        assert_eq!(out.effects.len(), 9);
+        assert_eq!(out.effects.len(), 12);
         assert!(matches!(
             &out.effects[0],
             ScriptedEffect::ResolveTools { decisions, .. }
@@ -648,7 +736,22 @@ mod tests {
                 if relationship == "check" && seed.len() == 1
         ));
         assert_eq!(
+            out.effects[6],
+            ScriptedEffect::ContinueCycle {
+                thread_id: "t-main".into(),
+                nudge: None,
+            },
+            "bare continue_cycle carries no nudge"
+        );
+        assert_eq!(
             out.effects[7],
+            ScriptedEffect::ContinueCycle {
+                thread_id: "t-main".into(),
+                nudge: Some("related material surfaced".into()),
+            }
+        );
+        assert_eq!(
+            out.effects[8],
             ScriptedEffect::CompleteRun {
                 outcome: ScriptedRunOutcome::Completed,
                 message: None,
@@ -656,12 +759,110 @@ mod tests {
             "bare complete_run defaults to a completed outcome"
         );
         assert_eq!(
-            out.effects[8],
+            out.effects[9],
             ScriptedEffect::CompleteRun {
                 outcome: ScriptedRunOutcome::Failed,
                 message: Some("no quorum".into()),
             }
         );
+        assert_eq!(
+            out.effects[10],
+            ScriptedEffect::QueryKnowledge {
+                id: "q1".into(),
+                query: "sharded consensus".into(),
+                buckets: Vec::new(),
+                top_k: None,
+                snippet_chars: None,
+                hot_only: None,
+            },
+            "bare query_knowledge defaults every bound"
+        );
+        assert_eq!(
+            out.effects[11],
+            ScriptedEffect::QueryKnowledge {
+                id: "q2".into(),
+                query: "cold archive".into(),
+                buckets: vec!["server:wiki".into()],
+                top_k: Some(3),
+                snippet_chars: Some(200),
+                hot_only: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn query_completed_event_is_readable_from_lua() {
+        // Pins the Lua-side shape of the async completion: hits arrive
+        // as an array of tables with numeric scores and the dedup key
+        // material (source_id / chunk_id) as plain strings.
+        let src = r#"
+            function on_event(state, event)
+              if event.kind == "query_completed" then
+                local best = event.hits[1]
+                return { state = {
+                  id = event.id,
+                  query = event.query,
+                  n = #event.hits,
+                  bucket = best.bucket,
+                  source = best.source_id,
+                  chunk = best.chunk_id,
+                  strong = best.score > 0.5,
+                  snippet = best.snippet,
+                  locator = best.locator,
+                } }
+              end
+              return { state = state }
+            end
+        "#;
+        let event = ScriptedEvent::QueryCompleted {
+            id: "q1".into(),
+            query: "sharded consensus".into(),
+            hits: vec![
+                ScriptedKnowledgeHit {
+                    bucket: "server:wiki".into(),
+                    source_id: "Paxos".into(),
+                    chunk_id: "c-9".into(),
+                    locator: Some("§2".into()),
+                    score: 0.83,
+                    snippet: "The synod protocol…".into(),
+                },
+                ScriptedKnowledgeHit {
+                    bucket: "server:wiki".into(),
+                    source_id: String::new(),
+                    chunk_id: "c-12".into(),
+                    locator: None,
+                    score: 0.31,
+                    snippet: "…".into(),
+                },
+            ],
+        };
+        let out = run_event(src, "qc", &json!({}), &event).unwrap();
+        assert_eq!(
+            out.state,
+            json!({
+                "id": "q1",
+                "query": "sharded consensus",
+                "n": 2,
+                "bucket": "server:wiki",
+                "source": "Paxos",
+                "chunk": "c-9",
+                "strong": true,
+                "snippet": "The synod protocol…",
+                "locator": "§2",
+            })
+        );
+
+        let failed = ScriptedEvent::QueryFailed {
+            id: "q1".into(),
+            message: "lost to restart".into(),
+        };
+        let src_failed = r#"
+            function on_event(state, event)
+              return { state = { id = event.id, message = event.message } }
+            end
+        "#;
+        let out = run_event(src_failed, "qf", &json!({}), &failed).unwrap();
+        assert_eq!(out.state, json!({"id": "q1", "message": "lost to restart"}));
     }
 
     #[test]

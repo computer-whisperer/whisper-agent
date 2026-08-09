@@ -150,6 +150,12 @@ pub enum PersistedDriverEffect {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         thread_id: String,
         generation: GenerationContext,
+        /// Index of the server-nudge entry a scripted `continue_cycle`
+        /// appended with the transition (step 11 slice 3) — the journal
+        /// explains where the injected entry came from. `None` on
+        /// nudge-less continues and every builtin record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nudge_entry: Option<usize>,
     },
     Finish {
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -211,6 +217,21 @@ pub enum PersistedDriverEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         behavior_id: Option<String>,
     },
+    /// One asynchronous knowledge query issued by this driver (step 11
+    /// slice 3 — the first async non-thread effect). Journaled pending
+    /// at issue and resolved when the engine completes; a record still
+    /// pending at load means the process died mid-query, and the
+    /// weave's first activation heals it to a `query_failed` event
+    /// (the dead-ticked-thread shape). `query_id` is the
+    /// driver-supplied correlation token; `buckets` the resolved
+    /// `scope:name` labels actually queried (empty on refused
+    /// records).
+    QueryKnowledge {
+        query_id: String,
+        query: String,
+        #[serde(default)]
+        buckets: Vec<String>,
+    },
     /// Head-advance: a referenced thread this weave ticks was promoted to
     /// primary; the previous primary (if any) was demoted to a dormant
     /// auxiliary. This is the journaled `compaction`-roll primitive —
@@ -245,6 +266,18 @@ impl PersistedDriverEffect {
             }
             _ => None,
         }
+    }
+
+    /// Whether a pending record of this effect resolves on its own
+    /// terms rather than with any thread's fate (step 11 slice 3).
+    /// Async non-thread effects (`query_knowledge`) are settled by
+    /// their live completion or by the load-time loss heal delivering
+    /// `query_failed` — the thread-scoped bulk resolvers and the
+    /// shutdown interrupt must leave them alone, or the record lies
+    /// while the future still flies and the heal finds nothing to
+    /// report.
+    pub fn is_async_non_thread(&self) -> bool {
+        matches!(self, Self::QueryKnowledge { .. })
     }
 }
 
@@ -356,6 +389,7 @@ impl DriverEffectJournal {
         let message = message.into();
         for record in &mut self.records {
             if record.outcome == DriverEffectOutcome::Pending
+                && !record.effect.is_async_non_thread()
                 && record.effect.cycle_thread().is_none_or(|t| t == thread_id)
             {
                 record.outcome = DriverEffectOutcome::Failed {
@@ -365,15 +399,19 @@ impl DriverEffectJournal {
         }
     }
 
-    /// Interrupt EVERY pending record regardless of attribution.
+    /// Interrupt every pending CYCLE record regardless of attribution.
     /// Load-path only: at startup the persister has healed every
-    /// in-flight thread to Failed, so every pending record is stale —
-    /// the one situation where bulk resolution is the truth. Runtime
-    /// paths must use the thread-scoped forms.
+    /// in-flight thread to Failed, so every pending cycle record is
+    /// stale — the one situation where bulk resolution is the truth.
+    /// Async non-thread records are exempt: their loss is healed by
+    /// `heal_pending_scripted_queries`, which needs to find them still
+    /// Pending. Runtime paths must use the thread-scoped forms.
     pub fn interrupt_all_pending(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         for record in &mut self.records {
-            if record.outcome == DriverEffectOutcome::Pending {
+            if record.outcome == DriverEffectOutcome::Pending
+                && !record.effect.is_async_non_thread()
+            {
                 record.outcome = DriverEffectOutcome::Interrupted {
                     reason: reason.clone(),
                 };
@@ -387,6 +425,7 @@ impl DriverEffectJournal {
         let reason = reason.into();
         for record in &mut self.records {
             if record.outcome == DriverEffectOutcome::Pending
+                && !record.effect.is_async_non_thread()
                 && record.effect.cycle_thread().is_none_or(|t| t == thread_id)
             {
                 record.outcome = DriverEffectOutcome::Interrupted {

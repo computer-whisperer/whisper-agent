@@ -65,7 +65,7 @@ impl Scheduler {
                     weave.complete_effect(effect_id);
                     self.mark_weave_dirty(weave_id);
                 }
-                let (text, tool_calls) = self
+                let (text, reasoning, tool_calls) = self
                     .tasks
                     .get(thread_id)
                     .map(|task| {
@@ -82,13 +82,18 @@ impl Scheduler {
                                 .collect(),
                             _ => Vec::new(),
                         };
-                        (last_assistant_text(task), calls)
+                        (
+                            last_assistant_text(task),
+                            last_assistant_reasoning(task),
+                            calls,
+                        )
                     })
                     .unwrap_or_default();
                 ScriptedEvent::AgentCompleted {
                     thread_id: thread_id.to_string(),
                     participant_id: generation.participant_id.to_string(),
                     text,
+                    reasoning,
                     tool_calls,
                 }
             }
@@ -201,7 +206,9 @@ impl Scheduler {
         // First activation since load: deliver the deferred death
         // facts collected by `load_state` BEFORE the triggering event,
         // so the driver's world-model catches up with the restart
-        // before it decides anything new.
+        // before it decides anything new. Query losses follow the
+        // deaths (a driver holding a continue for a lost query must
+        // already know which threads are corpses when it reacts).
         if let Some(notices) = self.scripted_load_notices.remove(weave_id) {
             let queue = self
                 .scripted_events
@@ -209,6 +216,47 @@ impl Scheduler {
                 .or_default();
             for (thread_id, message) in notices {
                 queue.push_back(ScriptedEvent::ThreadFailed { thread_id, message });
+            }
+        }
+        if let Some(notices) = self.scripted_query_notices.remove(weave_id) {
+            // Resolve the lost queries' journal records AT DELIVERY,
+            // not at the load scan: a crash between scan and delivery
+            // re-derives the notice from the still-Pending record next
+            // load (the rebuild-at-load contract the dead-ticked scan
+            // has by construction). Salvaged notices whose records
+            // already resolved live no-op here.
+            if let Some(weave) = self.weaves.get_mut(weave_id) {
+                let mut dirty = false;
+                for (id, message) in &notices {
+                    let lost: Vec<DriverEffectId> = weave
+                        .effect_journal
+                        .records()
+                        .iter()
+                        .filter(|record| {
+                            record.outcome == crate::runtime::driver::DriverEffectOutcome::Pending
+                                && matches!(
+                                    &record.effect,
+                                    PersistedDriverEffect::QueryKnowledge { query_id, .. }
+                                        if query_id == id
+                                )
+                        })
+                        .map(|record| record.id)
+                        .collect();
+                    for record_id in lost {
+                        weave.fail_effect(record_id, message.as_str());
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    self.mark_weave_dirty(weave_id);
+                }
+            }
+            let queue = self
+                .scripted_events
+                .entry(weave_id.to_string())
+                .or_default();
+            for (id, message) in notices {
+                queue.push_back(ScriptedEvent::QueryFailed { id, message });
             }
         }
         self.scripted_events
@@ -298,25 +346,47 @@ impl Scheduler {
         self.scripted_active.remove(weave_id);
         // Queued leftovers are dropped: after a failure they would run
         // against a failed origin, and a clean drain leaves the queue
-        // empty anyway. EXCEPT death facts — dropping an undelivered
+        // empty anyway. EXCEPT loss facts — dropping an undelivered
         // `thread_failed` re-opens the waits-forever wedge until the
-        // next restart re-detects it, so they re-stash for the next
-        // activation (queue order preserved keeps primary-first).
+        // next restart re-detects it, and an undelivered `query_failed`
+        // is worse (nothing re-detects a lost query once its journal
+        // record is resolved) — both re-stash for the next activation
+        // (queue order preserved keeps primary-first).
         if let Some(queue) = self.scripted_events.remove(weave_id) {
-            let salvaged: Vec<(String, String)> = queue
-                .into_iter()
-                .filter_map(|event| match event {
+            let mut dead_threads: Vec<(String, String)> = Vec::new();
+            let mut dead_queries: Vec<(String, String)> = Vec::new();
+            for event in queue {
+                match event {
                     ScriptedEvent::ThreadFailed { thread_id, message } => {
-                        Some((thread_id, message))
+                        dead_threads.push((thread_id, message))
                     }
-                    _ => None,
-                })
-                .collect();
-            if !salvaged.is_empty() {
+                    ScriptedEvent::QueryFailed { id, message } => dead_queries.push((id, message)),
+                    // An undelivered success degrades to a loss notice:
+                    // the hits are gone with this queue, but the
+                    // correlation must still resolve or a coordinating
+                    // driver waits forever. (The journal keeps the
+                    // Completed record — the scheduler ran the query;
+                    // delivery is what failed.)
+                    ScriptedEvent::QueryCompleted { id, .. } => dead_queries.push((
+                        id,
+                        "query completed but its result was dropped by a driver fault; \
+                         re-issue if still needed"
+                            .into(),
+                    )),
+                    _ => {}
+                }
+            }
+            if !dead_threads.is_empty() {
                 self.scripted_load_notices
                     .entry(weave_id.to_string())
                     .or_default()
-                    .extend(salvaged);
+                    .extend(dead_threads);
+            }
+            if !dead_queries.is_empty() {
+                self.scripted_query_notices
+                    .entry(weave_id.to_string())
+                    .or_default()
+                    .extend(dead_queries);
             }
         }
         if let Some(message) = failure {
@@ -404,8 +474,8 @@ impl Scheduler {
                     pending_io,
                 )
             }
-            ScriptedEffect::ContinueCycle { thread_id } => {
-                self.scripted_continue_cycle(weave_id, &thread_id, origin_thread, pending_io)
+            ScriptedEffect::ContinueCycle { thread_id, nudge } => {
+                self.scripted_continue_cycle(weave_id, &thread_id, origin_thread, nudge, pending_io)
             }
             ScriptedEffect::FinishCycle { thread_id } => {
                 self.scripted_finish_cycle(weave_id, &thread_id, origin_thread, pending_io)
@@ -482,6 +552,23 @@ impl Scheduler {
             ScriptedEffect::CompleteRun { outcome, message } => {
                 self.weave_complete_run(weave_id, outcome, message, pending_io)
             }
+            ScriptedEffect::QueryKnowledge {
+                id,
+                query,
+                buckets,
+                top_k,
+                snippet_chars,
+                hot_only,
+            } => self.weave_query_knowledge(
+                weave_id,
+                id,
+                query,
+                buckets,
+                top_k,
+                snippet_chars,
+                hot_only,
+                pending_io,
+            ),
             ScriptedEffect::AdvanceHead { thread_id } => {
                 self.weave_advance_head(weave_id, &thread_id)
             }
@@ -709,6 +796,7 @@ impl Scheduler {
         weave_id: &str,
         thread_id: &str,
         origin_thread: &str,
+        nudge: Option<String>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<(), String> {
         if self.thread_ticker.get(thread_id).map(String::as_str) != Some(weave_id) {
@@ -734,11 +822,42 @@ impl Scheduler {
                 "continue_cycle: thread `{thread_id}` did not accept the transition"
             ));
         }
+        // The nudge appends WITH the transition (the builtin
+        // `submit_server_nudge` shape) — the only mid-cycle injection
+        // point. A driver cannot sequence `continue_cycle` +
+        // `append_entry` instead: for a non-origin thread the step
+        // below runs the next turn re-entrantly before the following
+        // effect applies, and the append refuses mid-generation.
+        // Pushed only after the transition succeeded so a refused
+        // continue never strands the entry.
+        let nudge_entry = self.tasks.get_mut(thread_id).and_then(|task| {
+            nudge.map(|text| {
+                let author = task.config.participants.default_responder.clone();
+                task.conversation
+                    .push(Message::system_text(text).with_author(author));
+                (task.conversation.messages().len() - 1, task.snapshot())
+            })
+        });
+        // Live-transcript parity with the sibling injection paths
+        // (`inject_pending_knowledge_nudge`, `weave_append_entry`):
+        // subscribers see the injected entry before the reply that
+        // references it streams in.
+        let nudge_entry = nudge_entry.map(|(index, snapshot)| {
+            self.router.broadcast_to_subscribers(
+                thread_id,
+                whisper_agent_protocol::ServerToClient::ThreadSnapshot {
+                    thread_id: thread_id.to_string(),
+                    snapshot,
+                },
+            );
+            index
+        });
         self.record_completed_weave_effect(
             weave_id,
             PersistedDriverEffect::Continue {
                 thread_id: thread_id.to_string(),
                 generation,
+                nudge_entry,
             },
         );
         self.mark_weave_dirty(weave_id);
@@ -860,6 +979,463 @@ impl Scheduler {
         );
         self.fail_thread_at_boundary(origin_thread, "driver", message);
     }
+
+    // ---------- query_knowledge (step 11 slice 3) ----------
+
+    /// Execute a `query_knowledge` effect — the first async non-thread
+    /// effect: validate, journal pending, launch the
+    /// embed→search→rerank future. Resolution routes back through
+    /// [`Self::apply_scripted_query_completion`]. Static authoring
+    /// bugs (empty/duplicate id, empty query, out-of-bounds top_k)
+    /// journal Failed AND return `Err`, failing the activation like
+    /// any refused effect — the run_agent shape: auditable driver
+    /// bugs, not silent drops. Environmental conditions (empty scope,
+    /// nothing hot, missing providers) journal Failed and queue a
+    /// `query_failed` event instead — those are async-shaped facts a
+    /// driver handles, not authoring faults that should kill the
+    /// primary.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn weave_query_knowledge(
+        &mut self,
+        weave_id: &str,
+        query_id: String,
+        query: String,
+        bucket_refs: Vec<String>,
+        top_k: Option<u32>,
+        snippet_chars: Option<u32>,
+        hot_only: Option<bool>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<(), String> {
+        use crate::tools::builtin_tools::knowledge_query::{DEFAULT_TOP_K, MAX_TOP_K};
+        let Some(weave) = self.weaves.get(weave_id) else {
+            return Err(format!("unknown weave `{weave_id}`"));
+        };
+        let pod_id = weave.pod_id.clone();
+        if query_id.is_empty() {
+            return self.fault_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                "query_knowledge: `id` must be non-empty".into(),
+            );
+        }
+        if query.trim().is_empty() {
+            return self.fault_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                format!("query_knowledge `{query_id}`: `query` must be non-empty"),
+            );
+        }
+        let top_k = top_k.unwrap_or(DEFAULT_TOP_K);
+        if top_k == 0 || top_k > MAX_TOP_K {
+            return self.fault_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                format!("query_knowledge `{query_id}`: `top_k` must be in 1..={MAX_TOP_K}"),
+            );
+        }
+        let flight_key = (weave_id.to_string(), query_id.clone());
+        if self.scripted_queries_in_flight.contains_key(&flight_key) {
+            return self.fault_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                format!("query_knowledge `{query_id}`: a query with this id is already in flight"),
+            );
+        }
+        let snippet_chars = snippet_chars.unwrap_or(500) as usize;
+        let hot_only = hot_only.unwrap_or(true);
+
+        // Scope = the weave's pod knowledge ceiling. No participant
+        // narrowing — the driver is not a participant.
+        let mut in_scope_server: Vec<String> = Vec::new();
+        let mut in_scope_pod: Vec<String> = Vec::new();
+        for token in self.knowledge_scope_tokens_for_pod(&pod_id) {
+            match super::split_knowledge_bucket_token(&token) {
+                Some((crate::knowledge::BucketScope::Server, name)) => {
+                    in_scope_server.push(name.into())
+                }
+                Some((crate::knowledge::BucketScope::Pod, name)) => in_scope_pod.push(name.into()),
+                None => {}
+            }
+        }
+        let targets = match super::functions::resolve_query_targets(
+            &bucket_refs,
+            &in_scope_server,
+            &in_scope_pod,
+            &pod_id,
+        ) {
+            Ok(targets) if !targets.is_empty() => targets,
+            Ok(_) => {
+                return self.refuse_scripted_query(
+                    weave_id,
+                    &query_id,
+                    &query,
+                    "no knowledge buckets in the pod's scope".into(),
+                );
+            }
+            Err(message) => {
+                return self.refuse_scripted_query(weave_id, &query_id, &query, message);
+            }
+        };
+        let Some(reranker) = self
+            .rerank_providers
+            .values()
+            .next()
+            .map(|r| r.provider.clone())
+        else {
+            return self.refuse_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                "no rerank providers configured".into(),
+            );
+        };
+
+        let mut sources: Vec<ScriptedQueryBucket> = Vec::new();
+        let mut embedder_name: Option<String> = None;
+        for tgt in &targets {
+            let label = format!("{}:{}", tgt.scope.as_str(), tgt.name);
+            let Some(entry) =
+                self.bucket_registry
+                    .find_entry(tgt.scope, tgt.pod_id.as_deref(), &tgt.name)
+            else {
+                if hot_only {
+                    continue;
+                }
+                return self.refuse_scripted_query(
+                    weave_id,
+                    &query_id,
+                    &query,
+                    format!("bucket `{label}` is in scope but no longer exists in the registry"),
+                );
+            };
+            let Some(active) = entry.active_slot.as_ref() else {
+                if hot_only {
+                    continue;
+                }
+                return self.refuse_scripted_query(
+                    weave_id,
+                    &query_id,
+                    &query,
+                    format!("bucket `{label}` has no active slot to query"),
+                );
+            };
+            let embedder = entry.config.defaults.embedder.clone();
+            let source = if hot_only {
+                let hot = match tgt.scope {
+                    crate::knowledge::BucketScope::Server => {
+                        self.bucket_registry.hot_bucket(&tgt.name)
+                    }
+                    crate::knowledge::BucketScope::Pod => match tgt.pod_id.as_deref() {
+                        Some(pid) => self.bucket_registry.hot_bucket_pod(pid, &tgt.name),
+                        None => None,
+                    },
+                };
+                // Cold under hot_only: skipped, not failed — the
+                // journal's bucket list records what actually ran.
+                let Some(bucket) = hot else { continue };
+                ScriptedQueryBucket::Ready { label, bucket }
+            } else {
+                ScriptedQueryBucket::Load {
+                    label,
+                    scope: tgt.scope,
+                    pod_id: tgt.pod_id.clone(),
+                    name: tgt.name.clone(),
+                    slot_id: active.slot_id.clone(),
+                    serving_mode: format!("{:?}", active.serving.mode).to_lowercase(),
+                }
+            };
+            if embedder_name.is_none() {
+                embedder_name = Some(embedder);
+            }
+            sources.push(source);
+        }
+        if sources.is_empty() {
+            return self.refuse_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                "no hot buckets among the resolved targets (hot_only)".into(),
+            );
+        }
+        let Some(embedder) = embedder_name
+            .as_ref()
+            .and_then(|name| self.embedding_providers.get(name))
+            .map(|e| e.provider.clone())
+        else {
+            return self.refuse_scripted_query(
+                weave_id,
+                &query_id,
+                &query,
+                format!(
+                    "embedder `{}` is not configured",
+                    embedder_name.unwrap_or_default()
+                ),
+            );
+        };
+
+        let labels: Vec<String> = sources
+            .iter()
+            .map(|source| match source {
+                ScriptedQueryBucket::Ready { label, .. }
+                | ScriptedQueryBucket::Load { label, .. } => label.clone(),
+            })
+            .collect();
+        let effect_id = self
+            .weaves
+            .get_mut(weave_id)
+            .expect("checked above")
+            .record_pending_effect(PersistedDriverEffect::QueryKnowledge {
+                query_id: query_id.clone(),
+                query: query.clone(),
+                buckets: labels,
+            });
+        self.mark_weave_dirty(weave_id);
+        self.scripted_queries_in_flight
+            .insert(flight_key, effect_id);
+
+        let registry = self.bucket_registry.clone();
+        let task_tx = self.bucket_task_sender();
+        let sparse_timeout_ms = self.knowledge_config.query.sparse_timeout();
+        let weave_id_s = weave_id.to_string();
+        pending_io.push(Box::pin(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let result = async {
+                let mut buckets: Vec<std::sync::Arc<dyn crate::knowledge::Bucket>> =
+                    Vec::with_capacity(sources.len());
+                for source in sources {
+                    match source {
+                        ScriptedQueryBucket::Ready { bucket, .. } => buckets.push(bucket),
+                        ScriptedQueryBucket::Load {
+                            label,
+                            scope,
+                            pod_id,
+                            name,
+                            slot_id,
+                            serving_mode,
+                        } => {
+                            let load = super::buckets::load_bucket_with_progress(
+                                super::buckets::BucketLoadProgressRequest {
+                                    registry: registry.clone(),
+                                    bucket_id: name,
+                                    pod_id: match scope {
+                                        crate::knowledge::BucketScope::Server => None,
+                                        crate::knowledge::BucketScope::Pod => pod_id,
+                                    },
+                                    slot_id,
+                                    serving_mode,
+                                    task_tx: task_tx.clone(),
+                                    requester_conn: None,
+                                    correlation_id: None,
+                                    emit_cached: false,
+                                },
+                            )
+                            .await;
+                            match load {
+                                Ok(bucket) => buckets.push(bucket),
+                                Err(e) => return Err(format!("load bucket `{label}` failed: {e}")),
+                            }
+                        }
+                    }
+                }
+                let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
+                let params = crate::knowledge::QueryParams {
+                    top_k: top_k as usize,
+                    sparse_timeout_ms,
+                    ..Default::default()
+                };
+                engine
+                    .query(&buckets, &query, &params, &cancel)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            io_dispatch::SchedulerCompletion::ScriptedQuery(io_dispatch::ScriptedQueryCompletion {
+                weave_id: weave_id_s,
+                query_id,
+                effect_id,
+                query,
+                snippet_chars,
+                result,
+            })
+        }));
+        Ok(())
+    }
+
+    /// A static `query_knowledge` authoring fault: journal the record
+    /// Failed (the run_agent journal-every-refusal shape) and return
+    /// `Err`, failing the activation. No `query_failed` event — the
+    /// activation's failure is the loud signal, and the faulting
+    /// driver would only fault again on the notification.
+    fn fault_scripted_query(
+        &mut self,
+        weave_id: &str,
+        query_id: &str,
+        query: &str,
+        message: String,
+    ) -> Result<(), String> {
+        if let Some(weave) = self.weaves.get_mut(weave_id) {
+            weave.record_failed_effect(
+                PersistedDriverEffect::QueryKnowledge {
+                    query_id: query_id.to_string(),
+                    query: query.to_string(),
+                    buckets: Vec::new(),
+                },
+                message.as_str(),
+            );
+            self.mark_weave_dirty(weave_id);
+        }
+        Err(message)
+    }
+
+    /// An environmental `query_knowledge` refusal: journal the record
+    /// Failed and queue a `query_failed` event onto the weave's drain
+    /// (the `thread_derived` delivery shape — same activation, after
+    /// the current event's remaining effects).
+    fn refuse_scripted_query(
+        &mut self,
+        weave_id: &str,
+        query_id: &str,
+        query: &str,
+        message: String,
+    ) -> Result<(), String> {
+        let message = format!("query_knowledge: {message}");
+        if let Some(weave) = self.weaves.get_mut(weave_id) {
+            weave.record_failed_effect(
+                PersistedDriverEffect::QueryKnowledge {
+                    query_id: query_id.to_string(),
+                    query: query.to_string(),
+                    buckets: Vec::new(),
+                },
+                message.as_str(),
+            );
+            self.mark_weave_dirty(weave_id);
+        }
+        self.scripted_events
+            .entry(weave_id.to_string())
+            .or_default()
+            .push_back(ScriptedEvent::QueryFailed {
+                id: query_id.to_string(),
+                message,
+            });
+        Ok(())
+    }
+
+    /// Resolve a `query_knowledge` completion: settle the journal
+    /// record and deliver the fact to the driver. The weave's primary
+    /// rides as the delivery origin — a driver fault in the completion
+    /// handler fails the primary (the loud-victim containment story),
+    /// and the primary's stepping is ours to run after delivery since
+    /// no boundary caller owns a step loop here; every other thread the
+    /// handler's effects touch is stepped by the effect executors as
+    /// usual.
+    pub(super) fn apply_scripted_query_completion(
+        &mut self,
+        completion: io_dispatch::ScriptedQueryCompletion,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let io_dispatch::ScriptedQueryCompletion {
+            weave_id,
+            query_id,
+            effect_id,
+            query,
+            snippet_chars,
+            result,
+        } = completion;
+        self.scripted_queries_in_flight
+            .remove(&(weave_id.clone(), query_id.clone()));
+        let Some(weave) = self.weaves.get_mut(&weave_id) else {
+            // The weave retired while the query flew (retention sweep,
+            // pod removal); its journal went with it — nothing to
+            // resolve, nobody to tell.
+            warn!(%weave_id, %query_id, "knowledge query resolved for a gone weave; dropping");
+            return;
+        };
+        let event = match result {
+            Ok(hits) => {
+                weave.complete_effect(effect_id);
+                let hits = hits
+                    .into_iter()
+                    .map(|hit| lua::ScriptedKnowledgeHit {
+                        bucket: hit.bucket_id.to_string(),
+                        source_id: hit.source_ref.source_id,
+                        chunk_id: hit.chunk_id.to_string(),
+                        locator: hit.source_ref.locator.filter(|l| !l.is_empty()),
+                        score: hit.rerank_score,
+                        snippet: super::head_chars(&hit.chunk_text, snippet_chars),
+                    })
+                    .collect();
+                ScriptedEvent::QueryCompleted {
+                    id: query_id,
+                    query,
+                    hits,
+                }
+            }
+            Err(message) => {
+                warn!(%weave_id, error = %message, "scripted knowledge query failed");
+                weave.fail_effect(effect_id, message.as_str());
+                ScriptedEvent::QueryFailed {
+                    id: query_id,
+                    message,
+                }
+            }
+        };
+        self.mark_weave_dirty(&weave_id);
+        let origin = self
+            .weaves
+            .get(&weave_id)
+            .and_then(|weave| weave.primary_thread_id().map(str::to_string))
+            .unwrap_or_default();
+        self.run_scripted_driver(&weave_id, &origin, event, pending_io);
+        // Step every thread this weave ticks (primary first). A driver
+        // waiting on this query has PARKED a boundary (the
+        // hold-the-continue shape); stepping re-fires it now that the
+        // handler has stored the fact, and the driver acts from the
+        // re-fired boundary — the contract that stays correct across a
+        // restart, where a healed `query_failed` notice and the
+        // re-fired boundary share one drain. Threads the driver didn't
+        // park step to no-ops.
+        let mut ticked: Vec<String> = self
+            .weaves
+            .get(&weave_id)
+            .map(|weave| {
+                weave
+                    .ticked_thread_ids()
+                    .filter(|thread_id| {
+                        self.thread_ticker.get(*thread_id).map(String::as_str) == Some(&weave_id)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ticked.sort_by_key(|thread_id| thread_id != &origin);
+        for thread_id in ticked {
+            self.step_until_blocked(&thread_id, pending_io);
+        }
+    }
+}
+
+/// One bucket a scripted query will search, resolved at effect
+/// admission. `Ready` is a hot bucket grabbed from cache synchronously
+/// (the `hot_only` path); `Load` carries the coordinates for a
+/// cache-or-disk load inside the future (the `knowledge_query` tool's
+/// shape — a first load pays the slot-load cost).
+enum ScriptedQueryBucket {
+    Ready {
+        label: String,
+        bucket: std::sync::Arc<dyn crate::knowledge::Bucket>,
+    },
+    Load {
+        label: String,
+        scope: crate::knowledge::BucketScope,
+        pod_id: Option<String>,
+        name: String,
+        slot_id: String,
+        serving_mode: String,
+    },
 }
 
 /// Text of the most recent assistant entry — what the driver reads as
@@ -877,6 +1453,30 @@ fn last_assistant_text(task: &Thread) -> String {
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Thinking content of the last assistant message, for
+/// `agent_completed.reasoning`. Mirrors `last_assistant_text` (and the
+/// builtin autoquery's source extraction): visible Thinking blocks
+/// only — redacted thinking has no text to carry.
+fn last_assistant_reasoning(task: &Thread) -> String {
+    task.conversation
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::Assistant)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

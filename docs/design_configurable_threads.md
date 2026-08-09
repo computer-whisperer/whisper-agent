@@ -793,6 +793,168 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
      on a completion that never replays — the latter is the
      pre-existing scripted-weave hazard class, now also holding a run
      unrecorded.
+   **Slice 3 ratified 2026-08-09** (four forks via AskUserQuestion):
+   autoquery — driver-initiated knowledge retrieval, the first async
+   non-thread effect. Ground truth that shaped the slice: the builtin
+   "autoquery" is scheduler machinery keyed on `task.config.autoquery`,
+   not builtin-driver behavior — after every successful model call it
+   extracts query text from the response (reasoning-first by default),
+   fires an async embed→search→rerank over hot in-scope buckets, and
+   injects the formatted nudge at the next `NeedsModelCall` boundary,
+   HOLDING that model call while a query is in flight so the nudge
+   lands in time. On scripted threads it is half-alive: queries launch
+   (the trigger is config-keyed and scripted threads inherit pod
+   config) but injection and the wait-gate live in
+   `step_until_blocked`'s loop head, which scripted stepping bypasses
+   (`scripted_run_agent` / `continue_cycle` call `begin_model_call`
+   directly) — an autoquery-enabled pod pays embed+rerank per scripted
+   turn while nudges rot in the queue, injectable only stale at a
+   parked turn boundary (where injection also re-delivers
+   `turn_start`).
+   - *Surface: a query effect; the builtin machinery gates off
+     scripted threads.* New effect `query_knowledge{id, query,
+     buckets?, top_k?, snippet_chars?, hot_only?}` with completion
+     events `query_completed{id, query, hits}` / `query_failed{id,
+     message}`; the driver owns trigger, formatting, injection, and
+     dedup in Lua. `maybe_launch_knowledge_autoquery` skips
+     scripted-ticked threads — no more silent embed+rerank cost with
+     undeliverable nudges. REJECTED: config passthrough (making the
+     builtin machinery work under driver-gated stepping puts
+     scheduler-owned injection and wait-gates inside the scripted
+     executors — the scheduler delaying and prefixing driver-decided
+     model calls with content the driver never sees); both surfaces
+     active (double-nudge risk, and the passthrough work buys nothing
+     once drivers own the loop). Async-effect pattern established
+     here for every future non-thread effect: driver-supplied
+     correlation `id` echoed in the completion (a duplicate id while
+     one is in flight refuses and journals); journaled pending at
+     issue like `RunAgent`, resolved on completion; restart heals
+     pending query records to `query_failed` at the weave's first
+     activation (the dead-ticked-thread shape — an idempotent fact,
+     not an edge); completed records are inert at load. `min_score`
+     is deliberately absent: hits carry rerank scores and the driver
+     filters in Lua — the loop is driver-owned, the scheduler does
+     not pre-judge relevance.
+   - *Injection: nudge-on-continue.* `continue_cycle` gains an
+     optional `nudge` text param appended atomically as the same
+     system-authored message shape `submit_server_nudge` uses, before
+     the model call it triggers. `append_entry`'s mid-generation
+     refusal stays untouched (turn-boundary injection already works
+     through it — `NeedsModelCall` is not mid-generation). REJECTED:
+     relaxing append_entry at the post-tools parked boundary (sound
+     there — results are integrated — but it carves a state-specific
+     exception into a deliberate guard, and `AgentBoundary` must stay
+     refused or an entry splits tool_use from tool_result);
+     turn-boundary-only (loses the flagship case: retrieval landing
+     between tool rounds inside a working cycle). Atomicity is
+     load-bearing, not convenience: a `continue_cycle` + `append_entry`
+     pair in one effects list only sequences correctly for the event's
+     origin thread — any other thread is stepped re-entrantly by the
+     continue executor and the append lands mid-generation, refused.
+     *Consequence found at implementation — the hold is a parked
+     boundary and async handlers store, never move.* "Hold the
+     continue" = park the tools boundary (return no effects); after a
+     query resolves the scheduler steps every thread the weave ticks,
+     so the parked boundary re-fires and its handler finds the stored
+     nudge and continues. Moving the held thread from the
+     `query_completed`/`query_failed` handler instead works live but
+     breaks across a restart: a healed `query_failed` notice and the
+     re-fired boundary share one drain, and the boundary event queued
+     behind the notice goes stale the moment the notice's handler
+     moves the thread. Contract documented on the events; both example
+     patterns journal identically.
+   - *Cold buckets: per-effect `hot_only`, default true.* Ambient
+     nudge loops stay hot-only by authoring convention; a driver may
+     explicitly request a cold-capable query (the scheduled-digest
+     shape). Driver code is operator-authored and journaled — the
+     `knowledge_query` tool's trust class, not ambient config's.
+     REJECTED: hard hot-only (a digest driver would have to route
+     retrieval through a model turn just to touch cold data).
+   - *`agent_completed` gains `reasoning`* (empty string when none) —
+     the same parity argument that put `text` on the event; the
+     builtin's default `query_source` is reasoning-then-text and a
+     thinking-heavy model's terse text would starve a text-only
+     query. Reasoning is already persisted in thread journals — no
+     new exposure class. Authoring note, not mechanism: drivers that
+     stash reasoning into state bloat their persisted JSON.
+   - Scope and bounds: bucket refs use the config grammar (bare,
+     `server:name`, `pod:name`) resolved against the weave's POD
+     knowledge ceiling (no participant narrowing — the driver is not
+     a participant; empty means every in-scope bucket); `top_k`
+     defaults 5, max 20, zero refused — the `knowledge_query` tool's
+     bounds, not new numbers; `snippet_chars` bounds chunk text
+     crossing into Lua, default 500 (the builtin nudge default). Hits
+     carry `bucket`, `source_id`, `chunk_id`, `locator`, `score`,
+     `snippet` — enough for Lua-side dedup keys matching the
+     builtin's (source-or-chunk per bucket).
+   **Carrying case:** titled_chat grows an `autoquery` bool knob
+   (default false) implementing the builtin loop in Lua: query on
+   tool-bearing responses from reasoning-then-text, hold `continue`
+   until the result arrives, inject via the continue nudge, dedup
+   seen hits in driver state, suppress when the model called
+   `knowledge_query` itself. Extends its role as the builtin-parity
+   proof. Roundtable rider deliberately skipped this slice: no
+   natural per-round nudge point without new design work.
+   **Slice 3 landed 2026-08-09.** `ScriptedEffect::QueryKnowledge` /
+   `ScriptedEvent::{QueryCompleted, QueryFailed}` +
+   `ScriptedKnowledgeHit` (event `Eq` dropped for the f32 scores);
+   `ContinueCycle.nudge`; `AgentCompleted.reasoning`;
+   `PersistedDriverEffect::QueryKnowledge{query_id, query, buckets}`
+   (pending at issue, buckets = the labels actually queried) and
+   `Continue.nudge_entry` (the journal explains the injected entry);
+   `weave_query_knowledge` executor (static faults journal Failed AND
+   fail the activation — the run_agent audit shape; environmental
+   refusals journal Failed and queue `query_failed` onto the same
+   activation's drain, the thread_derived delivery shape);
+   `SchedulerCompletion::ScriptedQuery` → completion applier settles
+   the record, then steps every ticked thread of the weave so parked
+   boundaries re-fire (the store-don't-move mechanism); hot path
+   grabs cache-loaded buckets at admission, `hot_only = false`
+   snapshots (slot, serving mode) and loads inside the future — the
+   tool's exact shape; builtin `maybe_launch_knowledge_autoquery`
+   gates off scripted-ticked threads. Restart: the shutdown bulk
+   interrupt now EXEMPTS async non-thread records (they must stay
+   Pending), the load scan queues loss notices without touching the
+   journal, and the record fails AT DELIVERY — crash anywhere before
+   the notice lands re-derives it next load, the same
+   rebuild-at-load contract as the dead-ticked scan; thread-scoped
+   bulk resolvers (`fail_pending_for` / `interrupt_pending_for`)
+   also skip async records, so another thread's death can no longer
+   settle a flying query's record out from under it. Harness: five
+   tests — end-to-end refusal-never-stalls (pins reasoning-then-text
+   through real effect emission), the flagship
+   hold→complete→re-fire→nudge arc incl. snippet clip, journaled
+   `nudge_entry`, and dedup-to-nothing (via a manufactured in-flight
+   standing in for a launch — the real engine path needs bucket +
+   provider fixtures the harness doesn't have; noted, not hidden),
+   duplicate-id-is-a-journaled-driver-fault, and the
+   restart-heal arc pinning Pending-until-delivery. Lua tests pin the
+   full effect decode and the event's Lua-side shape.
+   **Reviewed (same session), verdict sound after fixes.** The
+   review's HIGH was real and structural: the persist layer's
+   shutdown interrupt resolved every pending record at load, so the
+   heal scan (which filters on Pending) was dead code on the
+   production path and a query in flight at shutdown wedged its
+   driver forever — the heal test had passed only because it called
+   the scan directly, bypassing persist. Fixed by the async-record
+   exemption + resolve-at-delivery above (the test now runs the
+   shutdown interrupt first). Also taken from review: the thread-
+   scoped bulk-resolver exemption (any thread's failure matched the
+   query's attribution-less record); static faults now journal
+   (ratified text said "refuses and journals"; the first cut
+   silently dropped); the continue-nudge entry now broadcasts a
+   ThreadSnapshot like both sibling injection paths (a live viewer
+   otherwise saw the reply reference material it couldn't see).
+   Accepted, recorded: `nudge_entry` is a moment-in-time index
+   (compaction/insert can shift it — the pre-existing
+   `AppendEntry.entry_index` weakness, forensic-only); builtin
+   autoquery leftovers on an adopted thread still inject once after
+   a builtin→scripted ticker adoption (bounded, self-clearing);
+   titled_chat's stored nudge can go stale across an external
+   cancel (hits were genuinely unseen; self-limiting); the real
+   launch→flight→completion path is fixture-untestable in the
+   harness today (fake embed/rerank providers + a fake Bucket are
+   feasible but nontrivial — a future harness investment).
 
 ## Open questions (flagged, not ratified)
 

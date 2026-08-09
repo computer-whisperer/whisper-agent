@@ -16,8 +16,13 @@
 -- lingers as a referenced auxiliary (relationship "title"): the
 -- title's provenance stays inspectable in drill-down.
 --
--- Knob: `title.model` ({backend, model}) — unset falls through to the
--- pod's default model.
+-- Knobs: `title.model` ({backend, model}) — unset falls through to the
+-- pod's default model. `autoquery` (boolean, default false) — when on,
+-- every tool-bearing reply fires a knowledge query built from the
+-- reply's reasoning (falling back to its text), the continue after
+-- tools holds until the query resolves, and unseen hits ride into the
+-- next model call as a nudge: the builtin autoquery loop (step 11
+-- slice 3) expressed in driver code.
 
 local TITLE_PROMPT = "You write conversation titles. Reply with the "
   .. "title only: 3 to 8 words, no quotes, no trailing punctuation."
@@ -29,6 +34,40 @@ local function clip(text, limit)
     return string.sub(text, 1, utf8.offset(text, limit + 1) - 1)
   end
   return text
+end
+
+-- Last `limit` characters on a UTF-8 boundary — the query wants the
+-- TAIL of a reasoning trace (its end sits closest to the next action).
+local function clip_tail(text, limit)
+  text = text or ""
+  local n = utf8.len(text)
+  if n and n > limit then
+    return string.sub(text, utf8.offset(text, n - limit + 1))
+  end
+  return text
+end
+
+-- The builtin's dedup key: source when the chunk has one, chunk id
+-- otherwise, scoped per bucket.
+local function hit_key(hit)
+  if hit.source_id ~= "" then
+    return hit.bucket .. "\tsource:" .. hit.source_id
+  end
+  return hit.bucket .. "\tchunk:" .. hit.chunk_id
+end
+
+local function format_nudge(hits)
+  local out = "A hot knowledge bucket surfaced material related to the "
+    .. "current reasoning trace. Use `knowledge_query` if you need "
+    .. "more context.\n"
+  for i, hit in ipairs(hits) do
+    local title = hit.source_id ~= "" and hit.source_id
+      or ("chunk " .. hit.chunk_id)
+    if hit.locator then title = title .. " (" .. hit.locator .. ")" end
+    out = out .. i .. ". [" .. hit.bucket .. "] " .. title .. "\n"
+      .. hit.snippet .. "\n"
+  end
+  return out
 end
 
 -- Trim, unquote, collapse whitespace, drop a trailing period, clip.
@@ -51,6 +90,8 @@ function describe()
       .. "after the first reply.",
     knobs = {
       { id = "title.model", label = "Title model", type = "model" },
+      { id = "autoquery", label = "Knowledge autoquery", type = "boolean",
+        default = false },
     },
   }
 end
@@ -104,8 +145,34 @@ function on_event(state, event, config)
     end
 
     if #event.tool_calls > 0 then
-      return { effects = { { kind = "dispatch_tools", thread_id = event.thread_id } },
-               state = state }
+      local effects = { { kind = "dispatch_tools", thread_id = event.thread_id } }
+      if config and config.autoquery then
+        -- The builtin's suppression rule: a model that queries
+        -- knowledge itself needs no ambient nudge this round.
+        local explicit = false
+        for _, call in ipairs(event.tool_calls) do
+          if call.name == "knowledge_query"
+            or call.name == "drain_knowledge_nudges" then
+            explicit = true
+          end
+        end
+        if explicit then
+          state.aq_nudge = nil
+        elseif not state.aq_pending then
+          -- Reasoning-then-text, tail-clipped: the builtin's default
+          -- query source.
+          local q = event.reasoning ~= "" and event.reasoning or event.text
+          q = clip_tail(q, 4000)
+          if #q > 0 then
+            state.aq_n = (state.aq_n or 0) + 1
+            local id = "aq-" .. state.aq_n
+            state.aq_pending = id
+            effects[#effects + 1] = { kind = "query_knowledge", id = id,
+              query = q, top_k = 1 }
+          end
+        end
+      end
+      return { effects = effects, state = state }
     end
 
     local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
@@ -140,8 +207,59 @@ function on_event(state, event, config)
   end
 
   if k == "tools_completed" then
+    if event.thread_id == state.primary and config and config.autoquery then
+      if state.aq_pending then
+        -- Hold the continue until the query resolves — the builtin's
+        -- wait-gate, expressed as a parked boundary. The query
+        -- handlers only store facts; this boundary re-fires once the
+        -- query resolves (the scheduler steps the weave's ticked
+        -- threads after delivery) and the continue flows from here.
+        return { state = state }
+      end
+      if state.aq_nudge then
+        local nudge = state.aq_nudge
+        state.aq_nudge = nil
+        return { effects = { { kind = "continue_cycle",
+          thread_id = event.thread_id, nudge = nudge } }, state = state }
+      end
+    end
     return { effects = { { kind = "continue_cycle", thread_id = event.thread_id } },
              state = state }
+  end
+
+  -- Store-don't-move (see the contract on query_completed in
+  -- driver/lua.rs): both query handlers record the outcome and issue
+  -- NO thread effects — the parked tools boundary re-fires and acts on
+  -- what they stored, which stays correct when a restart drains a
+  -- healed query_failed and the re-fired boundary back to back.
+  if k == "query_completed" then
+    if event.id ~= state.aq_pending then
+      return { state = state }
+    end
+    state.aq_pending = nil
+    state.aq_seen = state.aq_seen or {}
+    local fresh = {}
+    for _, hit in ipairs(event.hits) do
+      local key = hit_key(hit)
+      if not state.aq_seen[key] then
+        state.aq_seen[key] = true
+        fresh[#fresh + 1] = hit
+      end
+    end
+    if #fresh > 0 then
+      state.aq_nudge = format_nudge(fresh)
+    end
+    return { state = state }
+  end
+
+  if k == "query_failed" then
+    if event.id == state.aq_pending then
+      -- The query died (refused, engine error, or lost to a restart);
+      -- the chat must not stall on retrieval that was only ever
+      -- opportunistic.
+      state.aq_pending = nil
+    end
+    return { state = state }
   end
 
   if k == "thread_failed" then

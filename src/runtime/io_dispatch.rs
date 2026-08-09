@@ -51,6 +51,11 @@ pub(crate) struct IoCompletion {
 pub(crate) enum SchedulerCompletion {
     Io(IoCompletion),
     KnowledgeAutoquery(KnowledgeAutoqueryCompletion),
+    /// A scripted weave's `query_knowledge` effect resolved (step 11
+    /// slice 3 — the first async non-thread effect). Routed to the
+    /// weave, not a thread: the journal record resolves and the driver
+    /// hears `query_completed` / `query_failed`.
+    ScriptedQuery(ScriptedQueryCompletion),
     SharedMcp(SharedMcpCompletion),
     OauthStart(OauthStartCompletion),
     OauthComplete(OauthCompleteCompletion),
@@ -64,6 +69,18 @@ pub(crate) enum SchedulerCompletion {
 pub(crate) struct KnowledgeAutoqueryCompletion {
     pub(crate) thread_id: String,
     pub(crate) result: Result<KnowledgeAutoqueryResult, String>,
+}
+
+pub(crate) struct ScriptedQueryCompletion {
+    pub(crate) weave_id: String,
+    /// Driver-supplied correlation token, echoed on the event.
+    pub(crate) query_id: String,
+    /// The pending journal record this completion resolves.
+    pub(crate) effect_id: crate::runtime::driver::DriverEffectId,
+    pub(crate) query: String,
+    /// Clip applied to each hit's chunk text before it crosses into Lua.
+    pub(crate) snippet_chars: usize,
+    pub(crate) result: Result<Vec<crate::knowledge::RerankedCandidate>, String>,
 }
 
 pub(crate) struct KnowledgeAutoqueryResult {

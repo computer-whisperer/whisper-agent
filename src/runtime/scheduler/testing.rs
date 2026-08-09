@@ -14,8 +14,9 @@
 //! of migration step 7.
 
 use super::*;
+use crate::knowledge::RerankedCandidate;
 use crate::runtime::driver::{
-    DriverEffectOutcome, EntryRef, PersistedDriverEffect, ThreadRelationship,
+    DriverEffectOutcome, DriverState, EntryRef, PersistedDriverEffect, ThreadRelationship,
 };
 use crate::runtime::thread::{IoResult, ThreadInternalState};
 use crate::runtime::weave::WeaveThreadRole;
@@ -3370,4 +3371,475 @@ async fn retention_prunes_gone_refs_and_retires_the_weave() {
         !h.sched.thread_ticker.contains_key(&title_thread),
         "stale ticker entry for the gone thread pruned"
     );
+}
+
+// ---------- step 11 slice 3: query_knowledge ----------
+
+fn thinking_block(text: &str) -> ContentBlock {
+    ContentBlock::Thinking {
+        replay: None,
+        thinking: text.to_string(),
+    }
+}
+
+fn wiki_hit(source: &str, chunk_byte: u8, score: f32, text: &str) -> RerankedCandidate {
+    RerankedCandidate {
+        bucket_id: crate::knowledge::BucketId::server("wiki"),
+        chunk_id: crate::knowledge::ChunkId([chunk_byte; 32]),
+        chunk_text: text.to_string(),
+        source_ref: crate::knowledge::SourceRef {
+            source_id: source.to_string(),
+            locator: (!source.is_empty()).then(|| "§2".to_string()),
+        },
+        source_score: score,
+        source_path: crate::knowledge::SearchPath::Dense,
+        rerank_score: score,
+    }
+}
+
+impl Harness {
+    fn scripted_data(&self, weave_id: &str) -> serde_json::Value {
+        match &self.sched.weaves[weave_id].driver_state {
+            DriverState::Scripted { data, .. } => data.clone(),
+            other => panic!("weave `{weave_id}` is not scripted: {other:?}"),
+        }
+    }
+
+    /// Manufacture an in-flight `query_knowledge`: the driver-state,
+    /// journal, and in-flight entries `weave_query_knowledge` would
+    /// have created had a launch succeeded — the harness has no
+    /// bucket/reranker fixtures, so the launch path itself refuses
+    /// environmentally and is pinned by the refusal test instead.
+    fn fake_query_in_flight(
+        &mut self,
+        weave_id: &str,
+        query_id: &str,
+        query: &str,
+    ) -> crate::runtime::driver::DriverEffectId {
+        let weave = self.sched.weaves.get_mut(weave_id).unwrap();
+        if let DriverState::Scripted { data, .. } = &mut weave.driver_state
+            && let Some(object) = data.as_object_mut()
+        {
+            object.insert("aq_pending".into(), serde_json::json!(query_id));
+        }
+        let effect_id = weave.record_pending_effect(PersistedDriverEffect::QueryKnowledge {
+            query_id: query_id.to_string(),
+            query: query.to_string(),
+            buckets: vec!["server:wiki".into()],
+        });
+        self.sched
+            .scripted_queries_in_flight
+            .insert((weave_id.to_string(), query_id.to_string()), effect_id);
+        effect_id
+    }
+
+    fn nudge_messages(&self, thread_id: &str) -> Vec<String> {
+        self.sched.tasks[thread_id]
+            .conversation
+            .messages()
+            .iter()
+            .filter(|message| message.role == whisper_agent_protocol::Role::System)
+            .flat_map(|message| {
+                message.content.iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } if text.contains("knowledge bucket surfaced") => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The autoquery knob on an unprovisioned pod (no buckets in scope)
+/// must never stall or kill the chat: the effect emission is real (the
+/// query text pins reasoning-then-text extraction end-to-end), the
+/// refusal journals Failed and delivers `query_failed` in the same
+/// activation, and the tools round-trip continues bare.
+#[tokio::test]
+async fn titled_chat_autoquery_refusal_never_stalls_the_chat() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config(
+            "titled_chat",
+            [("autoquery".to_string(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "How do weaves persist?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![
+            thinking_block("weave storage internals"),
+            tool_use_block("toolu-aq", "list_images"),
+        ],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingTools { .. }
+    ));
+    let refused = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::QueryKnowledge { .. }))
+        .expect("the driver issued a real query_knowledge effect");
+    assert!(
+        matches!(
+            &refused.effect,
+            PersistedDriverEffect::QueryKnowledge { query_id, query, .. }
+                if query_id == "aq-1" && query == "weave storage internals"
+        ),
+        "query text drawn from the reply's reasoning: {:?}",
+        refused.effect
+    );
+    assert!(
+        matches!(
+            &refused.outcome,
+            DriverEffectOutcome::Failed { message }
+                if message.contains("no knowledge buckets")
+        ),
+        "environmental refusal journals Failed: {:?}",
+        refused.outcome
+    );
+    assert_eq!(
+        h.scripted_data(&weave_id).get("aq_pending"),
+        None,
+        "the same-activation query_failed cleared the pending marker"
+    );
+
+    h.respond_tool(&primary, "toolu-aq", "no images", &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "tools_completed continued bare — retrieval was only ever opportunistic"
+    );
+    assert!(h.nudge_messages(&primary).is_empty());
+}
+
+/// The flagship autoquery arc: a query in flight holds the continue
+/// (parked tools boundary), the completion stores the nudge, the
+/// re-fired boundary continues with it — the nudge lands as a
+/// journaled system entry ahead of the next model call — and a second
+/// completion carrying an already-seen hit dedups to nothing.
+#[tokio::test]
+async fn titled_chat_autoquery_holds_the_continue_and_injects_the_nudge() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config(
+            "titled_chat",
+            [("autoquery".to_string(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "How do weaves persist?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![
+            thinking_block("weave storage internals"),
+            tool_use_block("toolu-aq", "list_images"),
+        ],
+        &mut pending_io,
+    );
+    // Stand in for a successful launch (see fake_query_in_flight).
+    let effect_id = h.fake_query_in_flight(&weave_id, "aq-2", "weave storage internals");
+
+    h.respond_tool(&primary, "toolu-aq", "no images", &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::ToolsBoundary { .. }
+        ),
+        "the continue holds while the query is in flight"
+    );
+
+    let long_chunk = "The effect journal is flushed before any lazy IO future polls.";
+    h.sched.apply_scripted_query_completion(
+        crate::runtime::io_dispatch::ScriptedQueryCompletion {
+            weave_id: weave_id.clone(),
+            query_id: "aq-2".into(),
+            effect_id,
+            query: "weave storage internals".into(),
+            snippet_chars: 40,
+            result: Ok(vec![
+                wiki_hit("Paxos", 9, 0.83, long_chunk),
+                wiki_hit("", 12, 0.31, "chunk-keyed hit"),
+            ]),
+        },
+        &mut pending_io,
+    );
+
+    assert!(
+        h.sched.scripted_queries_in_flight.is_empty(),
+        "completion cleared the in-flight entry"
+    );
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| r.id == effect_id)
+        .unwrap();
+    assert_eq!(record.outcome, DriverEffectOutcome::Completed);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the re-fired boundary continued into the next model call"
+    );
+    let nudges = h.nudge_messages(&primary);
+    assert_eq!(nudges.len(), 1, "exactly one nudge entry injected");
+    assert!(
+        nudges[0].contains(&format!(
+            "[{}] Paxos (§2)",
+            crate::knowledge::BucketId::server("wiki")
+        )),
+        "nudge names the hit's bucket and source: {}",
+        nudges[0]
+    );
+    assert!(
+        nudges[0].contains("The effect journal is flushed before any…"),
+        "snippet clipped to the completion's snippet_chars: {}",
+        nudges[0]
+    );
+    let nudge_entry = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find_map(|r| match &r.effect {
+            PersistedDriverEffect::Continue {
+                nudge_entry: Some(index),
+                ..
+            } => Some(*index),
+            _ => None,
+        })
+        .expect("the continue journaled its injected entry");
+    let entry = &h.sched.tasks[&primary].conversation.messages()[nudge_entry];
+    assert_eq!(entry.role, whisper_agent_protocol::Role::System);
+    let data = h.scripted_data(&weave_id);
+    assert_eq!(data.get("aq_pending"), None);
+    assert_eq!(
+        data.get("aq_seen")
+            .and_then(|seen| seen.as_object())
+            .map(|seen| seen.len()),
+        Some(2),
+        "both hits recorded for dedup"
+    );
+
+    // Second round: the model tools again, another query completes with
+    // an already-seen hit — dedup leaves nothing to inject and the
+    // continue runs bare.
+    h.respond_model(
+        &primary,
+        vec![tool_use_block("toolu-aq2", "list_images")],
+        &mut pending_io,
+    );
+    let effect_id_2 = h.fake_query_in_flight(&weave_id, "aq-3", "weave storage internals");
+    h.respond_tool(&primary, "toolu-aq2", "still none", &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::ToolsBoundary { .. }
+    ));
+    h.sched.apply_scripted_query_completion(
+        crate::runtime::io_dispatch::ScriptedQueryCompletion {
+            weave_id: weave_id.clone(),
+            query_id: "aq-3".into(),
+            effect_id: effect_id_2,
+            query: "weave storage internals".into(),
+            snippet_chars: 40,
+            result: Ok(vec![wiki_hit("Paxos", 9, 0.9, long_chunk)]),
+        },
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert_eq!(
+        h.nudge_messages(&primary).len(),
+        1,
+        "the already-seen hit deduped to nothing — no second nudge"
+    );
+}
+
+/// Re-using a correlation id while its query is still in flight is a
+/// static authoring bug: the effect refuses as a driver fault (the
+/// activation fails and the origin thread dies loudly), unlike the
+/// environmental refusals that deliver `query_failed`.
+#[tokio::test]
+async fn scripted_query_duplicate_id_is_a_driver_fault() {
+    let mut h = harness().await;
+    h.install_driver(
+        "dup_query",
+        r#"
+            function on_event(state, event)
+              if event.kind == "turn_start" then
+                return { effects = { { kind = "query_knowledge",
+                  id = "dup", query = "anything" } }, state = state }
+              end
+              return { state = state }
+            end
+        "#,
+    );
+    let primary = h.create_scripted_thread("dup_query").unwrap();
+    let weave_id = h.weave_of(&primary);
+    h.sched
+        .scripted_queries_in_flight
+        .insert((weave_id.clone(), "dup".into()), 999);
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&primary, "go".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let detail = h.sched.tasks[&primary]
+        .failure_detail()
+        .expect("duplicate id fails the activation's origin thread");
+    assert!(
+        detail.contains("already in flight"),
+        "failure names the duplicate: {detail}"
+    );
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                (&r.effect, &r.outcome),
+                (
+                    PersistedDriverEffect::QueryKnowledge { query_id, .. },
+                    DriverEffectOutcome::Failed { message },
+                ) if query_id == "dup" && message.contains("already in flight")
+            )),
+        "static faults journal like every refusal — auditable, not silent"
+    );
+}
+
+/// A query still pending at load died with the process: the healing
+/// pass queues a loss notice (leaving the journal record Pending — a
+/// crash before delivery re-derives the notice next load), and the
+/// weave's next activation drains `query_failed` ahead of the re-fired
+/// boundary, failing the record at delivery — the parked continue
+/// releases bare instead of wedging forever. Also pins the
+/// load-order prerequisite: the shutdown interrupt exempts async
+/// non-thread records, or this scan would find nothing.
+#[tokio::test]
+async fn pending_scripted_queries_heal_to_query_failed_at_load() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config(
+            "titled_chat",
+            [("autoquery".to_string(), serde_json::json!(true))]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "How do weaves persist?".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![
+            thinking_block("weave storage internals"),
+            tool_use_block("toolu-aq", "list_images"),
+        ],
+        &mut pending_io,
+    );
+    let effect_id = h.fake_query_in_flight(&weave_id, "aq-2", "weave storage internals");
+    h.respond_tool(&primary, "toolu-aq", "no images", &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::ToolsBoundary { .. }
+    ));
+
+    // Restart: in-flight futures die with the process. The shutdown
+    // interrupt (persist load path) must leave the async record
+    // Pending for the heal scan to find — pinned here by running it.
+    h.sched.scripted_queries_in_flight.clear();
+    h.sched
+        .weaves
+        .get_mut(&weave_id)
+        .unwrap()
+        .interrupt_all_pending("task was in-flight at last shutdown");
+    h.sched.heal_pending_scripted_queries();
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| r.id == effect_id)
+        .unwrap();
+    assert_eq!(
+        record.outcome,
+        DriverEffectOutcome::Pending,
+        "the scan queues the notice but leaves the record Pending — \
+         a crash before delivery re-derives it next load"
+    );
+    assert!(
+        h.sched.scripted_query_notices.contains_key(&weave_id),
+        "loss notice queued for first activation"
+    );
+
+    // First activation after the restart: the parked boundary re-fires
+    // (here via an explicit step — production reaches it through any
+    // stepping path) and the drain delivers the loss notice first,
+    // failing the record at delivery.
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| r.id == effect_id)
+        .unwrap();
+    assert!(
+        matches!(
+            &record.outcome,
+            DriverEffectOutcome::Failed { message } if message.contains("lost to restart")
+        ),
+        "delivery resolved the lost record: {:?}",
+        record.outcome
+    );
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the held continue released bare after the loss notice"
+    );
+    assert!(
+        !h.sched.scripted_query_notices.contains_key(&weave_id),
+        "loss notice drained"
+    );
+    assert_eq!(h.scripted_data(&weave_id).get("aq_pending"), None);
+    assert!(h.nudge_messages(&primary).is_empty());
 }
