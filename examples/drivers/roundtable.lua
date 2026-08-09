@@ -236,12 +236,21 @@ function on_event(state, event, config)
 
   if k == "agent_completed" then
     if state.title_thread and event.thread_id == state.title_thread then
+      -- One-shot: unmap the title thread so a later external cancel of
+      -- the lingering auxiliary can't re-enter the title branches and
+      -- declare the run twice.
+      state.title_thread = nil
       local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
       local title = clean_title(event.text)
       if #title > 0 then
         effects[#effects + 1] = { kind = "set_title",
           thread_id = state.primary, title = title }
       end
+      -- First round closed and the title resolved: the triggered
+      -- unit of work is done. For a behavior-spawned weave this
+      -- records the run (step 11 slice 2); elsewhere it journals
+      -- and moves nothing.
+      effects[#effects + 1] = { kind = "complete_run" }
       return { effects = effects, state = state }
     end
     local speaker = voice_of(state, event.thread_id)
@@ -265,9 +274,11 @@ function on_event(state, event, config)
   if k == "thread_failed" then
     if state.title_thread and event.thread_id == state.title_thread then
       -- The title model died; keep the truncation placeholder and
-      -- don't retry (title_requested stays set).
+      -- don't retry (title_requested stays set). The round itself
+      -- closed, so the triggered run still completed — titling is
+      -- cosmetic.
       state.title_thread = nil
-      return { state = state }
+      return { effects = { { kind = "complete_run" } }, state = state }
     end
     if event.thread_id == state.primary then
       -- The minutes thread died (cancel or failure): the round is

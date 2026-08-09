@@ -656,6 +656,143 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    PRE-EXISTING hazard class shared with replacement-voice derives in
    the same position, deserving its own consideration; codepoint
    clip can split grapheme clusters (cosmetic).
+   **Slice 2 ratified 2026-08-08** (three forks via AskUserQuestion):
+   behavior startup — a behavior can spawn a scripted weave. Ground
+   truth that shaped the slice: `run_behavior` already flows through
+   `create_task` (which validates `Scripted{config}` end-to-end since
+   step 10) and already supplies the behavior's fire-time scope as
+   `base_scope_override`; the only reason a behavior can't start a
+   roundtable today is that `BehaviorThreadOverride` hardcodes
+   `driver: None`. The slice is therefore mostly plumbing plus one
+   piece of new vocabulary:
+   - *Authoring surface: TOML-only.* `[thread]` gains `driver` (program
+     name) and a `[thread.driver_config]` table of knob values (TOML
+     values crossing into the step-10 JSON knob map verbatim; `model`
+     knobs are inline `{backend, model}` tables). The structured
+     behavior editor only renders a subset of `BehaviorConfig` and
+     preserves non-exposed fields on save, so the new fields survive
+     editor round-trips unrendered; behaviors stay fully authorable as
+     files. REJECTED: shipping the editor's driver picker + knob form
+     in the same slice — real sheet-form composition work would land
+     before the server semantics have been dogfooded; it reuses the
+     step-10 components and becomes its own follow-up slice.
+     Validation stays fire-time-only (each fire re-validates against
+     the program as it exists then — the behavior analogue of step
+     10's "creation-time validation is the only validation"), with one
+     parse-time addition: `driver_config` without `driver` refuses at
+     load like any config error.
+   - *Run-done is driver-declared* — new journaled effect
+     `complete_run{outcome?, message?}` (outcome defaults `completed`;
+     `failed` carries the message into `BehaviorOutcome::Failed`). The
+     scheduler resolves the declaring weave's origin-carrying thread
+     and routes the declaration into behavior bookkeeping (run_count,
+     last_outcome, overlap-queue release). REJECTED: primary-terminal
+     as run-done (the recommended-and-declined option): it matches the
+     builtin hook's semantics for free, but a scripted primary goes
+     Completed at every `finish_cycle` while the weave's actual work
+     (title thread in flight, later multi-phase drivers) continues —
+     only the driver knows when the triggered unit of work is done.
+     Consequences ratified with it: the declaration must be an effect,
+     not presentation (presentation is non-authoritative by
+     invariant; the journal must explain why run_count moved);
+     mechanical death of the origin thread stays as the
+     Failed/Cancelled backstop (first fact wins — the existing
+     idempotence guard arbitrates declaration-vs-death races); a
+     Completed origin thread in a scripted weave defers to the
+     declaration, so a driver that never declares holds the run
+     in-flight and the overlap queue open — an authoring contract
+     note, visible in the behavior state UI, bounded by weave death.
+     A `complete_run` from a weave with no behavior origin journals
+     with `behavior_id: None` and moves nothing — drivers declare
+     done unconditionally and stay origin-agnostic.
+   - *Retention treats the weave as the unit.* The sweep's candidate
+     rule keys on `BehaviorOrigin`, which only the spawned primary
+     carries — auxiliaries (voices, title threads) would outlive every
+     sweep and a daily cron roundtable would leak a headless weave per
+     day. Ratified: when the origin thread belongs to a scripted
+     weave, candidacy requires every thread the weave references to be
+     terminal and the window is measured from the newest `last_active`
+     across members ("the weave has been idle N days"); the action
+     then sweeps every member (each already tears down refs via
+     `sweep_thread`, emptying and retiring the weave). A member
+     referenced by another weave is left unswept (its ref keeps the
+     weave alive — accepted, unreachable for behavior-spawned
+     drivers). REJECTED: propagating `BehaviorOrigin` onto derived
+     threads (voices sit Completed between rounds and would be swept
+     out from under a live weave); skipping scripted weaves entirely
+     (leaks by design).
+   Rider: the create-time model-knob backend check gains fire-scope
+   parity — it enforces `base_scope_override` (the behavior's
+   fire-time scope) the way it enforces a dispatching parent's scope;
+   bindings already narrowed against it, knobs did not. Both example
+   drivers declare `complete_run` at title resolution (title completed
+   or title thread dead — the points where their triggered work is
+   actually finished).
+   **Slice 2 landed 2026-08-08.** Protocol: `BehaviorThreadOverride`
+   `driver` + `driver_config` (TOML values crossing to the JSON knob
+   map verbatim, pinned by a parse test incl. an inline model-knob
+   table; `Eq` dropped); `to_create_thread_requests` maps them to
+   `Scripted{name, config}`; `DriverConfigWithoutDriver` parse
+   refusal. Server: `ScriptedEffect::CompleteRun` (typed
+   `ScriptedRunOutcome`, default `completed`) →
+   `PersistedDriverEffect::CompleteRun{outcome: BehaviorOutcome,
+   behavior_id}` → `weave_complete_run` executor (origin resolved by
+   walking the weave's refs for the origin-carrying thread; no-origin
+   declarations journal `behavior_id: None`); the terminal-hook tail
+   refactored into the shared `record_behavior_run_outcome` (guard +
+   state + broadcast + queued re-fire) with the hook deferring
+   Completed for scripted-ticked threads; `behavior_has_inflight_run`
+   holds the Skip/QueueOne gate while a scripted run is undeclared
+   (`last_outcome` None + live scripted ticker); weave-unit retention
+   with reference-resolved membership and gone-ref pruning; fire-scope
+   model-knob check in create_task. Harness firsts: `install_behavior`
+   + the first end-to-end behavior-fire tests (declaration arc incl.
+   deferral + gate + journal provenance, death backstop via the
+   production step-pairing, queued-payload release, fire-scope knob
+   refusal, weave-unit sweep + working-member deferral + dormant
+   origin + gone-ref prune).
+   **Reviewed (same session), verdict sound after fixes.** The review's
+   HIGH was real: the overlap gate keyed only on the last thread's
+   terminal state, so a scripted primary's per-cycle Completed opened
+   Skip/QueueOne while the run was undeclared — the ratified "holds
+   the overlap queue open" claim existed only in this document. Fixed
+   in `behavior_has_inflight_run` as above. Also taken: both drivers
+   now clear `state.title_thread` in the completed-title branch
+   (an external cancel of the lingering auxiliary could re-enter the
+   failed-title branch and declare twice — `CancelThread` has no
+   terminal-state precondition and cancel transitions Completed →
+   Cancelled); retention membership by reference (ticker-keyed lookup
+   silently demoted a dormant-origin weave — the `advance_head` roll
+   shape — back to the leaking per-thread sweep) plus gone-ref
+   pruning with stale-ticker cleanup (a ref to a vanished thread made
+   the weave an unsweepable zombie once its origin thread swept);
+   journal doc wording ("routed to", the recorder's guard may still
+   discard). Accepted, recorded for a future pass:
+   - *Single-slot idempotence guard* — `(last_thread_id,
+     last_outcome)` is one slot, so with `overlap = allow` (or any
+     interleaving) a late fact about run N after run N+1 fired can
+     re-record N (e.g. declared-then-dies-mid-round: Completed then
+     backstop Failed both count). Pre-existing weakness, amplified by
+     scripted weaves outliving their recorded run; the fix is a
+     per-run recorded fact (candidate: stamp on `BehaviorOrigin` or
+     the weave), which is a design decision, not a patch.
+   - *Origin search can mis-credit in adversarial compositions* — an
+     origin-less weave that `adopt_ticker`s someone else's dormant
+     origin-carrying thread would record runs against that behavior.
+     Unreachable with the example drivers (a behavior-spawned weave's
+     own primary ref is first); the clean fix is stamping behavior
+     identity on the weave at spawn, same candidate as above.
+   - *Idle dormant member defers retention forever* — a
+     derived-but-never-run thread (weave died right after derive)
+     never reaches a terminal state, so its unit never sweeps.
+   - *Flush-order loss windows* (threads → weaves → behaviors):
+     crash after weave flush / before behavior flush leaves a
+     declared run permanently unrecorded (driver state says resolved,
+     no re-declaration comes); crash after the title thread flushes
+     Completed but before the weave flush leaves the driver waiting
+     on a completion that never replays — the latter is the
+     pre-existing scripted-weave hazard class, now also holding a run
+     unrecorded.
 
 ## Open questions (flagged, not ratified)
 

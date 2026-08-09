@@ -148,6 +148,8 @@ pub enum BehaviorConfigError {
     BadTimezone(String),
     #[error("on_completion.days must be > 0 for {policy}")]
     ZeroRetentionDays { policy: &'static str },
+    #[error("thread.driver_config is set but thread.driver names no program")]
+    DriverConfigWithoutDriver,
 }
 
 /// Parse `behavior.toml` text, then run structural validation. Does not
@@ -173,6 +175,13 @@ pub fn to_toml(cfg: &BehaviorConfig) -> Result<String, BehaviorConfigError> {
 /// `Schedule` is thrown away — callers re-parse into `CachedCron`
 /// after `validate` succeeds.
 pub fn validate(cfg: &BehaviorConfig) -> Result<(), BehaviorConfigError> {
+    // Knob values without a driver to consume them are an authoring
+    // mistake — refuse at parse time. (Knob values themselves validate
+    // at fire time against the program as it exists then, the behavior
+    // analogue of step 10's creation-time-only validation.)
+    if !cfg.thread.driver_config.is_empty() && cfg.thread.driver.is_none() {
+        return Err(BehaviorConfigError::DriverConfigWithoutDriver);
+    }
     match &cfg.trigger {
         TriggerSpec::Manual | TriggerSpec::Webhook { .. } => {}
         TriggerSpec::Cron {
@@ -496,6 +505,47 @@ mod tests {
         let cfg: BehaviorConfig = toml::from_str(r#"name = "x""#).unwrap();
         assert_eq!(cfg.name, "x");
         assert!(matches!(cfg.trigger, TriggerSpec::Manual));
+    }
+
+    #[test]
+    fn thread_driver_and_knobs_parse_from_toml() {
+        // The TOML value bridge is the load-bearing part: a model
+        // knob's inline table must arrive as the same JSON object the
+        // new-thread form would submit.
+        let cfg = parse_toml(
+            r#"
+name = "digest"
+
+[thread]
+driver = "titled_chat"
+
+[thread.driver_config]
+"title.model" = { backend = "openai", model = "gpt-5-nano" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.thread.driver.as_deref(), Some("titled_chat"));
+        assert_eq!(
+            cfg.thread.driver_config.get("title.model"),
+            Some(&serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}))
+        );
+    }
+
+    #[test]
+    fn driver_config_without_driver_refuses() {
+        let err = parse_toml(
+            r#"
+name = "digest"
+
+[thread.driver_config]
+"title.model" = { backend = "openai", model = "gpt-5-nano" }
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            BehaviorConfigError::DriverConfigWithoutDriver
+        ));
     }
 
     #[test]

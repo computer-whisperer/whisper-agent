@@ -479,6 +479,9 @@ impl Scheduler {
             ScriptedEffect::SetTitle { thread_id, title } => {
                 self.weave_set_title(weave_id, &thread_id, &title)
             }
+            ScriptedEffect::CompleteRun { outcome, message } => {
+                self.weave_complete_run(weave_id, outcome, message, pending_io)
+            }
             ScriptedEffect::AdvanceHead { thread_id } => {
                 self.weave_advance_head(weave_id, &thread_id)
             }

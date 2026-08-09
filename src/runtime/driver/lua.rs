@@ -208,6 +208,19 @@ pub enum ScriptedEffect {
         thread_id: String,
         title: String,
     },
+    /// Declare the weave's triggered unit of work done (step 11 slice
+    /// 2). For a behavior-spawned weave the scheduler routes the
+    /// declaration into behavior bookkeeping (run_count, last_outcome,
+    /// overlap-queue release); for any other weave it journals and
+    /// moves nothing — drivers declare unconditionally and stay
+    /// origin-agnostic. `outcome` defaults to `completed`; `failed`
+    /// carries `message` into the recorded failure.
+    CompleteRun {
+        #[serde(default)]
+        outcome: ScriptedRunOutcome,
+        #[serde(default)]
+        message: Option<String>,
+    },
     /// Promote a referenced, self-ticked thread to primary; the previous
     /// primary becomes a dormant auxiliary. The compaction-roll primitive.
     AdvanceHead {
@@ -219,6 +232,17 @@ pub enum ScriptedEffect {
     ReleaseTicker {
         thread_id: String,
     },
+}
+
+/// What a `complete_run` effect declares about the triggered work.
+/// Deliberately binary — `cancelled` is a fact about external
+/// intervention, not something a driver declares about its own run.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptedRunOutcome {
+    #[default]
+    Completed,
+    Failed,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -606,11 +630,13 @@ mod tests {
                 { kind = "adopt_ticker", thread_id = "t-check" },
                 { kind = "dispatch_tools", thread_id = "t-main" },
                 { kind = "continue_cycle", thread_id = "t-main" },
+                { kind = "complete_run" },
+                { kind = "complete_run", outcome = "failed", message = "no quorum" },
               } }
             end
         "#;
         let out = run_event(src_ok, "vocab", &json!({}), &event_turn_start("t", 1)).unwrap();
-        assert_eq!(out.effects.len(), 7);
+        assert_eq!(out.effects.len(), 9);
         assert!(matches!(
             &out.effects[0],
             ScriptedEffect::ResolveTools { decisions, .. }
@@ -621,6 +647,21 @@ mod tests {
             ScriptedEffect::DeriveThread { relationship, disable_tools: true, seed, .. }
                 if relationship == "check" && seed.len() == 1
         ));
+        assert_eq!(
+            out.effects[7],
+            ScriptedEffect::CompleteRun {
+                outcome: ScriptedRunOutcome::Completed,
+                message: None,
+            },
+            "bare complete_run defaults to a completed outcome"
+        );
+        assert_eq!(
+            out.effects[8],
+            ScriptedEffect::CompleteRun {
+                outcome: ScriptedRunOutcome::Failed,
+                message: Some("no quorum".into()),
+            }
+        );
     }
 
     #[test]

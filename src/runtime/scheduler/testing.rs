@@ -329,6 +329,60 @@ impl Harness {
             pending_io,
         );
     }
+
+    /// Install an in-memory behavior on the default pod — the harness
+    /// stand-in for a `<pod>/behaviors/<id>/` directory, firing
+    /// through the real `run_behavior` path. Disk-state writes ride
+    /// the (unpolled) dirty machinery, so nothing touches the
+    /// filesystem.
+    fn install_behavior(
+        &mut self,
+        id: &str,
+        config: whisper_agent_protocol::BehaviorConfig,
+        prompt: &str,
+    ) {
+        let pod = self.sched.pods.get_mut(TEST_POD).expect("test pod");
+        let dir = pod.dir.join("behaviors").join(id);
+        pod.behaviors.insert(
+            id.to_string(),
+            crate::pod::behaviors::Behavior {
+                id: id.to_string(),
+                pod_id: TEST_POD.to_string(),
+                dir,
+                config: Some(config),
+                raw_toml: String::new(),
+                prompt: prompt.to_string(),
+                system_prompt: None,
+                state: Default::default(),
+                cron: None,
+                load_error: None,
+            },
+        );
+    }
+
+    fn behavior_state(&self, id: &str) -> &whisper_agent_protocol::BehaviorState {
+        &self.sched.pods[TEST_POD].behaviors[id].state
+    }
+}
+
+/// A behavior whose `[thread]` names a scripted driver — the TOML
+/// authoring surface of step 11 slice 2, built directly.
+fn scripted_behavior_config(
+    driver: &str,
+    knobs: std::collections::BTreeMap<String, serde_json::Value>,
+) -> whisper_agent_protocol::BehaviorConfig {
+    whisper_agent_protocol::BehaviorConfig {
+        name: "scripted test behavior".into(),
+        description: None,
+        trigger: Default::default(),
+        thread: whisper_agent_protocol::BehaviorThreadOverride {
+            driver: Some(driver.to_string()),
+            driver_config: knobs,
+            ..Default::default()
+        },
+        on_completion: Default::default(),
+        scope: Default::default(),
+    }
 }
 
 fn text_block(text: &str) -> ContentBlock {
@@ -2907,4 +2961,413 @@ async fn titled_chat_keeps_the_placeholder_when_the_title_model_dies() {
         .filter(|r| matches!(&r.effect, PersistedDriverEffect::DeriveThread { .. }))
         .count();
     assert_eq!(derives, 1, "no title retry after the model died");
+}
+
+// ---------- behavior-spawned scripted weaves (step 11 slice 2) ----------
+
+/// The full behavior→scripted-weave arc: a fire spawns a scripted weave
+/// with the TOML-authored knob map frozen at fire time, the primary's
+/// Completed does NOT record the run (driver-declared run-done), and the
+/// driver's `complete_run` — emitted once the title resolves — records
+/// it, with the journal naming the behavior that consumed the
+/// declaration.
+#[tokio::test]
+async fn behavior_fires_a_scripted_weave_and_the_driver_declares_the_run() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    h.install_behavior(
+        "digest",
+        scripted_behavior_config(
+            "titled_chat",
+            [(
+                "title.model".to_string(),
+                serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        "Summarize the day.",
+    );
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    let weave_id = h.weave_of(&primary);
+    assert!(
+        matches!(
+            &h.sched.weaves[&weave_id].driver,
+            ThreadDriverConfig::Scripted { name, config }
+                if name == "titled_chat" && config.contains_key("title.model")
+        ),
+        "the weave froze the behavior's knob map at fire time"
+    );
+    assert_eq!(
+        h.behavior_state("digest").last_thread_id.as_deref(),
+        Some(primary.as_str())
+    );
+
+    h.respond_model(
+        &primary,
+        vec![text_block("Quiet day; two PRs landed.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    // Driver-declared run-done: the primary going Completed at
+    // finish_cycle is NOT the run finishing — the builtin hook's
+    // semantics would have recorded here.
+    assert_eq!(h.behavior_state("digest").run_count, 0);
+    assert!(
+        h.behavior_state("digest").last_outcome.is_none(),
+        "primary Completed defers to the driver's declaration"
+    );
+    assert!(
+        h.sched.behavior_has_inflight_run(TEST_POD, "digest"),
+        "the Skip/QueueOne overlap gate holds while the run is undeclared"
+    );
+
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "title")
+        })
+        .expect("title thread derived after the first reply")
+        .thread_id
+        .clone();
+    assert_eq!(
+        h.sched.tasks[&title_thread].bindings.backend, "openai",
+        "the TOML-authored model knob reached the derive"
+    );
+    h.respond_model(
+        &title_thread,
+        vec![text_block("Daily Digest.")],
+        &mut pending_io,
+    );
+
+    assert_eq!(h.behavior_state("digest").run_count, 1);
+    assert_eq!(
+        h.behavior_state("digest").last_outcome,
+        Some(whisper_agent_protocol::BehaviorOutcome::Completed)
+    );
+    assert!(
+        !h.sched.behavior_has_inflight_run(TEST_POD, "digest"),
+        "the declaration opens the overlap gate"
+    );
+    assert_eq!(
+        h.sched.tasks[&primary].title.as_deref(),
+        Some("Daily Digest")
+    );
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                &r.effect,
+                PersistedDriverEffect::CompleteRun {
+                    outcome: whisper_agent_protocol::BehaviorOutcome::Completed,
+                    behavior_id: Some(behavior_id),
+                } if behavior_id == "digest"
+            )),
+        "the journal explains which behavior consumed the declaration"
+    );
+}
+
+/// Death stays mechanical: a behavior-spawned scripted primary that
+/// fails records `Failed` through the terminal-hook backstop — no
+/// declaration can arrive from a weave whose only work just died.
+#[tokio::test]
+async fn behavior_scripted_death_backstop_records_failed() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    h.install_behavior(
+        "digest",
+        scripted_behavior_config("titled_chat", Default::default()),
+        "Summarize the day.",
+    );
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+
+    h.fail_model(&primary, "provider exploded", &mut pending_io);
+    // The production loop pairs every io completion with a step
+    // (scheduler main loop); the terminal hook lives in the step
+    // epilogue, so mirror the pairing here.
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert_eq!(h.behavior_state("digest").run_count, 1);
+    assert!(
+        matches!(
+            h.behavior_state("digest").last_outcome,
+            Some(whisper_agent_protocol::BehaviorOutcome::Failed { .. })
+        ),
+        "mechanical death recorded through the backstop"
+    );
+    assert!(
+        !h.sched.behavior_has_inflight_run(TEST_POD, "digest"),
+        "a recorded death opens the overlap gate"
+    );
+}
+
+/// The declaration consumes a queued `QueueOne` payload exactly like
+/// the mechanical hook does — the shared recorder owns the release.
+#[tokio::test]
+async fn declaration_releases_a_queued_payload() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    h.install_behavior(
+        "digest",
+        scripted_behavior_config("titled_chat", Default::default()),
+        "Summarize the day.",
+    );
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    h.respond_model(&primary, vec![text_block("Done.")], &mut pending_io);
+    let weave_id = h.weave_of(&primary);
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| {
+            r.relationship
+                .as_ref()
+                .is_some_and(|rel| rel.kind == "title")
+        })
+        .expect("title thread")
+        .thread_id
+        .clone();
+    // A fire arrived while the run was in flight and parked its payload.
+    h.sched
+        .pods
+        .get_mut(TEST_POD)
+        .unwrap()
+        .behaviors
+        .get_mut("digest")
+        .unwrap()
+        .state
+        .queued_payload = Some(serde_json::json!({"again": true}));
+
+    h.respond_model(&title_thread, vec![text_block("Digest.")], &mut pending_io);
+    assert_eq!(h.behavior_state("digest").run_count, 1);
+    assert!(
+        h.behavior_state("digest").queued_payload.is_none(),
+        "the declaration released the queued payload"
+    );
+}
+
+/// A behavior whose model knob names a backend outside its own
+/// fire-time `[scope]` refuses at the fire — the knob analogue of the
+/// bindings narrowing `base_scope_override` already enforces.
+#[tokio::test]
+async fn behavior_fire_refuses_out_of_scope_model_knob() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut config = scripted_behavior_config(
+        "titled_chat",
+        [(
+            "title.model".to_string(),
+            serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    config.scope = whisper_agent_protocol::BehaviorScope {
+        backends: Some(vec!["anthropic".into()]),
+        ..Default::default()
+    };
+    h.install_behavior("digest", config, "Summarize the day.");
+    let mut pending_io = FuturesUnordered::new();
+    let err = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect_err("out-of-scope knob must refuse the fire");
+    assert!(
+        err.contains("fire-time scope.backends"),
+        "refusal names the fire scope: {err}"
+    );
+}
+
+/// Retention treats a behavior-spawned scripted weave as one unit: the
+/// origin rides only the primary, but the sweep takes every referenced
+/// thread once all are terminal and past the window, and the emptied
+/// weave retires with them.
+#[tokio::test]
+async fn retention_sweeps_a_behavior_spawned_weave_as_a_unit() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut config = scripted_behavior_config("titled_chat", Default::default());
+    config.on_completion = whisper_agent_protocol::RetentionPolicy::DeleteAfterDays { days: 1 };
+    h.install_behavior("digest", config, "Summarize the day.");
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    h.respond_model(&primary, vec![text_block("Done.")], &mut pending_io);
+    let weave_id = h.weave_of(&primary);
+    let members: Vec<String> = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .map(|r| r.thread_id.clone())
+        .collect();
+    assert_eq!(members.len(), 2, "primary + title thread");
+    let title_thread = members
+        .iter()
+        .find(|id| *id != &primary)
+        .expect("title thread")
+        .clone();
+    h.respond_model(&title_thread, vec![text_block("Digest.")], &mut pending_io);
+
+    let stale = chrono::Utc::now() - chrono::Duration::days(2);
+    for id in &members {
+        h.sched.tasks.get_mut(id).unwrap().last_active = stale;
+    }
+    h.sched.retention_sweep();
+    for id in &members {
+        assert!(
+            !h.sched.tasks.contains_key(id),
+            "member `{id}` swept with the weave unit"
+        );
+    }
+    assert!(
+        !h.sched.weaves.contains_key(&weave_id),
+        "the emptied weave retired"
+    );
+}
+
+/// A weave-unit candidate defers whole while any member still works —
+/// the primary being terminal and stale is not enough to archive a
+/// weave whose title thread is mid-flight.
+#[tokio::test]
+async fn retention_defers_a_weave_unit_while_a_member_works() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut config = scripted_behavior_config("titled_chat", Default::default());
+    config.on_completion = whisper_agent_protocol::RetentionPolicy::DeleteAfterDays { days: 1 };
+    h.install_behavior("digest", config, "Summarize the day.");
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    h.respond_model(&primary, vec![text_block("Done.")], &mut pending_io);
+    let weave_id = h.weave_of(&primary);
+    // The title thread is still awaiting its model call.
+    let stale = chrono::Utc::now() - chrono::Duration::days(2);
+    let members: Vec<String> = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .map(|r| r.thread_id.clone())
+        .collect();
+    for id in &members {
+        h.sched.tasks.get_mut(id).unwrap().last_active = stale;
+    }
+    h.sched.retention_sweep();
+    for id in &members {
+        assert!(
+            h.sched.tasks.contains_key(id),
+            "no member swept while the title thread works"
+        );
+    }
+    assert!(h.sched.weaves.contains_key(&weave_id));
+}
+
+/// Weave-unit membership is resolved by reference, not ticker: an
+/// origin thread left dormant (the `advance_head`/`release_ticker`
+/// shape) still pulls its whole weave through retention instead of
+/// quietly demoting to a per-thread sweep and leaking the auxiliaries.
+#[tokio::test]
+async fn retention_sweeps_a_weave_whose_origin_thread_went_dormant() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut config = scripted_behavior_config("titled_chat", Default::default());
+    config.on_completion = whisper_agent_protocol::RetentionPolicy::DeleteAfterDays { days: 1 };
+    h.install_behavior("digest", config, "Summarize the day.");
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    h.respond_model(&primary, vec![text_block("Done.")], &mut pending_io);
+    let weave_id = h.weave_of(&primary);
+    let members: Vec<String> = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .map(|r| r.thread_id.clone())
+        .collect();
+    let title_thread = members
+        .iter()
+        .find(|id| *id != &primary)
+        .expect("title thread")
+        .clone();
+    h.respond_model(&title_thread, vec![text_block("Digest.")], &mut pending_io);
+
+    // The origin thread goes dormant — no ticker entry, still
+    // referenced by the weave.
+    h.sched.thread_ticker.remove(&primary);
+    let stale = chrono::Utc::now() - chrono::Duration::days(2);
+    for id in &members {
+        h.sched.tasks.get_mut(id).unwrap().last_active = stale;
+    }
+    h.sched.retention_sweep();
+    for id in &members {
+        assert!(
+            !h.sched.tasks.contains_key(id),
+            "member `{id}` swept despite the dormant origin thread"
+        );
+    }
+    assert!(!h.sched.weaves.contains_key(&weave_id));
+}
+
+/// A ref to a gone thread (crash between sweep and weave flush, or a
+/// thread dropped at load) must not leave an unsweepable zombie weave:
+/// the unit sweep prunes the dead ref, retires the emptied weave, and
+/// clears the stale ticker entry the load path can leave behind.
+#[tokio::test]
+async fn retention_prunes_gone_refs_and_retires_the_weave() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut config = scripted_behavior_config("titled_chat", Default::default());
+    config.on_completion = whisper_agent_protocol::RetentionPolicy::DeleteAfterDays { days: 1 };
+    h.install_behavior("digest", config, "Summarize the day.");
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .run_behavior(None, None, TEST_POD, "digest", None, &mut pending_io)
+        .expect("scripted behavior fire");
+    h.respond_model(&primary, vec![text_block("Done.")], &mut pending_io);
+    let weave_id = h.weave_of(&primary);
+    let title_thread = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| r.thread_id != primary)
+        .expect("title thread")
+        .thread_id
+        .clone();
+    h.respond_model(&title_thread, vec![text_block("Digest.")], &mut pending_io);
+
+    // The title thread vanishes out from under its ref; its ticker
+    // entry stays stale (the load-path shape).
+    h.sched.tasks.remove(&title_thread);
+    h.sched.tasks.get_mut(&primary).unwrap().last_active =
+        chrono::Utc::now() - chrono::Duration::days(2);
+    h.sched.retention_sweep();
+    assert!(!h.sched.tasks.contains_key(&primary));
+    assert!(
+        !h.sched.weaves.contains_key(&weave_id),
+        "gone ref pruned, emptied weave retired"
+    );
+    assert!(
+        !h.sched.thread_ticker.contains_key(&title_thread),
+        "stale ticker entry for the gone thread pruned"
+    );
 }

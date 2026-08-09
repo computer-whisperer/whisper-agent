@@ -211,8 +211,25 @@ pub enum CatchUp {
 /// the pod default sets `system_prompt` here — useful for e.g. a
 /// summarization behavior that should run as a summarizer, not the
 /// pod's default agent persona.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+// (`Eq` dropped for the `serde_json::Value` knob map, same as
+// `ThreadDriverConfig` in step 10.)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct BehaviorThreadOverride {
+    /// Scripted driver for the spawned thread's weave (step 11 slice
+    /// 2). `None` spawns the builtin single-agent chat as ever; a name
+    /// resolves against `<pod>/drivers/<name>.lua` at fire time, so a
+    /// cron or webhook fire can start a roundtable instead of a plain
+    /// thread. Validation is fire-time-only — each fire re-validates
+    /// the pair against the program as it exists then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Knob values for the scripted driver, keyed by knob id — the
+    /// same map the new-thread form submits, authored as a
+    /// `[thread.driver_config]` TOML table (`model` knobs are inline
+    /// `{backend, model}` tables). Meaningless without `driver`
+    /// (refused at parse time by `validate`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub driver_config: std::collections::BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Override for the spawned thread's per-request output cap (see
@@ -248,7 +265,13 @@ impl BehaviorThreadOverride {
     ) {
         let config = crate::ThreadConfigOverride {
             participants: None,
-            driver: None,
+            driver: self
+                .driver
+                .clone()
+                .map(|name| crate::ThreadDriverConfig::Scripted {
+                    name,
+                    config: self.driver_config.clone(),
+                }),
             participant_profiles: None,
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -413,7 +436,7 @@ impl Default for BehaviorState {
 
 /// Terminal outcome of the last behavior-spawned thread. Feeds into UI
 /// status badges ("last run: failed 20 min ago") and future retry logic.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BehaviorOutcome {
     Completed,
@@ -612,6 +635,8 @@ mod tests {
     #[test]
     fn behavior_thread_override_converts_to_create_thread_requests() {
         let ov = BehaviorThreadOverride {
+            driver: None,
+            driver_config: Default::default(),
             model: Some("sonnet-4-6".into()),
             max_tokens: Some(8192),
             max_turns: Some(20),
@@ -626,6 +651,7 @@ mod tests {
         };
         let (config, bindings) = ov.to_create_thread_requests();
         let config = config.expect("config override");
+        assert!(config.driver.is_none(), "no driver override without one");
         assert_eq!(config.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(config.max_tokens, Some(8192));
         assert_eq!(config.max_turns, Some(20));

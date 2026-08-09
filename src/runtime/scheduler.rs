@@ -3738,6 +3738,22 @@ impl Scheduler {
                             spec.id
                         ));
                     }
+                    // Fire-scope parity (step 11 slice 2): top-level
+                    // creations that supply a `base_scope_override`
+                    // (behavior fires) get the same early check the
+                    // dispatched path gets from its parent — bindings
+                    // already narrow against this scope below; model
+                    // knobs must too, or a behavior's out-of-scope
+                    // knob refuses only at the eventual derive.
+                    if dispatched_by_parent.is_none()
+                        && let Some(fire_scope) = base_scope_override.as_ref()
+                        && !fire_scope.backends.admits(&backend.to_string())
+                    {
+                        return Err(format!(
+                            "knob `{}`: backend `{backend}` not in the fire-time scope.backends",
+                            spec.id
+                        ));
+                    }
                 }
             }
             config.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
@@ -6054,6 +6070,72 @@ impl Scheduler {
         result
     }
 
+    /// Execute a `complete_run` effect: the driver declares its
+    /// triggered unit of work done (step 11 slice 2). When the weave
+    /// references a `BehaviorOrigin`-carrying thread (the
+    /// behavior-spawned primary), the declaration routes into behavior
+    /// bookkeeping — run_count, last_outcome, overlap-queue release —
+    /// through the same guarded recorder the builtin terminal hook
+    /// uses, so a declaration racing a mechanical death resolves
+    /// first-fact-wins. A weave with no origin journals the
+    /// declaration with `behavior_id: None` and moves nothing:
+    /// drivers declare unconditionally and stay origin-agnostic.
+    pub(super) fn weave_complete_run(
+        &mut self,
+        weave_id: &str,
+        outcome: crate::runtime::driver::lua::ScriptedRunOutcome,
+        message: Option<String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        let Some(weave) = self.weaves.get(weave_id) else {
+            return Err(format!("unknown weave `{weave_id}`"));
+        };
+        // The origin-carrying thread is the behavior-spawned primary;
+        // referenced threads are same-pod by construction, so the first
+        // origin found is the weave's.
+        let origin = weave.threads.iter().find_map(|r| {
+            let task = self.tasks.get(&r.thread_id)?;
+            let origin = task.origin.as_ref()?;
+            Some((
+                r.thread_id.clone(),
+                task.pod_id.clone(),
+                origin.behavior_id.clone(),
+            ))
+        });
+        let declared = match outcome {
+            crate::runtime::driver::lua::ScriptedRunOutcome::Completed => {
+                whisper_agent_protocol::BehaviorOutcome::Completed
+            }
+            crate::runtime::driver::lua::ScriptedRunOutcome::Failed => {
+                whisper_agent_protocol::BehaviorOutcome::Failed {
+                    message: message.unwrap_or_else(|| "driver declared the run failed".into()),
+                }
+            }
+        };
+        let effect = PersistedDriverEffect::CompleteRun {
+            outcome: declared.clone(),
+            behavior_id: origin
+                .as_ref()
+                .map(|(_, _, behavior_id)| behavior_id.clone()),
+        };
+        self.weaves
+            .get_mut(weave_id)
+            .expect("checked above")
+            .record_completed_effect(effect);
+        self.mark_weave_dirty(weave_id);
+        if let Some((thread_id, pod_id, behavior_id)) = origin {
+            self.record_behavior_run_outcome(
+                &pod_id,
+                &behavior_id,
+                &thread_id,
+                declared,
+                pending_io,
+            );
+        }
+        Ok(())
+    }
+
     /// Execute an `adopt_ticker` effect: take over driving a dormant
     /// thread's turns. Refused when any weave (including the caller)
     /// already ticks the thread — ticker transfer is an explicit
@@ -6336,6 +6418,11 @@ impl Scheduler {
         let now = chrono::Utc::now();
 
         let mut sweep: Vec<(String, String, RetentionAction)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        // (weave_id, thread_id) refs pointing at threads that no longer
+        // exist, discovered while sweeping a weave unit — pruned after
+        // the sweep so the emptied weave can retire.
+        let mut prune_refs: Vec<(String, String)> = Vec::new();
         for (thread_id, task) in &self.tasks {
             let Some(origin) = task.origin.as_ref() else {
                 continue; // interactive thread — never swept
@@ -6366,20 +6453,125 @@ impl Scheduler {
                 RetentionPolicy::ArchiveAfterDays { days }
                 | RetentionPolicy::DeleteAfterDays { days } => *days,
             };
-            let age = now.signed_duration_since(task.last_active);
-            if age < chrono::Duration::days(days as i64) {
-                continue;
-            }
             let action = match policy {
                 RetentionPolicy::ArchiveAfterDays { .. } => RetentionAction::Archive,
                 RetentionPolicy::DeleteAfterDays { .. } => RetentionAction::Delete,
                 RetentionPolicy::Keep => unreachable!(),
             };
-            sweep.push((thread_id.clone(), task.pod_id.clone(), action));
+            // Weave-unit retention (step 11 slice 2): the origin rides
+            // only the spawned primary, so a behavior-spawned scripted
+            // weave's auxiliaries (voices, title threads) would outlive
+            // every per-thread sweep and leak a headless weave per
+            // fire. When a scripted weave references the origin
+            // thread, the weave is the retention unit: every
+            // referenced thread must be terminal, the window is
+            // measured from the newest activity across members ("the
+            // weave has been idle N days"), and the action sweeps
+            // every member — each `sweep_thread` drops its refs, so
+            // the weave empties and retires with the last one. A
+            // member referenced by another weave is left unswept (its
+            // ref keeps this weave alive; unreachable for
+            // behavior-spawned drivers). Membership is resolved by
+            // REFERENCE, not ticker — a driver that rolled its head
+            // (`advance_head`) or released the origin thread leaves it
+            // dormant with no ticker entry, and keying on the ticker
+            // would quietly demote it to a per-thread sweep and
+            // reintroduce the leak. Refs to gone threads (crash
+            // between sweep and weave flush, threads dropped at load)
+            // are pruned after the sweep so the weave can empty and
+            // retire instead of lingering as an unsweepable zombie.
+            if let Some((weave_id, weave)) = self.weaves.iter().find(|(_, weave)| {
+                matches!(
+                    weave.driver,
+                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                ) && weave.threads.iter().any(|r| &r.thread_id == thread_id)
+            }) {
+                let mut newest = task.last_active;
+                let mut all_terminal = true;
+                for member_ref in &weave.threads {
+                    let Some(member) = self.tasks.get(&member_ref.thread_id) else {
+                        continue; // gone ref — pruned below if the unit sweeps
+                    };
+                    if !matches!(
+                        member.public_state(),
+                        ThreadStateLabel::Completed
+                            | ThreadStateLabel::Failed
+                            | ThreadStateLabel::Cancelled
+                    ) {
+                        all_terminal = false;
+                        break;
+                    }
+                    if member.last_active > newest {
+                        newest = member.last_active;
+                    }
+                }
+                if !all_terminal
+                    || now.signed_duration_since(newest) < chrono::Duration::days(days as i64)
+                {
+                    continue;
+                }
+                for member_ref in &weave.threads {
+                    if !self.tasks.contains_key(&member_ref.thread_id) {
+                        prune_refs.push((weave_id.clone(), member_ref.thread_id.clone()));
+                        continue;
+                    }
+                    let shared_elsewhere = self.weaves.iter().any(|(other_id, other)| {
+                        other_id != weave_id
+                            && other
+                                .threads
+                                .iter()
+                                .any(|r| r.thread_id == member_ref.thread_id)
+                    });
+                    if shared_elsewhere {
+                        continue;
+                    }
+                    if seen.insert(member_ref.thread_id.clone()) {
+                        sweep.push((member_ref.thread_id.clone(), task.pod_id.clone(), action));
+                    }
+                }
+                continue;
+            }
+            let age = now.signed_duration_since(task.last_active);
+            if age < chrono::Duration::days(days as i64) {
+                continue;
+            }
+            if seen.insert(thread_id.clone()) {
+                sweep.push((thread_id.clone(), task.pod_id.clone(), action));
+            }
         }
 
         for (thread_id, pod_id, action) in sweep {
             self.sweep_thread(&thread_id, &pod_id, action);
+        }
+        // Prune gone refs discovered above. Runs after the member
+        // sweeps: `sweep_thread` has already dropped the live refs, so
+        // removing the dead ones lets the weave empty and retire via
+        // the same teardown `sweep_thread` uses. A stale ticker entry
+        // for the gone thread (load rebuilds tickers from refs without
+        // pruning) goes with it.
+        for (weave_id, thread_id) in prune_refs {
+            if self
+                .thread_ticker
+                .get(&thread_id)
+                .is_some_and(|w| w == &weave_id)
+            {
+                self.thread_ticker.remove(&thread_id);
+            }
+            let Some(weave) = self.weaves.get_mut(&weave_id) else {
+                continue; // already retired by the last live member's sweep
+            };
+            if !weave.remove_reference(&thread_id) {
+                continue;
+            }
+            if weave.threads.is_empty() {
+                self.weaves.remove(&weave_id);
+                self.dirty_weaves.remove(&weave_id);
+                self.scripted_load_notices.remove(&weave_id);
+                self.router.drop_weave(&weave_id);
+            } else {
+                self.mark_weave_dirty(&weave_id);
+                self.notify_weave_subscribers(&weave_id);
+            }
         }
     }
 

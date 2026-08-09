@@ -198,6 +198,19 @@ pub enum PersistedDriverEffect {
     /// (step 11) — the record explains where a model-generated title
     /// came from after the fact.
     SetTitle { thread_id: String, title: String },
+    /// The driver declared its triggered unit of work done (step 11
+    /// slice 2). `outcome` is the fact as behavior bookkeeping records
+    /// it (a declared failure carries its message inside the variant);
+    /// `behavior_id` names the behavior the declaration was ROUTED to
+    /// — the recorder's idempotence guard may still discard it (an
+    /// already-recorded run) — and is `None` when the weave has no
+    /// behavior origin (declared to nobody; deliberately not an
+    /// error, so drivers stay origin-agnostic).
+    CompleteRun {
+        outcome: whisper_agent_protocol::BehaviorOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        behavior_id: Option<String>,
+    },
     /// Head-advance: a referenced thread this weave ticks was promoted to
     /// primary; the previous primary (if any) was demoted to a dormant
     /// auxiliary. This is the journaled `compaction`-roll primitive —

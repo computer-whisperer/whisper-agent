@@ -151,6 +151,13 @@ mod tests {
     #[test]
     fn override_translates_every_set_field() {
         let ov = BehaviorThreadOverride {
+            driver: Some("roundtable".into()),
+            driver_config: [(
+                "title.model".to_string(),
+                serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}),
+            )]
+            .into_iter()
+            .collect(),
             model: Some("sonnet-4-6".into()),
             max_tokens: Some(8192),
             max_turns: Some(20),
@@ -165,6 +172,14 @@ mod tests {
         };
         let (cfg, bindings) = ov.to_create_thread_requests();
         let cfg = cfg.expect("config_override populated");
+        assert!(
+            matches!(
+                cfg.driver,
+                Some(whisper_agent_protocol::ThreadDriverConfig::Scripted { ref name, ref config })
+                    if name == "roundtable" && config.contains_key("title.model")
+            ),
+            "driver + knob map translate into the Scripted override"
+        );
         assert_eq!(cfg.model.as_deref(), Some("sonnet-4-6"));
         assert_eq!(cfg.max_tokens, Some(8192));
         assert_eq!(cfg.max_turns, Some(20));

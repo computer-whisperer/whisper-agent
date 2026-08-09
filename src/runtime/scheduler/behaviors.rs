@@ -373,10 +373,14 @@ impl Scheduler {
 
     /// True when the behavior's `last_thread_id` refers to a thread
     /// that is currently present in memory AND in a non-terminal
-    /// state (`Idle`/`Working`). Used by the Skip and QueueOne
-    /// overlap paths. Returns false when the behavior has never
-    /// fired, when the last thread has been evicted, or when the
-    /// last thread reached Completed/Failed/Cancelled.
+    /// state (`Idle`/`Working`) — or, for a thread coordinated by a
+    /// scripted weave, while the run is undeclared (step 11 slice 2:
+    /// a scripted primary goes Completed at every `finish_cycle`
+    /// while the weave's work, and therefore the run, continues;
+    /// only the driver's `complete_run` or the death backstop closes
+    /// it). Used by the Skip and QueueOne overlap paths. Returns
+    /// false when the behavior has never fired, when the last thread
+    /// has been evicted, or when the run reached its recorded end.
     pub(super) fn behavior_has_inflight_run(&self, pod_id: &str, behavior_id: &str) -> bool {
         let Some(pod) = self.pods.get(pod_id) else {
             return false;
@@ -390,10 +394,28 @@ impl Scheduler {
         let Some(task) = self.tasks.get(thread_id) else {
             return false;
         };
-        !matches!(
+        if !matches!(
             task.public_state(),
             ThreadStateLabel::Completed | ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
-        )
+        ) {
+            return true;
+        }
+        // Terminal thread, scripted coordinator, no recorded outcome:
+        // the run is in flight until declared. Keyed on the ticker so
+        // a weave that died or released the thread — no coordinator,
+        // so no declaration can arrive — falls back to the
+        // terminal-state answer above and the gate opens.
+        behavior.state.last_outcome.is_none()
+            && self
+                .thread_ticker
+                .get(thread_id)
+                .and_then(|weave_id| self.weaves.get(weave_id))
+                .is_some_and(|weave| {
+                    matches!(
+                        weave.driver,
+                        whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                    )
+                })
     }
 
     /// One-time pass at scheduler startup: apply each cron behavior's
@@ -577,10 +599,60 @@ impl Scheduler {
             _ => return,
         };
         let pod_id = task.pod_id.clone();
-        let Some(pod) = self.pods.get_mut(&pod_id) else {
+        // Driver-declared run-done (step 11 slice 2): when a scripted
+        // weave ticks this thread, its Completed is NOT the run
+        // finishing — a scripted primary goes Completed at every
+        // finish_cycle while the weave's actual work (a title thread
+        // in flight, later phases) may continue. Defer to the
+        // driver's `complete_run` declaration. Death stays mechanical:
+        // Failed/Cancelled record here as the backstop, and the
+        // recorder's idempotence guard arbitrates declaration-vs-death
+        // races first-fact-wins. A dormant origin thread (no ticker —
+        // the weave released it or died) falls through to mechanical
+        // recording: with no coordinator left, no declaration can
+        // arrive.
+        if matches!(outcome, whisper_agent_protocol::BehaviorOutcome::Completed)
+            && self
+                .thread_ticker
+                .get(thread_id)
+                .and_then(|weave_id| self.weaves.get(weave_id))
+                .is_some_and(|weave| {
+                    matches!(
+                        weave.driver,
+                        whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                    )
+                })
+        {
+            return;
+        }
+        self.record_behavior_run_outcome(
+            &pod_id,
+            &origin.behavior_id,
+            thread_id,
+            outcome,
+            pending_io,
+        );
+    }
+
+    /// Record a finished run on a behavior's durable state: outcome +
+    /// run_count, broadcast, and queued-payload re-fire. Shared by the
+    /// mechanical terminal hook above (builtin-driven spawns, death
+    /// backstop) and the `complete_run` effect executor
+    /// (driver-declared run-done on scripted weaves). The idempotence
+    /// guard makes the first recorded fact win — a declaration racing
+    /// a mechanical death cannot double-count or overwrite.
+    pub(super) fn record_behavior_run_outcome(
+        &mut self,
+        pod_id: &str,
+        behavior_id: &str,
+        thread_id: &str,
+        outcome: whisper_agent_protocol::BehaviorOutcome,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let Some(pod) = self.pods.get_mut(pod_id) else {
             return;
         };
-        let Some(behavior) = pod.behaviors.get_mut(&origin.behavior_id) else {
+        let Some(behavior) = pod.behaviors.get_mut(behavior_id) else {
             return;
         };
         // Idempotence: if we already recorded this thread's outcome,
@@ -604,13 +676,13 @@ impl Scheduler {
         // Persist via the dirty set: `flush_dirty` runs once per
         // scheduler-loop iteration and writes each dirty behavior
         // exactly once, so rapid terminals can't race on disk.
-        self.mark_behavior_dirty(&pod_id, &origin.behavior_id);
+        self.mark_behavior_dirty(pod_id, behavior_id);
 
         // Broadcast so every connected client sees the last-run update.
         self.router
             .broadcast_task_list(ServerToClient::BehaviorStateChanged {
-                pod_id: pod_id.clone(),
-                behavior_id: origin.behavior_id.clone(),
+                pod_id: pod_id.to_string(),
+                behavior_id: behavior_id.to_string(),
                 state: snapshot_state,
             });
 
@@ -622,16 +694,16 @@ impl Scheduler {
         // paused: pause means "no automatic fires", and the queued
         // payload was itself an automatic arrival.
         if let Some(payload) = queued {
-            if self.behavior_auto_paused(&pod_id, &origin.behavior_id) {
+            if self.behavior_auto_paused(pod_id, behavior_id) {
                 tracing::debug!(
                     pod_id = %pod_id,
-                    behavior_id = %origin.behavior_id,
+                    behavior_id = %behavior_id,
                     "dropping queued QueueOne payload: behavior/pod paused"
                 );
             } else {
                 self.register_and_launch_behavior_fire(
-                    &pod_id,
-                    &origin.behavior_id,
+                    pod_id,
+                    behavior_id,
                     payload,
                     crate::functions::TriggerSource::QueuedReplay,
                     pending_io,
