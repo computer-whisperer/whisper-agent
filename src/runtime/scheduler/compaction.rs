@@ -1,43 +1,26 @@
 //! Compaction — appending a summarize-yourself prompt to an overlong
 //! thread, then rolling the weave's head onto a fresh continuation
-//! thread seeded with the extracted summary.
+//! thread seeded with the extracted summary. Prompt mechanics follow
+//! the Claude Code pattern in `docs/research/compaction_claude_code.md`.
 //!
-//! Weave-native since migration step 8 (prompt mechanics still follow
-//! the Claude Code pattern in `docs/research/compaction_claude_code.md`):
-//!
-//!   1. Client sends `CompactThread { thread_id }` (or the auto-trigger
-//!      fires with a `CallerLink::Weave` caller). Admission requires the
-//!      thread to be its ticking weave's current primary.
-//!   2. [`Scheduler::launch_compact_thread`] stamps the weave's builtin
-//!      driver state (`compacting = Some(thread_id)`) and appends the
-//!      thread's configured compaction prompt as a final user message.
-//!   3. The normal step loop runs the model turn.
-//!   4. When the builtin driver finishes the cycle,
-//!      [`Scheduler::finalize_builtin_compaction`] fires from the
-//!      boundary path: it parses the `<summary>` out of the assistant's
-//!      response, derives a continuation thread into the same weave
-//!      (journaled `derive_thread` with a `{kind: "compaction"}`
-//!      relationship edge), and advances the head (journaled
-//!      `advance_head`) so the continuation becomes the primary.
-//!   5. The old thread is left `Completed` in-place as a dormant
-//!      auxiliary — drill-down history, no longer ticked. Fork is the
-//!      deliberate revive.
-//!
-//! The `compacting` marker lives on the weave's persisted driver state.
-//! A compaction does NOT survive restart: the persister heals every
-//! in-flight thread to `Failed`, so `Scheduler::load_state` clears any
-//! set marker (with a warning) rather than letting it wedge admission
-//! or mis-trigger the finalize against a later ordinary turn. (The
-//! pre-step-8 `InFlightOps::COMPACTING` bit claimed restart-resume in
-//! its docs; that claim was false for the same heal-to-Failed reason.)
+//! Since step 11 slice 6 the flow is entirely DRIVER-composED: the
+//! scheduler's half is admission + resolution (this module — the
+//! shared admission for manual and driver-requested compaction, the
+//! prompt/regex/template resolution that rides `compaction_ready`,
+//! and the inheritance helpers `derive_thread`'s granular `_from`
+//! directives copy with), while the driver appends the prompt, runs
+//! the summary turn, extracts with `regex_capture`, derives the
+//! continuation, and advances the head. The old head is left
+//! `Completed` in-place as a dormant auxiliary — drill-down history,
+//! no longer ticked; fork is the deliberate revive. A compaction does
+//! NOT survive restart: the persister heals the in-flight summary
+//! turn to `Failed`, and the driver clears its own marker on the
+//! `thread_failed` load notice (titled_chat's contract, pinned by the
+//! slice-5 harness tests).
 
-use futures::stream::FuturesUnordered;
-use regex::Regex;
-use tracing::{debug, warn};
 use whisper_agent_protocol::{ContentBlock, Role, ThreadConfigOverride};
 
 use super::Scheduler;
-use crate::runtime::io_dispatch::SchedulerFuture;
 
 /// Built-in fallback prompt when a thread's `CompactionConfig.prompt_file`
 /// is empty. Stripped-down version of the Claude Code compaction prompt
@@ -58,406 +41,7 @@ Produce a compact summary of this conversation that preserves every detail neede
 
 Do not preface your response. Do not call tools. End after the closing </summary> tag.";
 
-/// Execution body for `Function::CompactThread`. Called by the Function
-/// registry's `launch_function` after the synchronous precondition
-/// check has already verified `compaction.enabled`, idle state, the
-/// thread being its weave's current primary, and no compaction already
-/// running on the weave.
-///
-/// Resolves the thread's compaction prompt, stamps the weave's builtin
-/// driver state with the compacting marker, and appends the prompt as a
-/// user message — the same path as `SendUserMessage`, reusing its state
-/// transitions and broadcasts. The Function stays in `active_functions`
-/// until [`Scheduler::finalize_builtin_compaction`] fires
-/// `complete_function` when the builtin driver finishes the cycle.
 impl Scheduler {
-    pub(super) fn launch_compact_thread(
-        &mut self,
-        thread_id: &str,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let Some(task) = self.tasks.get(thread_id) else {
-            // Precondition already checked existence; defensive.
-            return;
-        };
-        let pod_id = task.pod_id.clone();
-        let prompt_file = task.config.compaction.prompt_file.clone();
-        let prompt_text = match self.resolve_compaction_prompt(&pod_id, &prompt_file) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(%thread_id, error = %e, "compact launch: prompt resolution failed");
-                // Without the prompt the Function can't proceed. Treat
-                // as an execution error and complete immediately.
-                if let Some(id) = self.find_compact_function_for(thread_id) {
-                    self.complete_function(
-                        id,
-                        crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
-                            kind: crate::functions::FunctionErrorKind::BadInput,
-                            detail: format!("compaction prompt resolution failed: {e}"),
-                        }),
-                        pending_io,
-                    );
-                }
-                return;
-            }
-        };
-
-        // Stamp the marker first so the finalize hook can see it when
-        // the builtin driver finishes the cycle below.
-        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
-            // Admission verified a ticking weave exists; defensive.
-            warn!(%thread_id, "compact launch: thread has no ticking weave");
-            return;
-        };
-        if let Some(weave) = self.weaves.get_mut(&weave_id) {
-            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                compacting, ..
-            } = &mut weave.driver_state
-            {
-                *compacting = Some(thread_id.to_string());
-            }
-            self.mark_weave_dirty(&weave_id);
-        }
-        // Reuse send_user_message so title/state broadcasts and dirty
-        // tracking run the same as any user follow-up.
-        self.send_user_message(thread_id, prompt_text, Vec::new(), pending_io);
-        self.step_until_blocked(thread_id, pending_io);
-    }
-
-    /// Failure cleanup, called from `step_until_blocked` next to the
-    /// other terminal hooks. A summary turn that died (provider error,
-    /// tool failure) must not leave the weave's compacting marker set:
-    /// the weave would refuse future compactions until an unrelated
-    /// Completed turn tripped the finalize against an ordinary
-    /// response. Clears the marker and completes the CompactThread
-    /// Function as an execution error. No-op unless the thread is
-    /// Failed and marked. (Cancellation is handled in
-    /// `weave_cancelled` / `execute_cancel_thread`.)
-    pub(super) fn abort_builtin_compaction_if_failed(
-        &mut self,
-        thread_id: &str,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let failed = self.tasks.get(thread_id).is_some_and(|task| {
-            matches!(
-                task.public_state(),
-                whisper_agent_protocol::ThreadStateLabel::Failed
-            )
-        });
-        if !failed {
-            return;
-        }
-        let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
-            return;
-        };
-        let Some(weave) = self.weaves.get_mut(&weave_id) else {
-            return;
-        };
-        let crate::runtime::driver::DriverState::BuiltinSingleAgentChat { compacting, .. } =
-            &mut weave.driver_state
-        else {
-            return;
-        };
-        if compacting.as_deref() != Some(thread_id) {
-            return;
-        }
-        *compacting = None;
-        self.mark_weave_dirty(&weave_id);
-        warn!(%thread_id, "compaction summary turn failed — marker cleared");
-        if let Some(id) = self.find_compact_function_for(thread_id) {
-            self.complete_function(
-                id,
-                crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
-                    kind: crate::functions::FunctionErrorKind::Execution,
-                    detail: "summary turn failed before completing".into(),
-                }),
-                pending_io,
-            );
-        }
-    }
-
-    /// Auto-trigger hook. Checks whether the given thread has crossed
-    /// its compaction `token_threshold` and, if so, registers a
-    /// `Function::CompactThread` with a `CallerLink::Weave` caller —
-    /// the weave noticing its primary outgrew its context is the true
-    /// originator.
-    ///
-    /// No-ops when:
-    ///   - the thread has no threshold configured,
-    ///   - the thread is not its ticking weave's current primary (a
-    ///     compacted-away head is a dormant auxiliary and never
-    ///     re-triggers; the promoted continuation triggers its own
-    ///     compaction when it crosses the threshold), or
-    ///   - `register_function` rejects (already compacting, not idle —
-    ///     the precondition checks inside the Function registry cover
-    ///     the same conditions).
-    ///
-    /// Fires from `step_until_blocked` after the boundary path has
-    /// finalized any completed compaction, so a freshly demoted head is
-    /// already non-primary when this runs.
-    pub(super) fn maybe_auto_compact(
-        &mut self,
-        thread_id: &str,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let task = match self.tasks.get(thread_id) {
-            Some(t) => t,
-            None => return,
-        };
-        let Some(threshold) = task.config.compaction.token_threshold else {
-            return;
-        };
-        // Scripted-driven threads own their lifecycle; the builtin
-        // flow's summary-prompt input would re-enter the driver
-        // mid-activation. They get the `advance_head` primitive
-        // instead; a compaction driver event waits until a real driver
-        // needs one.
-        if self.has_scripted_ticker(thread_id) {
-            return;
-        }
-        if task.total_usage.input_tokens <= threshold {
-            return;
-        }
-        // Only the weave's current primary compacts. Replaces the old
-        // O(tasks) `continued_from` scan: a head that was compacted
-        // away is no longer primary.
-        let is_primary = self
-            .thread_ticker
-            .get(thread_id)
-            .and_then(|weave_id| self.weaves.get(weave_id))
-            .is_some_and(|weave| weave.primary_thread_id() == Some(thread_id));
-        if !is_primary {
-            return;
-        }
-        debug!(
-            %thread_id,
-            input_tokens = task.total_usage.input_tokens,
-            threshold,
-            "auto-compaction threshold crossed — triggering"
-        );
-        let spec = crate::functions::Function::CompactThread {
-            thread_id: thread_id.to_string(),
-        };
-
-        let caller = crate::functions::CallerLink::Weave {
-            weave_id: self
-                .thread_ticker
-                .get(thread_id)
-                .cloned()
-                .expect("primary check above requires a ticking weave"),
-        };
-        match self.register_function(spec, caller) {
-            Ok(fn_id) => self.launch_function(fn_id, pending_io),
-            Err(e) => {
-                // All reject reasons here are benign — the state
-                // machine caught up and the compaction is either
-                // already running, not admissible, or disabled. Log
-                // at debug rather than warn since auto-compact is
-                // inherently racy with other turn activity.
-                debug!(%thread_id, error = ?e, "auto-compaction skipped");
-            }
-        }
-    }
-
-    /// Hook called from the builtin boundary path when the driver
-    /// finishes a cycle on `thread_id`. When the weave's builtin driver
-    /// state carries a compacting marker for this thread and the thread
-    /// has reached `Completed`, parse the `<summary>` from its most
-    /// recent assistant message, derive a continuation thread into the
-    /// same weave (journaled `derive_thread` with a
-    /// `{kind: "compaction"}` edge), advance the head (journaled
-    /// `advance_head` — the old head becomes a dormant auxiliary), and
-    /// seed the continuation.
-    ///
-    /// No-op when no compaction is marked for this thread. Safe to call
-    /// after every builtin cycle finish.
-    pub(super) fn finalize_builtin_compaction(
-        &mut self,
-        weave_id: &str,
-        thread_id: &str,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let marked = self.weaves.get(weave_id).is_some_and(|weave| {
-            matches!(
-                &weave.driver_state,
-                crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                    compacting: Some(t),
-                    ..
-                } if t == thread_id
-            )
-        });
-        if !marked {
-            return;
-        }
-        let task = match self.tasks.get(thread_id) {
-            Some(t) => t,
-            None => return,
-        };
-        if !matches!(
-            task.public_state(),
-            whisper_agent_protocol::ThreadStateLabel::Completed
-        ) {
-            return;
-        }
-
-        // Look for the trailing assistant message; it carries the
-        // summary. If the turn failed (Failed state isn't Completed
-        // anyway, so we don't reach here for that) or the model
-        // declined to emit the block, we clear the compacting flag
-        // and bail without spawning a continuation.
-        let assistant_text = extract_last_assistant_text(task);
-        let regex_src = task.config.compaction.summary_regex.clone();
-        let continuation_template = task.config.compaction.continuation_template.clone();
-        let old_bindings = task.bindings.clone();
-        let old_config = task.config.clone();
-        let old_origin = task.origin.clone();
-        // Snapshot the parent's setup prefix (Role::System prompt +
-        // Role::Tools manifest) so the continuation can inherit it
-        // verbatim. Matches fork semantics — a compaction continuation
-        // is conceptually "more of the same thread" and should run
-        // under the same system prompt the parent was running under,
-        // not whatever the pod's current `system_prompt.md` happens to
-        // hold. Critical for behavior-origin threads whose parent was
-        // created with a behavior-specific setup — re-reading the pod
-        // default would silently swap personalities at the compaction
-        // boundary.
-        let parent_setup = setup_prefix_snapshot(task);
-
-        // Always clear the marker so a failed parse doesn't re-trigger
-        // the finalize on every subsequent cycle finish.
-        if let Some(weave) = self.weaves.get_mut(weave_id) {
-            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                compacting, ..
-            } = &mut weave.driver_state
-            {
-                *compacting = None;
-            }
-            self.mark_weave_dirty(weave_id);
-        }
-
-        // Locate the in-flight CompactThread Function so we can emit
-        // its terminal. There should always be exactly one when the
-        // compacting flag is set — the flag is a 1:1 mirror of the
-        // registered Function today.
-        let compact_fn_id = self.find_compact_function_for(thread_id);
-
-        let Some(summary_text) = extract_summary(&regex_src, &assistant_text) else {
-            warn!(
-                %thread_id,
-                "compaction finalize: failed to extract <summary> from assistant response — \
-                 leaving thread Completed without spawning continuation"
-            );
-            if let Some(id) = compact_fn_id {
-                self.complete_function(
-                    id,
-                    crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
-                        kind: crate::functions::FunctionErrorKind::Execution,
-                        detail: "summary extraction failed".into(),
-                    }),
-                    pending_io,
-                );
-            }
-            return;
-        };
-
-        // Derive the continuation into the same weave. Routing through
-        // `weave_derive_thread` journals the `derive_thread` record with
-        // the `compaction` relationship edge (the durable lineage that
-        // replaced `Thread.continued_from`), re-resolves bindings, and
-        // fires the usual `ThreadCreated` broadcast. Base scope comes
-        // from the current primary — a narrowed parent doesn't widen at
-        // the compaction boundary.
-        let config_override = Some(inherited_config_override(&old_config));
-        let bindings_request = Some(inherited_bindings_request(&old_bindings));
-        let relationship = crate::runtime::driver::ThreadRelationship {
-            kind: "compaction".to_string(),
-            source: Some(crate::runtime::driver::EntryRef {
-                thread_id: thread_id.to_string(),
-                entry_index: None,
-            }),
-        };
-        let new_thread_id = match self.weave_derive_thread(
-            weave_id,
-            config_override,
-            bindings_request,
-            Vec::new(),
-            relationship,
-            old_origin,
-            pending_io,
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(
-                    %thread_id, error = %e,
-                    "compaction finalize: deriving continuation failed"
-                );
-                if let Some(id) = compact_fn_id {
-                    self.complete_function(
-                        id,
-                        crate::functions::FunctionOutcome::Error(crate::functions::FunctionError {
-                            kind: crate::functions::FunctionErrorKind::Execution,
-                            detail: format!("continuation derive failed: {e}"),
-                        }),
-                        pending_io,
-                    );
-                }
-                return;
-            }
-        };
-
-        self.apply_setup_snapshot(
-            &new_thread_id,
-            parent_setup,
-            &old_config.participant_profiles,
-        );
-
-        // Advance the head: the continuation becomes the weave's
-        // primary; the old head is demoted to a dormant auxiliary
-        // (frozen history, drill-down guaranteed). Journals the
-        // `advance_head` record, pushes fresh weave snapshots to
-        // subscribers, and broadcasts a decorated thread list so
-        // client-side weave tags stay coherent.
-        if let Err(e) = self.weave_advance_head(weave_id, &new_thread_id) {
-            // Admission can't reasonably fail here (the continuation
-            // was just derived into this weave, ticked), but if it
-            // does, surface it rather than silently leaving two live
-            // threads.
-            warn!(
-                %weave_id, %new_thread_id, error = %e,
-                "compaction finalize: advance_head refused"
-            );
-        }
-
-        // Seed the continuation with the filled-in template. This
-        // kicks the thread's first model call.
-        let seed_text = render_continuation_template(&continuation_template, &summary_text);
-        self.send_user_message(&new_thread_id, seed_text, Vec::new(), pending_io);
-        self.step_until_blocked(&new_thread_id, pending_io);
-
-        // Emit the CompactThread Function's success terminal. The
-        // client's visible UX already happened via the weave snapshot
-        // push and thread-list broadcast inside `weave_advance_head`;
-        // this is the registry-bookkeeping side of completion.
-        if let Some(id) = compact_fn_id {
-            self.complete_function(
-                id,
-                crate::functions::FunctionOutcome::Success(
-                    crate::functions::FunctionTerminal::CompactThread(
-                        crate::functions::CompactThreadTerminal {
-                            continuation_thread_id: new_thread_id.clone(),
-                        },
-                    ),
-                ),
-                pending_io,
-            );
-        }
-
-        debug!(
-            old = %thread_id, new = %new_thread_id, summary_bytes = summary_text.len(),
-            "compaction finalize: spawned continuation"
-        );
-    }
-
     /// Overwrite a freshly derived thread's setup prefix (seeded by
     /// `seed_thread_setup` inside `create_task` from current pod
     /// state) with a source thread's snapshot. Copying verbatim keeps
@@ -465,9 +49,9 @@ impl Scheduler {
     /// to what the source was running under — behaviors,
     /// custom-prompted threads, and mid-life pod edits all settle out
     /// the same way (the derive inherits, pod drift doesn't leak
-    /// across the boundary). Shared by the builtin compaction finalize
-    /// and the scripted `derive_thread { setup_from }` directive
-    /// (step 11 slice 5).
+    /// across the boundary) — the `derive_thread { setup_from }`
+    /// directive's copy machinery (step 11 slice 5; extracted from the
+    /// retired builtin finalize).
     ///
     /// `source_profiles` is the source thread's resolved profile map,
     /// used to realign participants other than the default responder;
@@ -620,12 +204,11 @@ pub(super) struct ResolvedCompaction {
 
 /// Config-side inheritance snapshot — the continuation carries the
 /// source thread's coordination topology and generation knobs
-/// verbatim. Shared by the builtin compaction finalize and the
-/// scripted `derive_thread { config_from }` directive (step 11 slice
-/// 5). `compaction`/`autoquery` deliberately stay `None`: the derived
-/// thread re-inherits the pod's defaults for those (the builtin's
-/// documented choice — per-thread overrides do not outlive the head
-/// they were set on).
+/// verbatim — the `derive_thread { config_from }` directive's copy
+/// machinery (step 11 slice 5; extracted from the retired builtin
+/// finalize). `compaction`/`autoquery` deliberately stay `None`: the
+/// derived thread re-inherits the pod's defaults for those
+/// (per-thread overrides do not outlive the head they were set on).
 pub(super) fn inherited_config_override(
     old_config: &whisper_agent_protocol::ThreadConfig,
 ) -> ThreadConfigOverride {
@@ -683,8 +266,8 @@ pub(super) fn inherited_config_override(
 /// entry still resolves, workspace_root pins included. `Inline`
 /// variants aren't addressable by name; drop those and inherit the pod
 /// default for that slot (rare: `Inline` only exists on the reserved
-/// subagent path). Shared by the builtin compaction finalize and the
-/// scripted `derive_thread { bindings_from }` directive.
+/// subagent path). The `derive_thread { bindings_from }` directive's
+/// copy machinery (extracted from the retired builtin finalize).
 pub(super) fn inherited_bindings_request(
     old_bindings: &whisper_agent_protocol::ThreadBindings,
 ) -> whisper_agent_protocol::ThreadBindingsRequest {
@@ -740,85 +323,4 @@ pub(super) fn extract_last_assistant_text(task: &crate::runtime::thread::Thread)
         }
     }
     String::new()
-}
-
-/// Pull the summary body out of the assistant's response. Compile-time
-/// regex would be cheaper, but the regex source lives in config so the
-/// user can tweak the parse without a code change; the per-compaction
-/// compile cost is negligible against the model turn itself.
-fn extract_summary(regex_src: &str, text: &str) -> Option<String> {
-    let re = Regex::new(regex_src).ok()?;
-    re.captures(text)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-}
-
-/// Substitute `{{summary}}` in the template with the extracted body.
-/// Deliberately minimal — matches the `{{payload}}` substitution
-/// behaviors use for webhook-triggered behaviors.
-fn render_continuation_template(template: &str, summary: &str) -> String {
-    if !template.contains("{{summary}}") {
-        return template.to_string();
-    }
-    template.replace("{{summary}}", summary)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_summary_from_tagged_text() {
-        let regex_src = r"(?s)<summary>\s*(.*?)\s*</summary>";
-        let text = "prose\n<summary>\nthe body\n</summary>\nafter";
-        assert_eq!(
-            extract_summary(regex_src, text).as_deref(),
-            Some("the body")
-        );
-    }
-
-    #[test]
-    fn returns_none_when_tag_missing() {
-        let regex_src = r"(?s)<summary>\s*(.*?)\s*</summary>";
-        assert!(extract_summary(regex_src, "nothing to see").is_none());
-    }
-
-    /// Regression: when the model verbatim-quotes a prior tool result
-    /// (e.g., a dispatched-thread notification) that itself contains a
-    /// `<summary>...</summary>` pair, the default extraction regex must
-    /// capture the OUTER block, not stop at the inner closing tag.
-    /// Triggered on a real gpt-5.5 thread on 2026-05-03 (k8s mavis pod):
-    /// a 45kB summary was truncated to ~19kB at the inner `</summary>`.
-    #[test]
-    fn extracts_outer_summary_when_body_contains_nested_tag() {
-        let regex_src = whisper_agent_protocol::CompactionConfig::default().summary_regex;
-        let text = "<summary>\noutside head\n\
-                    <dispatched-thread-notification><summary>nested</summary></dispatched-thread-notification>\n\
-                    outside tail\n</summary>";
-        let got = extract_summary(&regex_src, text).expect("regex should match outer block");
-        assert!(got.contains("outside head"), "got: {got}");
-        assert!(got.contains("outside tail"), "got: {got}");
-        assert!(got.contains("<summary>nested</summary>"), "got: {got}");
-    }
-
-    /// The default regex anchors to end-of-input (`\s*\z`), tolerating
-    /// trailing whitespace but rejecting trailing prose. The compaction
-    /// prompt instructs the model to end after the closing tag.
-    #[test]
-    fn default_regex_tolerates_trailing_whitespace() {
-        let regex_src = whisper_agent_protocol::CompactionConfig::default().summary_regex;
-        let text = "<summary>\nbody\n</summary>\n  \n";
-        assert_eq!(extract_summary(&regex_src, text).as_deref(), Some("body"));
-    }
-
-    #[test]
-    fn template_substitutes_summary() {
-        let out = render_continuation_template("prefix\n{{summary}}\nsuffix", "THE BODY");
-        assert_eq!(out, "prefix\nTHE BODY\nsuffix");
-    }
-
-    #[test]
-    fn template_without_placeholder_returns_as_is() {
-        let out = render_continuation_template("no placeholder", "ignored");
-        assert_eq!(out, "no placeholder");
-    }
 }

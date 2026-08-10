@@ -200,64 +200,29 @@ impl Scheduler {
                 thread_id,
                 correlation_id,
             } => {
-                // Scripted-ticked threads own their compaction
-                // lifecycle (step 11 slice 5): deliver the resolved
-                // config to the weave's driver as a `compaction_ready`
-                // event instead of registering the builtin Function.
-                // No positive ack message exists — the visible UX is
-                // the driver appending the summary prompt and running
-                // the turn, which thread subscribers stream as usual.
-                let scripted_weave = self
-                    .thread_ticker
-                    .get(&thread_id)
-                    .filter(|weave_id| {
-                        self.weaves.get(*weave_id).is_some_and(|weave| {
-                            matches!(
-                                weave.driver,
-                                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-                            )
-                        })
-                    })
-                    .cloned();
-                if let Some(weave_id) = scripted_weave {
-                    if let Err(message) =
+                // Compaction is driver-composed (step 11 slices 5-6):
+                // the request routes to the ticking weave's driver as a
+                // `compaction_ready` event. Refusals bounce as a
+                // correlated Error; success sends no positive ack —
+                // the visible UX is the driver appending the summary
+                // prompt and running the turn, which thread
+                // subscribers stream as usual.
+                let result = match self.thread_ticker.get(&thread_id).cloned() {
+                    Some(weave_id) => {
                         self.deliver_manual_compaction(&weave_id, &thread_id, pending_io)
-                    {
-                        warn!(conn_id, %thread_id, %message, "compact_thread (scripted) refused");
-                        self.router.send_to_client(
-                            conn_id,
-                            ServerToClient::Error {
-                                correlation_id,
-                                thread_id: Some(thread_id),
-                                message: format!("compact_thread: {message}"),
-                            },
-                        );
                     }
-                    return;
-                }
-                // Route through the Function registry — same path as
-                // auto-compact takes with its SchedulerInternal caller.
-                let spec = crate::functions::Function::CompactThread {
-                    thread_id: thread_id.clone(),
+                    None => Err("thread is dormant (no weave ticks it)".into()),
                 };
-
-                let caller = crate::functions::CallerLink::WsClient {
-                    conn_id,
-                    correlation_id: correlation_id.clone(),
-                };
-                match self.register_function(spec, caller) {
-                    Ok(fn_id) => self.launch_function(fn_id, pending_io),
-                    Err(e) => {
-                        warn!(error = ?e, conn_id, %thread_id, "compact_thread rejected");
-                        self.router.send_to_client(
-                            conn_id,
-                            ServerToClient::Error {
-                                correlation_id,
-                                thread_id: Some(thread_id),
-                                message: format!("compact_thread: {}", reject_reason_detail(&e)),
-                            },
-                        );
-                    }
+                if let Err(message) = result {
+                    warn!(conn_id, %thread_id, %message, "compact_thread refused");
+                    self.router.send_to_client(
+                        conn_id,
+                        ServerToClient::Error {
+                            correlation_id,
+                            thread_id: Some(thread_id),
+                            message: format!("compact_thread: {message}"),
+                        },
+                    );
                 }
             }
             ClientToServer::SetThreadDraft { thread_id, text } => {
@@ -899,6 +864,28 @@ impl Scheduler {
                         driver,
                         description,
                         error,
+                    });
+                }
+            }
+            ClientToServer::ListDrivers {
+                correlation_id,
+                pod_id,
+            } => {
+                let drivers = self
+                    .list_driver_names(&pod_id)
+                    .into_iter()
+                    .map(
+                        |(name, embedded)| whisper_agent_protocol::driver::DriverListEntry {
+                            name,
+                            embedded,
+                        },
+                    )
+                    .collect();
+                if let Some(outbound) = self.router.outbound(conn_id) {
+                    let _ = outbound.send(ServerToClient::DriverList {
+                        correlation_id,
+                        pod_id,
+                        drivers,
                     });
                 }
             }

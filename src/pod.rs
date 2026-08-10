@@ -361,6 +361,8 @@ mod tests {
                 backend: "anthropic".into(),
                 model: "claude-opus-4-7".into(),
                 system_prompt_file: "system_prompt.md".into(),
+                driver: None,
+                driver_config: Default::default(),
                 max_tokens: 32000,
                 max_turns: 100,
                 host_env: vec!["landlock-rw".into()],
@@ -713,5 +715,77 @@ behaviors = "none"
             reserved.contains(&"dispatch"),
             "dispatch must be reserved: {reserved:?}"
         );
+    }
+
+    #[test]
+    fn thread_defaults_driver_round_trips_through_toml() {
+        let toml_src = r#"
+name = "p"
+created_at = "2026-08-10T00:00:00Z"
+
+[allow]
+backends = ["anthropic"]
+
+[thread_defaults]
+backend = "anthropic"
+model = "m"
+system_prompt_file = "system_prompt.md"
+driver = "roundtable"
+max_tokens = 1024
+max_turns = 4
+
+[thread_defaults.driver_config]
+autoquery = true
+"compaction.token_threshold" = 50000
+
+[thread_defaults.driver_config."title.model"]
+backend = "openai"
+model = "gpt-5-nano"
+"#;
+        let config = parse_toml(toml_src).unwrap();
+        assert_eq!(config.thread_defaults.driver.as_deref(), Some("roundtable"));
+        assert_eq!(
+            config.thread_defaults.driver_config.get("autoquery"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            config
+                .thread_defaults
+                .driver_config
+                .get("compaction.token_threshold"),
+            Some(&serde_json::json!(50000))
+        );
+        assert_eq!(
+            config.thread_defaults.driver_config.get("title.model"),
+            Some(&serde_json::json!({"backend": "openai", "model": "gpt-5-nano"}))
+        );
+        // Round-trip: the fields serialize back out and re-parse.
+        let out = to_toml(&config).unwrap();
+        let back = parse_toml(&out).unwrap();
+        assert_eq!(back.thread_defaults.driver, config.thread_defaults.driver);
+        assert_eq!(
+            back.thread_defaults.driver_config,
+            config.thread_defaults.driver_config
+        );
+        // Absent fields stay absent (old pod.toml keeps loading).
+        let bare = parse_toml(
+            r#"
+name = "p"
+created_at = "2026-08-10T00:00:00Z"
+
+[allow]
+backends = ["anthropic"]
+
+[thread_defaults]
+backend = "anthropic"
+model = "m"
+system_prompt_file = "system_prompt.md"
+max_tokens = 1024
+max_turns = 4
+"#,
+        )
+        .unwrap();
+        assert!(bare.thread_defaults.driver.is_none());
+        assert!(bare.thread_defaults.driver_config.is_empty());
     }
 }

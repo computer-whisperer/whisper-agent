@@ -74,6 +74,8 @@ pub fn build_default_pod_config(
             backend: backend_names.first().cloned().unwrap_or_default(),
             model: config.model.clone(),
             system_prompt_file: "system_prompt.md".into(),
+            driver: None,
+            driver_config: Default::default(),
             max_tokens: config.max_tokens,
             max_turns: config.max_turns,
             host_env: default_host_env_names,
@@ -95,15 +97,41 @@ pub fn build_default_pod_config(
 /// chat log faithfully records what the model saw.
 /// Binding-side defaults (backend, sandbox, shared hosts) are produced
 /// separately by `resolve_bindings_choice`.
+///
+/// Scripted is the only runtime driver kind (step 11 slice 6): a pod
+/// that names no `thread_defaults.driver` gets the server's embedded
+/// default with the pod's `driver_config` knobs, so the base config
+/// never leaves here carrying the builtin tombstone.
 pub(super) fn base_thread_config_from_pod(pod: &Pod) -> ThreadConfig {
-    ThreadConfig::from_thread_defaults(&pod.config.thread_defaults)
+    let mut config = ThreadConfig::from_thread_defaults(&pod.config.thread_defaults);
+    if matches!(
+        config.driver,
+        whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat
+    ) {
+        config.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
+            name: super::scripted::DEFAULT_DRIVER_NAME.to_string(),
+            config: pod.config.thread_defaults.driver_config.clone(),
+        };
+    }
+    config
 }
 
 pub(super) fn apply_config_override(
     base: ThreadConfig,
     ov: Option<ThreadConfigOverride>,
 ) -> ThreadConfig {
-    base.compose_override(ov)
+    // An explicit builtin override — an old client's stale submission —
+    // maps to the pod default rather than erroring (slice 6 compat):
+    // the builtin no longer exists at runtime.
+    let pod_default_driver = base.driver.clone();
+    let mut config = base.compose_override(ov);
+    if matches!(
+        config.driver,
+        whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat
+    ) {
+        config.driver = pod_default_driver;
+    }
+    config
 }
 
 /// Render a behavior's prompt template. Minimal v1: a single

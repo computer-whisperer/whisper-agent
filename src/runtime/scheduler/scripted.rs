@@ -1030,9 +1030,8 @@ impl Scheduler {
                 "continue_cycle: thread `{thread_id}` did not accept the transition"
             ));
         }
-        // The nudge appends WITH the transition (the builtin
-        // `submit_server_nudge` shape) — the only mid-cycle injection
-        // point. A driver cannot sequence `continue_cycle` +
+        // The nudge appends WITH the transition — the only mid-cycle
+        // injection point. A driver cannot sequence `continue_cycle` +
         // `append_entry` instead: for a non-origin thread the step
         // below runs the next turn re-entrantly before the following
         // effect applies, and the append refuses mid-generation.
@@ -1046,8 +1045,8 @@ impl Scheduler {
                 (task.conversation.messages().len() - 1, task.snapshot())
             })
         });
-        // Live-transcript parity with the sibling injection paths
-        // (`inject_pending_knowledge_nudge`, `weave_append_entry`):
+        // Live-transcript parity with the sibling injection path
+        // (`weave_append_entry`):
         // subscribers see the injected entry before the reply that
         // references it streams in.
         let nudge_entry = nudge_entry.map(|(index, snapshot)| {
@@ -1120,7 +1119,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Read `<pod>/drivers/<name>.lua`. Synchronous like the pod
+    /// Resolve a driver program: `<pod>/drivers/<name>.lua` first, then
+    /// the embedded registry (step 11 slice 6) — a pod may shadow an
+    /// embedded program to customize it. Synchronous like the pod
     /// system-prompt read at thread creation; driver programs are small
     /// policy scripts.
     pub(super) fn load_driver_program(&self, pod_id: &str, name: &str) -> Result<String, String> {
@@ -1131,8 +1132,106 @@ impl Scheduler {
             return Err(format!("unknown pod `{pod_id}`"));
         };
         let path = pod.dir.join("drivers").join(format!("{name}.lua"));
-        std::fs::read_to_string(&path)
-            .map_err(|error| format!("driver program `{name}` unreadable: {error}"))
+        match std::fs::read_to_string(&path) {
+            Ok(source) => Ok(source),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                embedded_driver_program(name)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("driver program `{name}` unreadable: {error}"))
+            }
+            Err(error) => Err(format!("driver program `{name}` unreadable: {error}")),
+        }
+    }
+
+    /// Load-time migration (step 11 slice 6): scripted is the only
+    /// runtime driver kind, so every weave persisted with the builtin
+    /// driver — including weaves the persister synthesized for legacy
+    /// driverless thread JSON — converts to the embedded default here.
+    /// Driver state synthesizes to what titled_chat would have arrived
+    /// at on its own: the weave's primary as its head and titling
+    /// already done (the thread has lived under its placeholder or
+    /// model title; no retro-titling). Knobs translate from the
+    /// PRIMARY thread's legacy config so ambient behaviors keep
+    /// working through the driver path. The old `compacting` marker
+    /// drops with the state — a compaction never survives restart
+    /// (the persister heals its summary turn to Failed), which is
+    /// exactly what the pre-migration load-time clear enforced.
+    ///
+    /// Runs after threads load (the knob translation reads the
+    /// primary's config) and before the dead-ticked-thread collection
+    /// (migrated weaves must receive their `thread_failed` load
+    /// notices like any scripted weave).
+    pub(super) fn migrate_builtin_weaves(&mut self) {
+        let builtin_ids: Vec<String> = self
+            .weaves
+            .iter()
+            .filter(|(_, weave)| {
+                matches!(
+                    weave.driver,
+                    whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for weave_id in builtin_ids {
+            let primary = self.weaves[&weave_id]
+                .primary_thread_id()
+                .map(str::to_string);
+            let knobs = primary
+                .as_deref()
+                .and_then(|id| self.tasks.get(id))
+                .map(|task| legacy_config_knobs(&task.config))
+                .unwrap_or_default();
+            let mut data = serde_json::Map::new();
+            if let Some(primary) = &primary {
+                data.insert(
+                    "primary".to_string(),
+                    serde_json::Value::String(primary.clone()),
+                );
+            }
+            data.insert("title_requested".to_string(), serde_json::Value::Bool(true));
+            let weave = self.weaves.get_mut(&weave_id).expect("listed above");
+            weave.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
+                name: DEFAULT_DRIVER_NAME.to_string(),
+                config: knobs,
+            };
+            weave.driver_state = DriverState::Scripted {
+                data: serde_json::Value::Object(data),
+                turns: Default::default(),
+            };
+            // Stamped from the resolved source at the first activation.
+            weave.driver_program_hash = None;
+            tracing::info!(%weave_id, "migrated builtin weave to the scripted default");
+            self.mark_weave_dirty(&weave_id);
+        }
+    }
+
+    /// Every driver name resolvable in `pod_id`, for the picker:
+    /// embedded programs plus the pod's `drivers/*.lua` stems (a pod
+    /// file shadowing an embedded name lists once, as the pod entry).
+    pub(super) fn list_driver_names(&self, pod_id: &str) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = EMBEDDED_DRIVERS
+            .iter()
+            .map(|(name, _)| (name.to_string(), true))
+            .collect();
+        if let Some(pod) = self.pods.get(pod_id)
+            && let Ok(entries) = std::fs::read_dir(pod.dir.join("drivers"))
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("lua")
+                    && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    if let Some(slot) = out.iter_mut().find(|(name, _)| name == stem) {
+                        slot.1 = false;
+                    } else {
+                        out.push((stem.to_string(), false));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     fn scripted_turn_count(&self, weave_id: &str, thread_id: &str) -> u32 {
@@ -1247,18 +1346,6 @@ impl Scheduler {
             self.step_until_blocked(&tid, pending_io);
         }
         Ok(())
-    }
-
-    pub(super) fn has_scripted_ticker(&self, thread_id: &str) -> bool {
-        self.thread_ticker
-            .get(thread_id)
-            .and_then(|weave_id| self.weaves.get(weave_id))
-            .is_some_and(|weave| {
-                matches!(
-                    weave.driver,
-                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-                )
-            })
     }
 
     fn fail_weave_effect(&mut self, weave_id: &str, effect_id: DriverEffectId, message: &str) {
@@ -1824,6 +1911,54 @@ impl Scheduler {
             self.step_until_blocked(&thread_id, pending_io);
         }
     }
+}
+
+/// The server's default driver program (step 11 slice 6): the name new
+/// threads resolve when neither the creation override nor the pod's
+/// `thread_defaults.driver` names one.
+pub(super) const DEFAULT_DRIVER_NAME: &str = "titled_chat";
+
+/// Programs compiled into the binary so the default driver resolves in
+/// every pod. The canonical sources stay in `examples/drivers/` (also
+/// exercised directly by the harness tests); a pod file with the same
+/// stem shadows its embedded entry.
+const EMBEDDED_DRIVERS: &[(&str, &str)] = &[(
+    DEFAULT_DRIVER_NAME,
+    include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/drivers/titled_chat.lua"
+    )),
+)];
+
+pub(super) fn embedded_driver_program(name: &str) -> Option<&'static str> {
+    EMBEDDED_DRIVERS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, source)| *source)
+}
+
+/// Translate a legacy thread config's ambient-machinery settings into
+/// titled_chat knob values (step 11 slice 6 migration): the ambient
+/// autoquery subsystem and the scheduler auto-compaction trigger died
+/// with the builtin, so the driver knobs carry the behavior forward.
+/// A zero threshold is dropped — the Integer knob declares `min = 1`,
+/// and a 0-token auto-compact was never meaningful.
+pub(super) fn legacy_config_knobs(
+    config: &whisper_agent_protocol::ThreadConfig,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut knobs = std::collections::BTreeMap::new();
+    if config.autoquery.enabled {
+        knobs.insert("autoquery".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(threshold) = config.compaction.token_threshold
+        && threshold > 0
+    {
+        knobs.insert(
+            "compaction.token_threshold".to_string(),
+            serde_json::json!(threshold),
+        );
+    }
+    knobs
 }
 
 /// One async dispatch callback owed to a scripted weave driver, indexed

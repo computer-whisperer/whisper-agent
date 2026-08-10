@@ -121,35 +121,12 @@ pub struct Thread {
     /// this on spawn and the on-completion hook reads it back.
     #[serde(default)]
     pub origin: Option<BehaviorOrigin>,
-    /// Rendered `<dispatched-thread-notification>` envelopes queued
-    /// for injection as fresh user messages once this thread reaches
-    /// an idle turn boundary. Populated by
-    /// `Scheduler::deliver_async_followup` when a dispatched child
-    /// terminates while the parent is still Working; drained during
-    /// `step_until_blocked` when the parent hits Idle/Completed.
-    /// Transient — not persisted; a restart mid-delivery drops the
-    /// queued follow-up (same lifecycle guarantee as other in-flight
-    /// Function state).
-    #[serde(default, skip)]
-    pub pending_tool_result_followups: Vec<String>,
-    /// Server-generated knowledge nudges waiting to be inserted before
-    /// the next model sub-turn. Transient: autoquery is opportunistic,
-    /// so a restart can drop an in-flight nudge without corrupting the
-    /// conversation.
-    #[serde(default, skip)]
-    pub pending_knowledge_nudges: Vec<String>,
-    /// Knowledge hit keys already surfaced to this thread, either via
-    /// explicit `knowledge_query` tool results or automatic knowledge
-    /// nudges. Persisted with the thread so opportunistic retrieval
-    /// does not repeat the same source record after a restart.
+    /// Knowledge hit keys already surfaced to this thread via
+    /// explicit `knowledge_query` tool results. Persisted with the
+    /// thread so retrieval does not repeat the same source record
+    /// after a restart.
     #[serde(default)]
     pub seen_knowledge_hits: HashSet<String>,
-    /// One-shot suppression flag for auto-injected nudges after the
-    /// model explicitly asked for knowledge (`knowledge_query`) or
-    /// manually drained queued nudges. Transient: after a restart,
-    /// the persisted conversation already carries what was shown.
-    #[serde(default, skip)]
-    pub suppress_next_knowledge_nudge: bool,
     /// Parent thread id when this thread was spawned by a parent's
     /// `dispatch_thread` tool call. `None` for top-level threads. Set
     /// once at spawn; never mutated afterward. Distinct from the
@@ -458,10 +435,7 @@ impl Thread {
             scope,
             tool_surface,
             origin: None,
-            pending_tool_result_followups: Vec::new(),
-            pending_knowledge_nudges: Vec::new(),
             seen_knowledge_hits: HashSet::new(),
-            suppress_next_knowledge_nudge: false,
             dispatched_by: None,
             dispatch_depth: 0,
             draft: String::new(),
@@ -558,10 +532,7 @@ impl Thread {
             scope: self.scope.clone(),
             tool_surface: self.tool_surface.clone(),
             origin: None,
-            pending_tool_result_followups: Vec::new(),
-            pending_knowledge_nudges: Vec::new(),
             seen_knowledge_hits: HashSet::new(),
-            suppress_next_knowledge_nudge: false,
             dispatched_by: None,
             dispatch_depth: 0,
             // Client seeds the new thread's draft with the forked-from
@@ -694,21 +665,6 @@ impl Thread {
     /// consumed by the model as part of the current user cycle. Unlike
     /// a real user message, this does not reset the driver's turn counter;
     /// it is an agent sub-turn nudge, not a new user request.
-    pub fn submit_server_nudge(&mut self, text: String, pending_resources: Vec<String>) {
-        self.conversation.push(
-            Message::system_text(text)
-                .with_author(self.config.participants.default_responder.clone()),
-        );
-        self.internal = if pending_resources.is_empty() {
-            ThreadInternalState::NeedsModelCall
-        } else {
-            ThreadInternalState::WaitingOnResources {
-                needed: pending_resources,
-            }
-        };
-        self.touch();
-    }
-
     /// Bring the thread to a clean `Idle` state that can accept a new
     /// user message (or be stepped from scratch) without corrupting
     /// the conversation shape.
@@ -827,21 +783,6 @@ impl Thread {
     /// appended message's `Role` (`ToolResult` instead of `User`) so
     /// clients and adapters can classify the append without content-
     /// block inspection.
-    pub fn submit_tool_result_text(&mut self, text: String, pending_resources: Vec<String>) {
-        self.conversation.push(
-            Message::tool_result_text(text)
-                .with_author(self.config.participants.default_responder.clone()),
-        );
-        self.internal = if pending_resources.is_empty() {
-            ThreadInternalState::NeedsModelCall
-        } else {
-            ThreadInternalState::WaitingOnResources {
-                needed: pending_resources,
-            }
-        };
-        self.touch();
-    }
-
     /// Drop a now-Ready resource id from the `WaitingOnResources` set.
     /// Returns whether the thread is now ready to step (its `needed` set
     /// emptied as a result). No-op for any state other than
@@ -1691,7 +1632,6 @@ fn truncate(mut s: String, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::driver::{DriverFinishReason, PersistedDriverEffect};
 
     #[test]
     fn truncate_handles_multibyte_boundary() {
@@ -1728,146 +1668,6 @@ mod tests {
         }
     }
 
-    /// Minimal stand-in for the scheduler's boundary router
-    /// (`Scheduler::apply_thread_boundary`): route `Boundary` outcomes
-    /// through `weave`, apply the decision, and collect dispatched I/O
-    /// until the thread pauses. Keeps thread tests exercising the same
-    /// choreography the runtime uses.
-    fn drive_until_blocked(
-        task: &mut Thread,
-        weave: &mut crate::runtime::weave::Weave,
-        next_op_id: &mut OpId,
-        events: &mut Vec<ThreadEvent>,
-    ) -> Vec<IoRequest> {
-        use crate::runtime::driver::{DriverEffect, DriverFinishReason, PersistedDriverEffect};
-        let mut dispatched = Vec::new();
-        loop {
-            match task.step(next_op_id, events) {
-                StepOutcome::DispatchIo(req) => dispatched.push(req),
-                StepOutcome::Continue => {}
-                StepOutcome::Paused => break,
-                StepOutcome::Boundary(ThreadBoundary::TurnStart) => {
-                    let effect = weave
-                        .next_effect(&task.config.participants, task.config.max_turns)
-                        .unwrap();
-                    match effect {
-                        DriverEffect::RunAgent {
-                            participant_id,
-                            turn,
-                        } => {
-                            let generation = GenerationContext::new(
-                                uuid::Uuid::new_v4().to_string(),
-                                participant_id,
-                            );
-                            let effect_id =
-                                weave.record_pending_effect(PersistedDriverEffect::RunAgent {
-                                    thread_id: task.id.clone(),
-                                    generation: generation.clone(),
-                                    turn,
-                                });
-                            let op_id = next_id(next_op_id);
-                            let req = task
-                                .begin_model_call(op_id, generation, effect_id, turn, events)
-                                .expect("RunAgent applies at turn start");
-                            dispatched.push(req);
-                        }
-                        DriverEffect::Finish => {
-                            weave.record_completed_effect(PersistedDriverEffect::Finish {
-                                thread_id: task.id.clone(),
-                                generation: None,
-                                reason: DriverFinishReason::TurnLimit,
-                            });
-                            task.finish_cycle(events);
-                        }
-                        other => panic!("unexpected effect at turn start: {other:?}"),
-                    }
-                }
-                StepOutcome::Boundary(ThreadBoundary::AgentCompleted {
-                    generation,
-                    effect_id,
-                    has_tool_calls,
-                }) => {
-                    weave.complete_effect(effect_id);
-                    let effect = weave
-                        .agent_completed(
-                            &generation.participant_id,
-                            &task.config.participants,
-                            has_tool_calls,
-                        )
-                        .unwrap();
-                    match effect {
-                        DriverEffect::DispatchTools => {
-                            let tool_use_ids = match &task.internal {
-                                ThreadInternalState::AgentBoundary {
-                                    pending_tool_uses, ..
-                                } => pending_tool_uses
-                                    .iter()
-                                    .map(|t| t.tool_use_id.clone())
-                                    .collect(),
-                                _ => Vec::new(),
-                            };
-                            let dispatch_id =
-                                weave.record_pending_effect(PersistedDriverEffect::DispatchTools {
-                                    thread_id: task.id.clone(),
-                                    generation,
-                                    tool_use_ids,
-                                });
-                            assert!(task.begin_tool_dispatch(dispatch_id));
-                        }
-                        DriverEffect::Finish => {
-                            weave.record_completed_effect(PersistedDriverEffect::Finish {
-                                thread_id: task.id.clone(),
-                                generation: Some(generation),
-                                reason: DriverFinishReason::AgentCompleted,
-                            });
-                            task.finish_cycle(events);
-                        }
-                        other => panic!("unexpected effect after agent: {other:?}"),
-                    }
-                }
-                StepOutcome::Boundary(ThreadBoundary::ToolsCompleted {
-                    generation,
-                    effect_id,
-                }) => {
-                    weave.complete_effect(effect_id);
-                    let effect = weave
-                        .tools_completed(&generation.participant_id, &task.config.participants)
-                        .unwrap();
-                    match effect {
-                        DriverEffect::Continue => {
-                            weave.record_completed_effect(PersistedDriverEffect::Continue {
-                                thread_id: task.id.clone(),
-                                generation,
-                                nudge_entry: None,
-                            });
-                            assert!(task.continue_cycle());
-                        }
-                        DriverEffect::Finish => {
-                            weave.record_completed_effect(PersistedDriverEffect::Finish {
-                                thread_id: task.id.clone(),
-                                generation: Some(generation),
-                                reason: DriverFinishReason::ToolsCompleted,
-                            });
-                            task.finish_cycle(events);
-                        }
-                        other => panic!("unexpected effect after tools: {other:?}"),
-                    }
-                }
-            }
-        }
-        dispatched
-    }
-
-    fn singleton_weave_for(task: &Thread) -> crate::runtime::weave::Weave {
-        let mut weave = crate::runtime::weave::Weave::singleton_for_thread(
-            task.id.clone(),
-            task.pod_id.clone(),
-            task.config.driver.clone(),
-        );
-        weave.input_accepted().unwrap();
-        weave
-    }
-
     #[test]
     fn legacy_driver_fields_lift_into_a_singleton_weave() {
         let task = Thread::new(
@@ -1894,13 +1694,14 @@ mod tests {
         weave.import_thread_driver_state(
             std::mem::take(&mut decoded.driver_state),
             std::mem::take(&mut decoded.effect_journal),
-            decoded.turns_in_cycle,
         );
         decoded.turns_in_cycle = 0;
-        assert_eq!(
-            crate::runtime::driver::turns_in_cycle(&weave.driver_state),
-            3
-        );
+        // The lifted state is the deserialize-only tombstone; the
+        // scheduler's load-time migration converts it (slice 6).
+        assert!(matches!(
+            weave.driver_state,
+            crate::runtime::driver::DriverState::BuiltinSingleAgentChat { .. }
+        ));
 
         // New thread snapshots carry no driver fields at all.
         let migrated = serde_json::to_value(decoded).unwrap();
@@ -2065,218 +1866,6 @@ mod tests {
         );
         assert_eq!(task.turn_log.entries[0].participant_id.as_str(), "builder");
         assert_eq!(task.turn_log.entries[0].run_id.as_str(), "test-run");
-    }
-
-    #[test]
-    fn model_dispatch_has_one_stable_participant_scoped_generation() {
-        let mut config = base_config_for_fork();
-        config.participants.members[1].id = "builder".into();
-        config.participants.default_responder = "builder".into();
-        let mut task = Thread::new(
-            "generated".into(),
-            "pod".into(),
-            config,
-            ThreadBindings::default(),
-            Scope::allow_all(),
-            ToolSurface::default(),
-        );
-        task.submit_user_message("hello".into(), Vec::new(), Vec::new());
-        let mut weave = singleton_weave_for(&task);
-
-        let mut next_op_id = 1;
-        let mut events = Vec::new();
-        let dispatched = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        let begin = events.iter().find_map(|event| match event {
-            ThreadEvent::AssistantBegin { generation, .. } => Some(generation),
-            _ => None,
-        });
-        let Some(begin) = begin else {
-            panic!("missing AssistantBegin")
-        };
-        let [IoRequest::ModelCall { op_id, generation }] = dispatched.as_slice() else {
-            panic!("expected exactly one model dispatch, got {dispatched:?}")
-        };
-
-        assert!(!generation.run_id.is_empty());
-        assert_eq!(generation.participant_id.as_str(), "builder");
-        assert_eq!(begin, generation);
-        let ThreadInternalState::AwaitingModel {
-            generation: persisted,
-            effect_id,
-            ..
-        } = &task.internal
-        else {
-            panic!("expected AwaitingModel")
-        };
-        assert_eq!(persisted, generation);
-        let record = &weave.effect_journal.records()[0];
-        assert_eq!(record.id, *effect_id);
-        assert!(matches!(
-            &record.effect,
-            PersistedDriverEffect::RunAgent {
-                generation: recorded,
-                turn: 1,
-                ..
-            } if recorded == generation
-        ));
-        assert_eq!(
-            record.outcome,
-            crate::runtime::driver::DriverEffectOutcome::Pending
-        );
-
-        // The pending record (on the weave) and its internal-state link (on
-        // the thread) both serialize before the lazy model future is polled
-        // by the scheduler; the thread JSON no longer carries a journal.
-        let weave_json = serde_json::to_value(&weave).unwrap();
-        assert_eq!(weave_json["effect_journal"]["records"][0]["id"], *effect_id);
-        let thread_json = serde_json::to_value(&task).unwrap();
-        assert_eq!(thread_json["internal"]["effect_id"], *effect_id);
-        assert!(thread_json.get("effect_journal").is_none());
-
-        let op_id = *op_id;
-        task.apply_io_result(
-            op_id,
-            IoResult::ModelCall(Ok(ModelResponse {
-                content: vec![ContentBlock::Text {
-                    text: "done".into(),
-                }],
-                stop_reason: Some("end_turn".into()),
-                usage: Usage::default(),
-            })),
-            &mut events,
-        );
-        let followup = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        assert!(followup.is_empty());
-        assert!(matches!(task.internal, ThreadInternalState::Completed));
-        assert_eq!(weave.effect_journal.records().len(), 2);
-        assert!(weave.effect_journal.records().iter().all(|record| {
-            record.outcome == crate::runtime::driver::DriverEffectOutcome::Completed
-        }));
-        assert!(matches!(
-            weave.effect_journal.records()[1].effect,
-            PersistedDriverEffect::Finish {
-                reason: DriverFinishReason::AgentCompleted,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn tool_cycle_resolves_dispatch_effect_before_driver_continues() {
-        use crate::tools::mcp::McpContentBlock;
-
-        let mut task = Thread::new(
-            "journal-tools".into(),
-            "pod".into(),
-            base_config_for_fork(),
-            ThreadBindings::default(),
-            Scope::allow_all(),
-            ToolSurface::default(),
-        );
-        task.submit_user_message("use a tool".into(), Vec::new(), Vec::new());
-        let mut weave = singleton_weave_for(&task);
-        let mut next_op_id = 1;
-        let mut events = Vec::new();
-        let dispatched = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        let [IoRequest::ModelCall { op_id, .. }] = dispatched.as_slice() else {
-            panic!("expected model dispatch, got {dispatched:?}")
-        };
-
-        let op_id = *op_id;
-        task.apply_io_result(
-            op_id,
-            IoResult::ModelCall(Ok(ModelResponse {
-                content: vec![ContentBlock::ToolUse {
-                    id: "toolu-1".into(),
-                    name: "lookup".into(),
-                    input: serde_json::json!({ "q": "x" }),
-                    replay: None,
-                }],
-                stop_reason: Some("tool_use".into()),
-                usage: Usage::default(),
-            })),
-            &mut events,
-        );
-        // Driving routes the agent boundary through the weave: the
-        // DispatchTools record goes pending, then the queued tool call
-        // dispatches.
-        let dispatched = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        let [
-            IoRequest::ToolCall {
-                op_id: tool_op_id,
-                tool_use_id,
-                ..
-            },
-        ] = dispatched.as_slice()
-        else {
-            panic!("expected tool call, got {dispatched:?}")
-        };
-        let ThreadInternalState::AwaitingTools { effect_id, .. } = &task.internal else {
-            panic!("expected tool dispatch")
-        };
-        assert_eq!(
-            weave.effect_journal.records()[0].outcome,
-            crate::runtime::driver::DriverEffectOutcome::Completed
-        );
-        assert_eq!(weave.effect_journal.records()[1].id, *effect_id);
-        assert_eq!(
-            weave.effect_journal.records()[1].outcome,
-            crate::runtime::driver::DriverEffectOutcome::Pending
-        );
-
-        let tool_op_id = *tool_op_id;
-        let tool_use_id = tool_use_id.clone();
-        task.apply_io_result(
-            tool_op_id,
-            IoResult::ToolCall {
-                tool_use_id,
-                result: Ok(CallToolResult {
-                    content: vec![McpContentBlock::Text { text: "ok".into() }],
-                    is_error: false,
-                }),
-            },
-            &mut events,
-        );
-
-        // Driving resolves the tools boundary (Continue) and then the next
-        // turn boundary spawns the second model call.
-        let dispatched = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        assert!(matches!(
-            dispatched.as_slice(),
-            [IoRequest::ModelCall { .. }]
-        ));
-        assert!(matches!(
-            task.internal,
-            ThreadInternalState::AwaitingModel { .. }
-        ));
-        // The journal fully encodes the choreography: first turn's RunAgent
-        // and DispatchTools resolved, the synchronous Continue recorded
-        // completed, and the second turn's RunAgent pending.
-        let records = weave.effect_journal.records();
-        assert_eq!(records.len(), 4);
-        assert!(matches!(
-            records[0].effect,
-            PersistedDriverEffect::RunAgent { turn: 1, .. }
-        ));
-        assert!(matches!(
-            records[1].effect,
-            PersistedDriverEffect::DispatchTools { .. }
-        ));
-        assert!(matches!(
-            records[2].effect,
-            PersistedDriverEffect::Continue { .. }
-        ));
-        assert!(matches!(
-            records[3].effect,
-            PersistedDriverEffect::RunAgent { turn: 2, .. }
-        ));
-        assert!(records[..3].iter().all(|record| {
-            record.outcome == crate::runtime::driver::DriverEffectOutcome::Completed
-        }));
-        assert_eq!(
-            records[3].outcome,
-            crate::runtime::driver::DriverEffectOutcome::Pending
-        );
     }
 
     #[test]
@@ -2452,14 +2041,37 @@ mod tests {
             ToolSurface::default(),
         );
         task.submit_user_message("hello".into(), Vec::new(), Vec::new());
-        let mut weave = singleton_weave_for(&task);
-        let mut next_op_id = 1;
+        // Journal the pending RunAgent and begin the model call — the
+        // scripted router's choreography, minus the VM.
+        let mut weave = crate::runtime::weave::Weave::singleton_for_thread(
+            task.id.clone(),
+            task.pod_id.clone(),
+            task.config.driver.clone(),
+        );
         let mut events = Vec::new();
-        let dispatched = drive_until_blocked(&mut task, &mut weave, &mut next_op_id, &mut events);
-        assert!(matches!(
-            dispatched.as_slice(),
-            [IoRequest::ModelCall { .. }]
-        ));
+        let generation = whisper_agent_protocol::GenerationContext::new("run-restart", "agent");
+        let effect_id =
+            weave.record_pending_effect(crate::runtime::driver::PersistedDriverEffect::RunAgent {
+                thread_id: task.id.clone(),
+                generation: generation.clone(),
+                turn: 1,
+            });
+        let mut saw_turn_start = false;
+        for _ in 0..4 {
+            match task.step(&mut 1, &mut events) {
+                StepOutcome::Boundary(ThreadBoundary::TurnStart) => {
+                    saw_turn_start = true;
+                    break;
+                }
+                StepOutcome::Continue => continue,
+                other => panic!("unexpected step outcome before the turn boundary: {other:?}"),
+            }
+        }
+        assert!(saw_turn_start);
+        assert!(
+            task.begin_model_call(1, generation, effect_id, 1, &mut events)
+                .is_some()
+        );
         assert!(weave.effect_journal.has_pending());
 
         // Restart healing: the thread heals to Idle, and the runtime

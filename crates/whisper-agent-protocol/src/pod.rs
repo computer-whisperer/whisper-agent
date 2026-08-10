@@ -175,6 +175,22 @@ pub struct ThreadDefaults {
     pub host_env: Vec<String>,
     #[serde(default)]
     pub mcp_hosts: Vec<String>,
+    /// Scripted driver coordinating new threads' weaves (step 11
+    /// slice 6): a program name resolved pod-first then against the
+    /// server's embedded registry. `None` (the common case) means the
+    /// server default — embedded `titled_chat`. There is no builtin
+    /// driver to name anymore; the enum variant survives only as a
+    /// load-migration tombstone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Knob values for the default driver, keyed by knob id (the
+    /// `[thread_defaults.driver_config]` TOML table — same shape as a
+    /// behavior's `[thread.driver_config]`). Validated against the
+    /// program's `describe()` at each thread creation like any
+    /// submitted knob map. Meaningful with or without `driver` (it
+    /// configures the server default too).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub driver_config: std::collections::BTreeMap<String, serde_json::Value>,
     /// Compaction defaults threads in this pod inherit. Threads
     /// override via [`crate::ThreadConfigOverride.compaction`].
     #[serde(default)]
@@ -284,8 +300,8 @@ where
 /// carries the same fields as `Option`s for per-thread partial overrides.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CompactionConfig {
-    /// Master switch. When false, `/compact` is rejected and
-    /// `token_threshold` auto-triggers are skipped.
+    /// Master switch. When false, compaction requests — manual and
+    /// driver-issued alike — are refused at admission.
     #[serde(default = "compaction_enabled_default")]
     pub enabled: bool,
     /// Path to the compaction-instruction file, relative to the pod
@@ -297,9 +313,11 @@ pub struct CompactionConfig {
     /// with leading/trailing whitespace trimmed.
     #[serde(default = "default_summary_regex")]
     pub summary_regex: String,
-    /// Auto-compact once the thread's accumulated input tokens exceed
-    /// this. `None` ⇒ manual-only. (Auto-trigger lands in a follow-up
-    /// commit; the field is already on the wire so pods can declare it.)
+    /// DEAD wire compat (step 11 slice 6): the auto-compaction trigger
+    /// is a driver knob now (`compaction.token_threshold` in
+    /// `driver_config`); nothing reads this field at runtime. It is
+    /// translated into the knob once, when a pre-slice-6 weave
+    /// migrates at load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_threshold: Option<u32>,
     /// Template for the seed message on the continuation thread.
@@ -343,10 +361,13 @@ impl Default for CompactionConfig {
     }
 }
 
-/// Opportunistic retrieval nudges driven by a model's own recent
-/// output. This is deliberately separate from the explicit
-/// `knowledge_query` tool: autoquery must be low-latency and must not
-/// load cold buckets just because a model turn ended.
+/// DEAD wire compat (step 11 slice 6): the ambient autoquery
+/// machinery this configured died with the builtin driver — the live
+/// surface is the driver's `autoquery` knob (drivers compose retrieval
+/// through the `query_knowledge` effect). At load, `enabled = true` on
+/// a pre-slice-6 weave's primary translates into the knob once; the
+/// richer fields (buckets, top_k, rerank floor, query source, …) have
+/// no runtime reader until a driver wants knobs for them.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct KnowledgeAutoqueryConfig {
     /// Master switch. Default-off so existing pods do not change

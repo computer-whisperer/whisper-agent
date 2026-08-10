@@ -742,11 +742,21 @@ core_tools       = [\"describe_tool\", \"find_tool\", \"sudo\"]
 initial_listing  = \"none\"           # \"none\" | \"all_names\" | \"core_only\"
 activation_surface = \"announce\"     # \"announce\" | \"inject_schema\"
 
-# Compaction — automatic summarization when the thread grows long.
+# Compaction texts — prompt/regex/template resolved when a driver
+# compacts. `enabled = false` refuses compaction outright.
 [thread_defaults.compaction]
 enabled         = true
 prompt_file     = \"\"                 # empty → built-in default
-token_threshold = 120000              # auto-trigger over this; omit for manual-only
+
+# Driver defaults: which scripted driver coordinates new threads
+# (omit for the server default, titled_chat) and its knob values.
+# Auto-compaction and knowledge autoquery are DRIVER knobs now —
+# the old `compaction.token_threshold` / `autoquery.enabled` thread
+# fields are dead wire compat and nothing reads them.
+# driver = \"titled_chat\"
+[thread_defaults.driver_config]
+\"compaction.token_threshold\" = 120000  # auto-compact over this; omit for manual-only
+autoquery = false
 
 [limits]
 max_concurrent_threads = 10           # default 10 if omitted

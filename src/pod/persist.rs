@@ -784,7 +784,6 @@ async fn load_pod(pod_dir: &Path, pod_id: &str) -> Result<(Pod, Vec<Thread>, Vec
         weave.import_thread_driver_state(
             std::mem::take(&mut task.driver_state),
             std::mem::take(&mut task.effect_journal),
-            task.turns_in_cycle,
         );
         task.turns_in_cycle = 0;
         weaves.push(weave);
@@ -1068,6 +1067,8 @@ fn synthesize_pod_config(task: &Thread) -> PodConfig {
             backend,
             model: task.config.model.clone(),
             system_prompt_file: "system_prompt.md".into(),
+            driver: None,
+            driver_config: Default::default(),
             max_tokens: task.config.max_tokens,
             max_turns: task.config.max_turns,
             host_env: Vec::new(),
@@ -1117,6 +1118,8 @@ mod tests {
                 backend: "anthropic".into(),
                 model: "claude-sonnet-4-6".into(),
                 system_prompt_file: "system_prompt.md".into(),
+                driver: None,
+                driver_config: Default::default(),
                 max_tokens: 8000,
                 max_turns: 30,
                 host_env: Vec::new(),
@@ -1208,7 +1211,6 @@ mod tests {
             task.pod_id.clone(),
             task.config.driver.clone(),
         );
-        weave.input_accepted().unwrap();
         let generation = GenerationContext::new("run-restart", "agent");
         let effect_id =
             weave.record_pending_effect(crate::runtime::driver::PersistedDriverEffect::RunAgent {
@@ -1273,10 +1275,15 @@ mod tests {
         let weave = &loaded.weaves[0];
         assert_eq!(weave.id, "t-weave-synth");
         assert_eq!(weave.primary_thread_id(), Some("t-weave-synth"));
-        assert_eq!(
-            crate::runtime::driver::turns_in_cycle(&weave.driver_state),
-            3
-        );
+        // The lifted state is the deserialize-only tombstone; the
+        // scheduler's load-time migration converts it (slice 6).
+        assert!(matches!(
+            weave.driver_state,
+            crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
+                turns_in_cycle: 3,
+                ..
+            }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

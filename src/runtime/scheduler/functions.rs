@@ -11,9 +11,6 @@
 //! Currently wired:
 //!
 //! - `Function::CancelThread` — synchronous; launch completes inline.
-//! - `Function::CompactThread` — asynchronous; launches the compaction
-//!   turn and stays in the registry until `finalize_pending_compaction`
-//!   fires `complete_function`.
 
 use chrono::{DateTime, Utc};
 use futures::stream::FuturesUnordered;
@@ -38,9 +35,8 @@ pub(super) const MAX_DISPATCH_DEPTH: u32 = 4;
 /// Server-owned runtime state of an in-flight Function.
 ///
 /// Phase-2/3 shape: minimal — enough to support synchronous variants
-/// (CancelThread) and multi-tick async variants that carry only a
-/// thread_id (CompactThread). Full progress/terminal channels land when
-/// the tool-call variants migrate in Commit 4.
+/// (CancelThread) and multi-tick async variants. Full progress/terminal
+/// channels land when the tool-call variants migrate in Commit 4.
 #[derive(Debug)]
 // Fields are written at registration and read by variant launch/complete
 // paths + the cancel-by-thread sweep; silence early dead-code until
@@ -101,15 +97,6 @@ pub enum FunctionDelivery {
     /// converts the result into an `IoResult::ToolCall` — normal tool
     /// result delivery.
     ToolResultChannel(oneshot::Sender<Result<String, String>>),
-    /// Async tool-call follow-up: render a
-    /// `<dispatched-thread-notification>` envelope from the terminal
-    /// and inject it as a fresh user message on the parent thread.
-    /// The parent's tool call already returned a synthetic ack, so
-    /// there's no parked oneshot to fire.
-    ToolResultFollowup {
-        parent_thread_id: String,
-        parent_tool_use_id: String,
-    },
 }
 
 impl std::fmt::Debug for FunctionDelivery {
@@ -117,14 +104,6 @@ impl std::fmt::Debug for FunctionDelivery {
         match self {
             Self::None => write!(f, "None"),
             Self::ToolResultChannel(_) => write!(f, "ToolResultChannel(<sender>)"),
-            Self::ToolResultFollowup {
-                parent_thread_id,
-                parent_tool_use_id,
-            } => f
-                .debug_struct("ToolResultFollowup")
-                .field("parent_thread_id", parent_thread_id)
-                .field("parent_tool_use_id", parent_tool_use_id)
-                .finish(),
         }
     }
 }
@@ -195,68 +174,6 @@ impl Scheduler {
                     .ok_or_else(|| RejectReason::PreconditionFailed {
                         detail: format!("unknown thread {thread_id}"),
                     })?;
-                Ok(())
-            }
-            Function::CompactThread { thread_id } => {
-                let task =
-                    self.tasks
-                        .get(thread_id)
-                        .ok_or_else(|| RejectReason::PreconditionFailed {
-                            detail: format!("unknown thread {thread_id}"),
-                        })?;
-                if !task.config.compaction.enabled {
-                    return Err(RejectReason::PreconditionFailed {
-                        detail: "compaction is disabled on this thread".into(),
-                    });
-                }
-                if !task.is_idle() {
-                    return Err(RejectReason::PreconditionFailed {
-                        detail: "thread is not at a clean turn boundary".into(),
-                    });
-                }
-                // Compaction runs a turn on the thread; a dormant one
-                // (no ticking weave) can't run it, and the weave's
-                // compacting marker would wedge set when the input
-                // guard rejects the summary prompt.
-                let Some(weave) = self
-                    .thread_ticker
-                    .get(thread_id)
-                    .and_then(|weave_id| self.weaves.get(weave_id))
-                else {
-                    return Err(RejectReason::PreconditionFailed {
-                        detail: "thread is dormant (no weave ticks it)".into(),
-                    });
-                };
-                if matches!(
-                    weave.driver,
-                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-                ) {
-                    return Err(RejectReason::PreconditionFailed {
-                        detail: "scripted-driven threads own their lifecycle; a driver \
-                                 composes compaction from weave primitives"
-                            .into(),
-                    });
-                }
-                if matches!(
-                    &weave.driver_state,
-                    crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                        compacting: Some(_),
-                        ..
-                    }
-                ) {
-                    return Err(RejectReason::ResourceBusy {
-                        detail: "compaction already in progress on this weave".into(),
-                    });
-                }
-                // Only the weave's current head compacts: a compacted-
-                // away thread is a dormant auxiliary (caught above),
-                // but guard explicitly so role drift can never launch a
-                // summary turn on a non-primary.
-                if weave.primary_thread_id() != Some(thread_id.as_str()) {
-                    return Err(RejectReason::PreconditionFailed {
-                        detail: "thread is not its weave's primary; only the head compacts".into(),
-                    });
-                }
                 Ok(())
             }
             Function::CreateThread { pod_id, parent, .. } => {
@@ -356,11 +273,6 @@ impl Scheduler {
                     FunctionOutcome::Success(FunctionTerminal::CancelThread),
                     pending_io,
                 );
-            }
-            Function::CompactThread { thread_id } => {
-                self.launch_compact_thread(&thread_id, pending_io);
-                // Function stays in the registry until
-                // `finalize_pending_compaction` calls `complete_function`.
             }
             Function::CreateThread {
                 pod_id,
@@ -482,15 +394,15 @@ impl Scheduler {
     /// terminals for `WsClient` callers with a correlation_id surface
     /// as `ServerToClient::Error`. Terminals with
     /// `FunctionDelivery::ToolResultChannel` fire the parked oneshot
-    /// so the parent's parked tool-call SchedulerFuture resumes;
-    /// `ToolResultFollowup` renders the terminal text as a
-    /// `<dispatched-thread-notification>` envelope and injects it as
-    /// a user message on the parent.
+    /// so the parent's parked tool-call SchedulerFuture resumes.
+    /// (`pending_io` is currently unused — async dispatch callbacks
+    /// became driver events in step 11 slices 4/6 — but every caller
+    /// already threads it and a future delivery kind will want it.)
     pub(super) fn complete_function(
         &mut self,
         id: FunctionId,
         outcome: FunctionOutcome,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+        _pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) {
         let Some(entry) = self.active_functions.remove(&id) else {
             warn!(function_id = id, "complete_function: no such entry");
@@ -557,133 +469,7 @@ impl Scheduler {
                 // side.
                 let _ = sender.send(msg);
             }
-            FunctionDelivery::ToolResultFollowup {
-                parent_thread_id,
-                parent_tool_use_id,
-            } => {
-                self.deliver_async_followup(
-                    &parent_thread_id,
-                    &parent_tool_use_id,
-                    &entry.spec,
-                    &outcome,
-                    pending_io,
-                );
-            }
         }
-    }
-
-    /// Render a `<dispatched-thread-notification>` envelope from the
-    /// completed Function's terminal and inject it as a fresh user
-    /// message on the parent thread. No-op if the parent can't
-    /// currently accept one (parent gone, in a terminal state of its
-    /// own). The Function spec's `CreateThread`-variant carries the
-    /// child thread id; the terminal carries its final text.
-    fn deliver_async_followup(
-        &mut self,
-        parent_thread_id: &str,
-        parent_tool_use_id: &str,
-        spec: &Function,
-        outcome: &FunctionOutcome,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let child_thread_id = match spec {
-            Function::CreateThread { .. } => match outcome {
-                FunctionOutcome::Success(FunctionTerminal::CreateThread(term)) => {
-                    term.thread_id.clone()
-                }
-                _ => return,
-            },
-            _ => return,
-        };
-        let Some(child_task) = self.tasks.get(&child_thread_id) else {
-            return;
-        };
-        let (status, body) = match outcome {
-            FunctionOutcome::Success(FunctionTerminal::CreateThread(term)) => (
-                crate::runtime::scheduler::dispatch::DispatchStatus::Completed,
-                term.final_result
-                    .as_ref()
-                    .and_then(|s| s.final_text.clone())
-                    .unwrap_or_default(),
-            ),
-            FunctionOutcome::Error(err) => (
-                crate::runtime::scheduler::dispatch::DispatchStatus::Failed,
-                format!("child failed: {}", err.detail),
-            ),
-            FunctionOutcome::Cancelled(_) => (
-                crate::runtime::scheduler::dispatch::DispatchStatus::Cancelled,
-                String::new(),
-            ),
-            FunctionOutcome::Success(_) => return,
-        };
-        let notification = crate::runtime::scheduler::dispatch::render_dispatch_notification(
-            child_task,
-            parent_tool_use_id,
-            status,
-            &body,
-        );
-        let Some(parent) = self.tasks.get_mut(parent_thread_id) else {
-            // Parent gone — drop silently.
-            return;
-        };
-        let parent_state = parent.public_state();
-        let parent_terminal = matches!(
-            parent_state,
-            ThreadStateLabel::Failed | ThreadStateLabel::Cancelled
-        );
-        if parent_terminal {
-            debug!(
-                parent = %parent_thread_id,
-                child = %child_thread_id,
-                state = ?parent_state,
-                "dispatch async follow-up: parent in terminal state; dropping delivery"
-            );
-            return;
-        }
-        // A dormant parent (no ticking weave) can't run the turn this
-        // notification kicks — queue instead of delivering into the
-        // rejecting input guard, so the child's result survives until a
-        // weave adopts the parent.
-        let parent_can_accept = self.thread_ticker.contains_key(parent_thread_id)
-            && matches!(
-                parent_state,
-                ThreadStateLabel::Idle | ThreadStateLabel::Completed
-            );
-        if !parent_can_accept {
-            // Parent is mid-turn; queue the notification on the
-            // parent's state. `drain_pending_tool_result_followups`
-            // (called from `step_until_blocked` when the parent
-            // reaches an idle boundary) injects each queued entry as
-            // a fresh user message.
-            debug!(
-                parent = %parent_thread_id,
-                child = %child_thread_id,
-                state = ?parent_state,
-                "dispatch async follow-up: parent busy; queueing for next idle boundary"
-            );
-            parent.pending_tool_result_followups.push(notification);
-            self.mark_dirty(parent_thread_id);
-            return;
-        }
-        debug!(
-            parent = %parent_thread_id,
-            child = %child_thread_id,
-            "dispatch async follow-up: injecting notification as user message"
-        );
-        self.send_tool_result_text(parent_thread_id, notification, pending_io);
-        self.step_until_blocked(parent_thread_id, pending_io);
-    }
-
-    /// Find the FunctionId of the in-flight `CompactThread` targeting
-    /// `thread_id`, if any. Linear scan; `active_functions` stays small
-    /// enough that a scan is fine at the expected scale.
-    pub(super) fn find_compact_function_for(&self, thread_id: &str) -> Option<FunctionId> {
-        self.active_functions
-            .iter()
-            .find_map(|(id, entry)| match &entry.spec {
-                Function::CompactThread { thread_id: t } if t == thread_id => Some(*id),
-                _ => None,
-            })
     }
 
     /// Find the FunctionId of the in-flight tool-call Function (i.e.,
@@ -810,17 +596,6 @@ impl Scheduler {
         }
         if name == crate::tools::builtin_tools::FIND_TOOL {
             self.complete_find_tool_call(
-                thread_id,
-                op_id,
-                tool_use_id,
-                input,
-                disposition,
-                pending_io,
-            );
-            return;
-        }
-        if name == crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES {
-            self.complete_drain_knowledge_nudges_call(
                 thread_id,
                 op_id,
                 tool_use_id,
@@ -1089,32 +864,12 @@ impl Scheduler {
                 )
             }));
         } else {
-            // Delivery-shape selection is the scripted gate-off (step
-            // 11 slice 4): a scripted-ticked parent's callback is a
-            // driver event wired through the journal + watcher pair —
-            // `FunctionDelivery::None` leaves the Function owning
+            // Async callbacks are driver events wired through the
+            // journal + watcher pair (step 11 slice 4; scripted is the
+            // only driver kind since slice 6) — the Function owns
             // creation and cascade-cancel only, and machine text never
-            // rides the input path on a scripted weave.
-            let scripted_weave = self
-                .thread_ticker
-                .get(parent_thread_id)
-                .filter(|weave_id| {
-                    self.weaves.get(*weave_id).is_some_and(|weave| {
-                        matches!(
-                            weave.driver,
-                            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-                        )
-                    })
-                })
-                .cloned();
-            let delivery = if scripted_weave.is_some() {
-                FunctionDelivery::None
-            } else {
-                FunctionDelivery::ToolResultFollowup {
-                    parent_thread_id: parent_thread_id.to_string(),
-                    parent_tool_use_id: tool_use_id.clone(),
-                }
-            };
+            // rides the input path.
+            let delivery = FunctionDelivery::None;
             let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
                 Ok(id) => id,
                 Err(e) => {
@@ -1162,47 +917,42 @@ impl Scheduler {
                 ));
                 return;
             };
-            let ack = if let Some(weave_id) = scripted_weave {
-                // Durable half then in-memory half: the pending
-                // journal record is what a restart heals from; the
-                // watcher is the live index onto it.
-                if let Some(weave) = self.weaves.get_mut(&weave_id) {
-                    let effect_id = weave.record_pending_effect(
-                        crate::runtime::driver::PersistedDriverEffect::DispatchCallback {
-                            parent_thread_id: parent_thread_id.to_string(),
-                            tool_use_id: tool_use_id.clone(),
-                            child_thread_id: child_id.clone(),
-                        },
-                    );
-                    self.mark_weave_dirty(&weave_id);
-                    self.scripted_dispatch_watchers.insert(
-                        child_id.clone(),
-                        super::scripted::ScriptedDispatchWatcher {
-                            weave_id,
-                            parent_thread_id: parent_thread_id.to_string(),
-                            tool_use_id: tool_use_id.clone(),
-                            child_thread_id: child_id.clone(),
-                            effect_id,
-                        },
-                    );
-                    // The child may have terminated during its launch
-                    // step — before the watcher existed. Same edge
-                    // `launch_create_thread` re-checks for the
-                    // Function itself.
-                    self.complete_scripted_dispatch_for_child(&child_id, pending_io);
-                }
-                format!(
-                    "Dispatched child thread `{child_id}` in the background. Its outcome \
-                     will be reported to this thread's coordinating driver when it \
-                     terminates; you can continue working in the meantime."
-                )
-            } else {
-                format!(
-                    "Dispatched child thread `{child_id}` in the background. Its final result will \
-                     be delivered as a fresh user message once the child terminates; you can \
-                     continue working in the meantime."
-                )
-            };
+            // Durable half then in-memory half: the pending journal
+            // record is what a restart heals from; the watcher is the
+            // live index onto it. (The parent's ticking weave is
+            // always scripted since slice 6.)
+            if let Some(weave_id) = self.thread_ticker.get(parent_thread_id).cloned()
+                && let Some(weave) = self.weaves.get_mut(&weave_id)
+            {
+                let effect_id = weave.record_pending_effect(
+                    crate::runtime::driver::PersistedDriverEffect::DispatchCallback {
+                        parent_thread_id: parent_thread_id.to_string(),
+                        tool_use_id: tool_use_id.clone(),
+                        child_thread_id: child_id.clone(),
+                    },
+                );
+                self.mark_weave_dirty(&weave_id);
+                self.scripted_dispatch_watchers.insert(
+                    child_id.clone(),
+                    super::scripted::ScriptedDispatchWatcher {
+                        weave_id,
+                        parent_thread_id: parent_thread_id.to_string(),
+                        tool_use_id: tool_use_id.clone(),
+                        child_thread_id: child_id.clone(),
+                        effect_id,
+                    },
+                );
+                // The child may have terminated during its launch
+                // step — before the watcher existed. Same edge
+                // `launch_create_thread` re-checks for the
+                // Function itself.
+                self.complete_scripted_dispatch_for_child(&child_id, pending_io);
+            }
+            let ack = format!(
+                "Dispatched child thread `{child_id}` in the background. Its outcome \
+                 will be reported to this thread's coordinating driver when it \
+                 terminates; you can continue working in the meantime."
+            );
             let parent_id = parent_thread_id.to_string();
             pending_io.push(Box::pin(async move {
                 crate::runtime::io_dispatch::SchedulerCompletion::Io(
@@ -1387,63 +1137,6 @@ impl Scheduler {
             op_id,
             tool_use_id,
             out,
-        ));
-    }
-
-    /// `drain_knowledge_nudges`-specific synchronous path. Drains the
-    /// same transient queue used by automatic knowledge nudge
-    /// insertion, giving models a portable explicit handle at provider
-    /// turn/tool boundaries without removing the auto-insert path.
-    fn complete_drain_knowledge_nudges_call(
-        &mut self,
-        thread_id: &str,
-        op_id: crate::runtime::thread::OpId,
-        tool_use_id: String,
-        input: serde_json::Value,
-        disposition: crate::permission::Disposition,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        if matches!(disposition, crate::permission::Disposition::Deny) {
-            pending_io.push(make_denial_future(
-                thread_id.to_string(),
-                tool_use_id,
-                op_id,
-                crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES.to_string(),
-            ));
-            return;
-        }
-        if let Err(e) = crate::tools::builtin_tools::drain_knowledge_nudges::parse_args(input) {
-            pending_io.push(immediate_tool_error(
-                thread_id.to_string(),
-                op_id,
-                tool_use_id,
-                e,
-            ));
-            return;
-        }
-
-        let in_flight = self.knowledge_autoquery_in_flight.contains(thread_id);
-        let Some(nudges) = self.tasks.get_mut(thread_id).map(|task| {
-            task.suppress_next_knowledge_nudge = true;
-            std::mem::take(&mut task.pending_knowledge_nudges)
-        }) else {
-            pending_io.push(immediate_tool_error(
-                thread_id.to_string(),
-                op_id,
-                tool_use_id,
-                format!("no such thread `{thread_id}`"),
-            ));
-            return;
-        };
-        if !nudges.is_empty() {
-            self.mark_dirty(thread_id);
-        }
-        let body = crate::tools::builtin_tools::drain_knowledge_nudges::render(&nudges, in_flight);
-        pending_io.push(immediate_tool_success(
-            thread_id.to_string(),
-            op_id,
-            tool_use_id,
-            body,
         ));
     }
 
@@ -1879,13 +1572,8 @@ impl Scheduler {
 
         // Caller pod id — required to derive the pod-scope in-scope
         // set and to construct typed `pod` targets.
-        let (caller_pod_id, cleared_pending_nudges) = match self.tasks.get_mut(thread_id) {
-            Some(task) => {
-                let had_pending_nudges = !task.pending_knowledge_nudges.is_empty();
-                task.pending_knowledge_nudges.clear();
-                task.suppress_next_knowledge_nudge = true;
-                (task.pod_id.clone(), had_pending_nudges)
-            }
+        let caller_pod_id = match self.tasks.get(thread_id) {
+            Some(task) => task.pod_id.clone(),
             None => {
                 pending_io.push(immediate_tool_error(
                     thread_id.to_string(),
@@ -1896,9 +1584,6 @@ impl Scheduler {
                 return;
             }
         };
-        if cleared_pending_nudges {
-            self.mark_dirty(thread_id);
-        }
 
         let (in_scope_server, in_scope_pod) =
             self.in_scope_knowledge_bucket_names_for_thread(thread_id);
@@ -3395,20 +3080,6 @@ impl Scheduler {
                     );
                     self.teardown_host_env_if_terminal(child_id);
                     self.on_behavior_thread_terminal(child_id, pending_io);
-                    // Same resolution `execute_cancel_thread` performs:
-                    // if the child was mid-compaction (auto-compact can
-                    // fire on an awaited child at a cycle boundary),
-                    // `weave_cancelled` above cleared the marker but the
-                    // child's own CompactThread Function — Weave caller,
-                    // no awaiting-child link, matched by neither cascade
-                    // helper — would leak in the registry.
-                    if let Some(compact_fn) = self.find_compact_function_for(child_id) {
-                        self.complete_function(
-                            compact_fn,
-                            FunctionOutcome::Cancelled(crate::functions::CancelReason::CallerGone),
-                            pending_io,
-                        );
-                    }
                     Some(child_id.clone())
                 }
             } else {
@@ -3486,16 +3157,6 @@ impl Scheduler {
         self.complete_functions_awaiting_thread(thread_id, pending_io);
         self.complete_scripted_dispatch_for_child(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
-        // A compaction in flight on this thread was abandoned by the
-        // cancel (the weave's marker was cleared in `weave_cancelled`);
-        // resolve its Function so the registry doesn't leak the entry.
-        if let Some(fn_id) = self.find_compact_function_for(thread_id) {
-            self.complete_function(
-                fn_id,
-                FunctionOutcome::Cancelled(crate::functions::CancelReason::ExplicitCancel),
-                pending_io,
-            );
-        }
     }
 }
 

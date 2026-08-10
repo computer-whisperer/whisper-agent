@@ -19,12 +19,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use whisper_agent_protocol::ThreadDriverConfig;
 use whisper_agent_protocol::weave::{PresentationBlock, WeaveSnapshot, WeaveThreadRefInfo};
-use whisper_agent_protocol::{ParticipantId, ThreadDriverConfig, ThreadParticipants};
 
 use crate::runtime::driver::{
-    self, DriverEffect, DriverEffectId, DriverEffectJournal, DriverState, PersistedDriverEffect,
-    ThreadRelationship,
+    DriverEffectId, DriverEffectJournal, DriverState, PersistedDriverEffect, ThreadRelationship,
 };
 
 pub type WeaveId = String;
@@ -313,61 +312,6 @@ impl Weave {
     // ---------- driver policy boundaries ----------
     //
     // Thin wrappers so the scheduler consults one object and `Thread` never
-    // imports driver policy. Participants and max_turns are passed in from
-    // the thread's config: execution setup stays thread-level until the
-    // profile definitions migrate up in steps 6-7.
-
-    /// External input was accepted into a coordinated thread; reset the
-    /// driver's cycle state.
-    pub fn input_accepted(&mut self) -> Result<(), String> {
-        self.touch();
-        driver::input_accepted(&self.driver, &mut self.driver_state)
-    }
-
-    /// Ask the driver what to do at a runnable turn boundary.
-    pub fn next_effect(
-        &mut self,
-        participants: &ThreadParticipants,
-        max_turns: u32,
-    ) -> Result<DriverEffect, String> {
-        driver::next_effect(
-            &self.driver,
-            &mut self.driver_state,
-            participants,
-            max_turns,
-        )
-    }
-
-    /// Interpret one completed agent response.
-    pub fn agent_completed(
-        &self,
-        participant_id: &ParticipantId,
-        participants: &ThreadParticipants,
-        has_tool_calls: bool,
-    ) -> Result<DriverEffect, String> {
-        driver::agent_completed(
-            &self.driver,
-            &self.driver_state,
-            participant_id,
-            participants,
-            has_tool_calls,
-        )
-    }
-
-    /// Interpret completion of all tools requested by an agent turn.
-    pub fn tools_completed(
-        &self,
-        participant_id: &ParticipantId,
-        participants: &ThreadParticipants,
-    ) -> Result<DriverEffect, String> {
-        driver::tools_completed(
-            &self.driver,
-            &self.driver_state,
-            participant_id,
-            participants,
-        )
-    }
-
     // ---------- journal ----------
 
     /// Record a pending effect. The caller must dispatch the matching I/O
@@ -446,15 +390,12 @@ impl Weave {
     }
 
     /// One-time bridge for state migrated off pre-weave thread JSON.
-    pub fn import_thread_driver_state(
-        &mut self,
-        state: DriverState,
-        journal: DriverEffectJournal,
-        legacy_turns: u32,
-    ) {
+    /// The tombstone builtin state it imports is converted wholesale by
+    /// `migrate_builtin_weaves` at load (slice 6), so the old per-turn
+    /// legacy bridge is gone.
+    pub fn import_thread_driver_state(&mut self, state: DriverState, journal: DriverEffectJournal) {
         self.driver_state = state;
         self.effect_journal = journal;
-        driver::import_legacy_turn_count(&mut self.driver_state, legacy_turns);
     }
 }
 
@@ -472,33 +413,6 @@ mod tests {
         assert_eq!(weave.primary_thread_id(), Some("t-1"));
         assert!(weave.references("t-1"));
         assert!(!weave.references("t-2"));
-    }
-
-    #[test]
-    fn boundary_flow_mirrors_the_compatibility_driver() {
-        let mut weave =
-            Weave::singleton_for_thread("t-1", "pod", ThreadDriverConfig::BuiltinSingleAgentChat);
-        let participants = ThreadParticipants::default();
-        weave.input_accepted().unwrap();
-
-        let effect = weave.next_effect(&participants, 4).unwrap();
-        assert!(matches!(effect, DriverEffect::RunAgent { turn: 1, .. }));
-        assert_eq!(
-            weave
-                .agent_completed(&participants.default_responder, &participants, true)
-                .unwrap(),
-            DriverEffect::DispatchTools
-        );
-        assert_eq!(
-            weave
-                .tools_completed(&participants.default_responder, &participants)
-                .unwrap(),
-            DriverEffect::Continue
-        );
-        assert!(matches!(
-            weave.next_effect(&participants, 4).unwrap(),
-            DriverEffect::RunAgent { turn: 2, .. }
-        ));
     }
 
     #[test]

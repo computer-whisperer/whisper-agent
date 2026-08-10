@@ -1267,6 +1267,146 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    no summary turn — the next close fails extraction and
    self-heals, and input clears it too.
 
+11. **Step 11 slice 6 ratified 2026-08-10: the builtin conversion.**
+   The last slice of step 11 — scripted becomes the only driver kind
+   at runtime. Ground truth: the UI's "builtin" picker option already
+   submits NO driver override (the server default decides), the
+   compact button doesn't key off driver kind, `ThreadDefaults`
+   tolerates unknown TOML fields in both directions, and every
+   builtin-only code path traces to five clusters (policy fns + weave
+   wrappers, builtin boundary arms, the CompactThread Function
+   machinery, the ambient autoquery subsystem, the async-dispatch
+   envelope injection queue — whose `ToolResultFollowup` delivery has
+   exactly one construction site). Four forks ratified:
+   - *Residence: embedded + pod override.* titled_chat.lua embeds in
+     the binary (canonical file stays `examples/drivers/`);
+     `load_driver_program` tries `<pod>/drivers/<name>.lua` first,
+     then the embedded registry — a pod may shadow the default to
+     customize it. Pods gain optional `thread_defaults.driver` +
+     `[thread_defaults.driver_config]` (the behavior-TOML shape);
+     absent = embedded titled_chat, empty knobs. REJECTED: a server
+     drivers dir on disk (a broken file breaks creation server-wide;
+     installs need seeding); materializing copies into pods (N
+     drifting copies + backfill).
+   - *Migration: translate configs.* `load_state` converts every
+     builtin weave to Scripted titled_chat with synthesized state
+     `{primary, title_requested: true}` (existing titles stand; no
+     retro-titling) and knob translation from the PRIMARY thread's
+     config — `autoquery.enabled` → the `autoquery` knob,
+     `compaction.token_threshold` → the threshold knob — so legacy
+     auto behaviors keep working through the driver path. Every
+     loaded thread's `config.driver` rewrites the same way (forks
+     inherit correctly); driverless legacy JSON deserializes to the
+     builtin default and migrates on the same pass. Going forward
+     the knobs are the ONLY auto-compact/autoquery surface;
+     thread-config `token_threshold` and `autoquery.enabled` are
+     documented-dead wire fields (kept for compat). REJECTED:
+     minimal synthesis (silently stops legacy auto behaviors); no
+     migration (the two-driver world persists — the anti-goal).
+   - *Deletion: all five clusters now.* Migration makes every
+     builtin path unreachable; dead code invites drift. The enum
+     variants (`ThreadDriverConfig::BuiltinSingleAgentChat`,
+     `DriverState::BuiltinSingleAgentChat`) survive as
+     deserialize-only tombstones that load migrates away; nothing
+     constructs them at runtime. Recorded consequences: the rich
+     `AutoqueryConfig` fields (buckets, top_k, rerank floor,
+     query_source, …) become dead config until a driver wants knobs
+     for them; `drain_knowledge_nudges` leaves the tool surface
+     (frozen manifests of migrated threads may still list it — a
+     model calling it gets a graceful unknown-tool error); the
+     fork-mid-compaction guard dies with the marker (scripted cp is
+     opaque; forking mid-summary copies the prompt into the fork —
+     cosmetic, recorded at slice 5). An explicit
+     `ThreadConfigOverride.driver = BuiltinSingleAgentChat` from an
+     old client maps to the pod default at creation (compat mapping,
+     not an error). REJECTED: flip-now-delete-later (two slices
+     touching the same code; a window where dead code silently
+     regresses).
+   - *Titling cost: accept uniformly.* Every creation path —
+     dispatch children, subagents, behavior threads without a TOML
+     driver — gets titled_chat and its one-turn tools-off title job
+     (~one cheap call per thread; the knob can point at a small
+     model pod-wide). Uniformity keeps creation paths policy-free.
+     REJECTED: a title.enabled knob forced off by internal creation
+     paths (policy leaking into creation code); a second embedded
+     plain-chat driver (two programs + a which-default-where policy
+     surface). **Standing direction (user, 2026-08-10, verbatim):**
+     "longer term I think the correct way to handle derived threads
+     is to make them part of the weave, and give the driver a way
+     to establish custom tools that it manages. Having the existing
+     system just spawn a new weave seems like an acceptable
+     intermediate solution." — i.e. dispatch-style children
+     eventually join the PARENT weave under driver-declared,
+     driver-managed tools, and the per-child singleton weave (with
+     its titling) is sanctioned transitional scaffolding, not a
+     surface to optimize.
+   - *Implementation notes (decided, not forked):* a small
+     server-authoritative `ListDrivers` wire pair replaces the UI's
+     pod-file-tree derivation for the picker (the embedded default
+     isn't a pod file; the behavior-editor slice wants the same
+     list); the picker's empty-string option relabels to "Pod
+     default"; `DescribeDriver` resolves through the same
+     pod-then-embedded lookup; the pod-editor Defaults-tab control
+     for `thread_defaults.driver` is deferred to the UI slice
+     (pod.toml is hand-editable meanwhile).
+
+   **Slice 6 landed 2026-08-10** (same session as ratification).
+   `EMBEDDED_DRIVERS`/`DEFAULT_DRIVER_NAME` + pod-first resolution in
+   `load_driver_program` (a broken shadowing file errors loudly —
+   only NotFound falls through); `ThreadDefaults.driver`/
+   `driver_config` + server-side substitution in
+   `base_thread_config_from_pod`, explicit-builtin mapping in
+   `apply_config_override` (maps to `base.driver` — the POD default
+   incl. its knobs, not hardcoded titled_chat);
+   `migrate_builtin_weaves` in `load_state` after threads, before
+   the dead-ticked notice collection (migrated weaves get their
+   `thread_failed` load notices); per-thread `config.driver` rewrite
+   in the thread loop; all five deletion clusters removed (~27
+   builtin tests retired, net −1600 lines of machinery);
+   `ListDrivers`/`DriverList` wire + UI picker on it. Every
+   pre-existing harness test passed UNCHANGED after the flip — the
+   embedded fallback needed zero fixtures. Tests: migration
+   end-to-end (knob translation, no retro-titling, manual compact on
+   a migrated weave), default resolution incl. explicit-builtin
+   mapping and pod-shadow listing, dispatch-child default, TOML
+   round-trip both directions. Gates: fmt, clippy -D warnings exit
+   0, 1411 workspace tests 0 failed.
+   **Reviewed (same session), verdict sound after fixes** — the
+   reviewer verified reachability (nothing constructs or matches the
+   tombstones at runtime), migration order and edge cases
+   (no-primary weave, healed-Failed primary vs the synthesized
+   state, threshold-0 drop), wire/JSON compat both directions (the
+   deleted Thread fields were never persisted), and the default
+   resolution composition. Fixes taken: the "documented-dead"
+   contract was actually finished — the model-facing `about` pod
+   doc now teaches `[thread_defaults.driver_config]` knobs instead
+   of the dead `compaction.token_threshold` field (the one finding
+   that actively misled models pod-wide), and the protocol doc
+   comments on `CompactionConfig.token_threshold` /
+   `KnowledgeAutoqueryConfig` say DEAD wire compat; the new-thread
+   form's dead autoquery-override section and compaction
+   token-threshold row were removed (they submitted wire fields
+   nothing reads); dead `Thread::submit_tool_result_text` /
+   `submit_server_nudge` deleted; stale doc-comment debris swept
+   (orphaned builtin references in scheduler/functions/compaction
+   docs, the UI driver-menu doc, the drain-nudges entry in the
+   tool-disposition editor). Accepted, recorded: a pod shadowing
+   `titled_chat` with a describe() that drops the
+   autoquery/threshold knobs makes a migrated legacy knob map fail
+   creation-time validation at the first compaction-continuation
+   derive ("unknown knob" — narrow: shadow + legacy weave + legacy
+   knobs; the roll fails loudly at the derive step);
+   `list_driver_names` on an unknown pod returns the embedded list
+   rather than erroring, and an EACCES drivers dir lists
+   embedded-only while creation errors loudly — benign
+   inconsistency; old clients sending CompactThread no longer see
+   Function lifecycle broadcasts (cosmetic; the compact button
+   never keyed off them); `ServerToClient::ThreadToolResultMessage`
+   is never emitted anymore but stays in the protocol + UI for old
+   transcripts; the pod-editor Defaults-tab autoquery section still
+   edits the dead TOML fields — swept with the UI slice's
+   driver_config form.
+
 ## Open questions (flagged, not ratified)
 
 - Entry storage: copies on pollution (accepted initially; fan-out is small)

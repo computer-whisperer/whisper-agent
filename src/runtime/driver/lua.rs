@@ -320,10 +320,9 @@ pub enum ScriptedEffect {
         decisions: Vec<ScriptedToolDecision>,
     },
     /// Take another model turn after tools completed. `nudge`
-    /// optionally appends one system-authored message (the
-    /// `submit_server_nudge` shape) atomically before the model call —
-    /// the only mid-cycle injection point; `append_entry` stays
-    /// refused mid-generation.
+    /// optionally appends one system-authored message atomically
+    /// before the model call — the only mid-cycle injection point;
+    /// `append_entry` stays refused mid-generation.
     ContinueCycle {
         thread_id: String,
         #[serde(default)]

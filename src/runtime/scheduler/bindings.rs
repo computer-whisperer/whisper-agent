@@ -365,6 +365,8 @@ mod tests {
                 backend: "anthropic".into(),
                 model: "claude-opus-4-7".into(),
                 system_prompt_file: "system_prompt.md".into(),
+                driver: None,
+                driver_config: Default::default(),
                 max_tokens: 1000,
                 max_turns: 10,
                 host_env: vec!["wide".into()],

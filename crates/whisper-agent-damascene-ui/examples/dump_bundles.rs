@@ -2498,6 +2498,8 @@ mcp_hosts = ["filesystem", "git"]
             backend: "anthropic-prod".into(),
             model: "claude-opus-4-7".into(),
             system_prompt_file: "system_prompt.md".into(),
+            driver: None,
+            driver_config: Default::default(),
             max_tokens: 16384,
             max_turns: 30,
             host_env: vec!["main".into()],

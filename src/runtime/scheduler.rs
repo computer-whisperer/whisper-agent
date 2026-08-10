@@ -53,9 +53,8 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use whisper_agent_protocol::{
-    ClientToServer, ContentBlock, HostEnvBinding, KnowledgeAutoqueryConfig,
-    KnowledgeAutoquerySource, ResourceKind, ServerToClient, ThreadBindings, ThreadBindingsRequest,
-    ThreadConfigOverride, ThreadStateLabel, ThreadSummary,
+    ClientToServer, HostEnvBinding, ResourceKind, ServerToClient, ThreadBindings,
+    ThreadBindingsRequest, ThreadConfigOverride, ThreadStateLabel, ThreadSummary,
 };
 
 use crate::knowledge::BucketRegistry;
@@ -67,9 +66,7 @@ use crate::providers::model::ModelProvider;
 use crate::providers::rerank::RerankProvider;
 use crate::runtime::audit::AuditLog;
 use crate::runtime::forensics::ForensicSink;
-use crate::runtime::io_dispatch::{
-    self, IoCompletion, KnowledgeAutoqueryCompletion, SchedulerCompletion, SchedulerFuture,
-};
+use crate::runtime::io_dispatch::{self, IoCompletion, SchedulerCompletion, SchedulerFuture};
 use crate::runtime::thread::{IoResult, OpId, StepOutcome, Thread, derive_title, new_task_id};
 use crate::server::thread_router::ThreadEventRouter;
 use crate::tools::mcp::{McpSession, ToolAnnotations, ToolDescriptor as McpTool};
@@ -128,55 +125,6 @@ struct BoundMcp<'a> {
     source_name: String,
 }
 
-fn autoquery_text_from_blocks(
-    blocks: &[ContentBlock],
-    source: KnowledgeAutoquerySource,
-    max_chars: usize,
-) -> String {
-    let reasoning = collect_assistant_text(blocks, true);
-    let text = collect_assistant_text(blocks, false);
-    let selected = match source {
-        KnowledgeAutoquerySource::ReasoningThenText => {
-            if reasoning.trim().is_empty() {
-                text
-            } else {
-                reasoning
-            }
-        }
-        KnowledgeAutoquerySource::TextThenReasoning => {
-            if text.trim().is_empty() {
-                reasoning
-            } else {
-                text
-            }
-        }
-        KnowledgeAutoquerySource::ReasoningAndText => match (reasoning.is_empty(), text.is_empty())
-        {
-            (true, true) => String::new(),
-            (false, true) => reasoning,
-            (true, false) => text,
-            (false, false) => format!("{reasoning}\n\n{text}"),
-        },
-        KnowledgeAutoquerySource::ReasoningOnly => reasoning,
-        KnowledgeAutoquerySource::TextOnly => text,
-    };
-    tail_chars(selected.trim(), max_chars)
-}
-
-fn collect_assistant_text(blocks: &[ContentBlock], reasoning: bool) -> String {
-    let mut out = String::new();
-    for block in blocks {
-        match (reasoning, block) {
-            (true, ContentBlock::Thinking { thinking, .. }) => {
-                append_block_text(&mut out, thinking)
-            }
-            (false, ContentBlock::Text { text }) => append_block_text(&mut out, text),
-            _ => {}
-        }
-    }
-    out
-}
-
 pub(crate) fn knowledge_hit_key(hit: &crate::knowledge::RerankedCandidate) -> String {
     if hit.source_ref.source_id.is_empty() {
         format!("{}\tchunk:{}", hit.bucket_id, hit.chunk_id)
@@ -189,31 +137,6 @@ pub(crate) fn knowledge_hit_keys(hits: &[crate::knowledge::RerankedCandidate]) -
     hits.iter().map(knowledge_hit_key).collect()
 }
 
-fn append_block_text(out: &mut String, text: &str) {
-    if text.trim().is_empty() {
-        return;
-    }
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(text);
-}
-
-fn tail_chars(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let len = text.chars().count();
-    if len <= max_chars {
-        return text.to_string();
-    }
-    text.chars()
-        .skip(len - max_chars)
-        .collect::<String>()
-        .trim_start()
-        .to_string()
-}
-
 fn head_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -223,54 +146,6 @@ fn head_chars(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
-}
-
-fn format_autoquery_nudge(
-    query: &str,
-    labels: &[String],
-    hits: &[crate::knowledge::RerankedCandidate],
-    config: &KnowledgeAutoqueryConfig,
-) -> Option<String> {
-    let filtered: Vec<_> = hits
-        .iter()
-        .filter(|h| h.rerank_score >= config.min_rerank_score)
-        .collect();
-    if filtered.is_empty() {
-        return None;
-    }
-    let mut out = String::from(
-        "A hot knowledge bucket surfaced material related to the current reasoning trace. Use `knowledge_query` if you need more context.\n",
-    );
-    out.push_str("Queried hot buckets: ");
-    out.push_str(&labels.join(", "));
-    out.push('\n');
-    out.push_str("Trace query excerpt: ");
-    out.push_str(&format!("{:?}", head_chars(query, 240)));
-    out.push_str("\n\n");
-    for (idx, hit) in filtered.into_iter().enumerate() {
-        let title = if hit.source_ref.source_id.is_empty() {
-            format!("chunk {}", hit.chunk_id)
-        } else {
-            hit.source_ref.source_id.clone()
-        };
-        let locator = hit
-            .source_ref
-            .locator
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|s| format!(" ({s})"))
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "{}. [{}] {}{} — rerank={:.3}\n{}\n\n",
-            idx + 1,
-            hit.bucket_id,
-            title,
-            locator,
-            hit.rerank_score,
-            head_chars(&hit.chunk_text, config.snippet_chars as usize),
-        ));
-    }
-    Some(out)
 }
 
 fn tool_requires_image_input(name: &str) -> bool {
@@ -797,7 +672,6 @@ pub struct Scheduler {
     /// flight. A fast tool result can otherwise advance the thread to
     /// the next model call before retrieval finishes, making the nudge
     /// arrive after the turn is already terminal.
-    knowledge_autoquery_in_flight: HashSet<String>,
     /// Server-level `[knowledge]` tunables (sparse timeout, …). Cloned
     /// into each query call site at use time. Refreshed in place by
     /// the runtime config-edit handler.
@@ -1108,7 +982,6 @@ impl Scheduler {
                 oauth_refresh_in_flight: HashSet::new(),
                 oauth_refresh_no_refresh_token_warned: HashSet::new(),
                 oauth_refresh_failure_counts: HashMap::new(),
-                knowledge_autoquery_in_flight: HashSet::new(),
                 knowledge_config,
                 tasks: HashMap::new(),
                 weaves: HashMap::new(),
@@ -3121,27 +2994,6 @@ impl Scheduler {
         // but any single winner restores the invariant, and the
         // demotion is flushed so the choice sticks across restarts.
         for mut weave in state.weaves {
-            // A compacting marker can't survive restart: the persister
-            // heals every in-flight thread to Failed (the summary turn
-            // is always in flight while the marker is set) and the
-            // CompactThread Function registry is in-memory only. Left
-            // set, the marker would refuse all future compactions on
-            // this weave and mis-trigger the finalize against the
-            // first ordinary Completed turn. The compaction prompt in
-            // the transcript is inert; the user re-triggers at will.
-            if let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                compacting: compacting @ Some(_),
-                ..
-            } = &mut weave.driver_state
-            {
-                warn!(
-                    weave_id = %weave.id,
-                    thread_id = compacting.as_deref().unwrap_or(""),
-                    "compaction was in flight at last shutdown — abandoned"
-                );
-                *compacting = None;
-                self.dirty_weaves.insert(weave.id.clone());
-            }
             for thread_ref in &mut weave.threads {
                 if !thread_ref.ticks {
                     continue;
@@ -3184,6 +3036,23 @@ impl Scheduler {
             // `rebind_escalation_if_orphaned`.
             if let crate::permission::Escalation::Interactive { .. } = task.scope.escalation {
                 task.scope.escalation = crate::permission::Escalation::None;
+            }
+            // Slice 6: the builtin driver no longer exists at runtime.
+            // A thread config carrying it — including legacy
+            // driverless JSON, which deserializes to the tombstone
+            // default — rewrites to the scripted default with knobs
+            // translated from its own config, so forks and compaction
+            // continuations inherit a live driver. (The weave-side
+            // conversion happens in `migrate_builtin_weaves` below.)
+            if matches!(
+                task.config.driver,
+                whisper_agent_protocol::ThreadDriverConfig::BuiltinSingleAgentChat
+            ) {
+                task.config.driver = whisper_agent_protocol::ThreadDriverConfig::Scripted {
+                    name: scripted::DEFAULT_DRIVER_NAME.to_string(),
+                    config: scripted::legacy_config_knobs(&task.config),
+                };
+                bindings_dirty = true;
             }
             for profile in task.config.participant_profiles.values_mut() {
                 if let crate::permission::Escalation::Interactive { .. } = profile.scope.escalation
@@ -3404,6 +3273,7 @@ impl Scheduler {
                 );
             }
         }
+        self.migrate_builtin_weaves();
         // A scripted weave's driver believes whatever its persisted
         // state says, and drivers don't run at load — so ticked
         // threads found dead here (persister-healed mid-flight, or
@@ -4721,26 +4591,12 @@ impl Scheduler {
         reset_capabilities: bool,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> Result<String, String> {
-        // Mid-compaction forks are refused here (the marker lives on
-        // the weave, which `Thread::fork_from` can't see): the summary
-        // turn is about to demote this thread, and the fork would copy
-        // the appended compaction prompt as ordinary history.
-        let compacting = self
-            .thread_ticker
-            .get(source_thread_id)
-            .and_then(|weave_id| self.weaves.get(weave_id))
-            .is_some_and(|weave| {
-                matches!(
-                    &weave.driver_state,
-                    crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                        compacting: Some(t),
-                        ..
-                    } if t == source_thread_id
-                )
-            });
-        if compacting {
-            return Err("cannot fork a thread while compaction is in flight".into());
-        }
+        // Note (step 11 slice 6): the old builtin path refused forks
+        // mid-compaction via its weave marker. Scripted compaction
+        // state is opaque driver JSON, so no guard is possible here —
+        // forking during a summary turn copies the appended compaction
+        // prompt into the fork as ordinary history (cosmetic; recorded
+        // at slice 5's review).
         let new_id = crate::runtime::thread::new_task_id();
         let mut task = {
             let source = self
@@ -5019,93 +4875,6 @@ impl Scheduler {
             });
     }
 
-    /// Append a `Role::ToolResult` + text message to `thread_id`'s
-    /// conversation and kick the model turn, same shape as
-    /// [`Self::send_user_message`] but broadcasts a
-    /// `ThreadToolResultMessage` event so clients can render it as
-    /// tool output rather than user input. Used for async
-    /// `dispatch_thread` callbacks (and any future server-injected
-    /// tool output) — the originating `tool_use_id` has already been
-    /// consumed by the synchronous ack, so the callback can't bind
-    /// to it structurally; the role carries the intent and the webui
-    /// parses the embedded XML envelope to reattach the payload to
-    /// the right tool-call item.
-    pub(super) fn send_tool_result_text(
-        &mut self,
-        thread_id: &str,
-        text: String,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        // Same dormant-thread guard as `send_user_message`: this text
-        // kicks a turn, and a thread with no ticking weave has nothing
-        // to route the resulting boundary.
-        if !self.thread_ticker.contains_key(thread_id) {
-            self.router.dispatch_events(
-                thread_id,
-                vec![crate::runtime::thread::ThreadEvent::Error {
-                    message: "thread is dormant (no weave ticks it); input rejected".into(),
-                }],
-            );
-            return;
-        }
-        // External input targets the presentation head (ratified 7b
-        // input rule). A scripted weave's auxiliary thread is the
-        // driver's workspace: input landing there would heal it
-        // mid-coordination and bulk-interrupt the shared weave's
-        // pending records, silently voiding an in-flight check and
-        // orphaning the parked primary. Refuse; the primary stays the
-        // one externally writable thread until a driver vocabulary
-        // (await_input) says otherwise.
-        if let Some(weave) = self
-            .thread_ticker
-            .get(thread_id)
-            .and_then(|weave_id| self.weaves.get(weave_id))
-            && matches!(
-                weave.driver,
-                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-            )
-            && weave.threads.iter().any(|r| {
-                r.thread_id == thread_id
-                    && r.role == crate::runtime::weave::WeaveThreadRole::Auxiliary
-            })
-        {
-            self.router.dispatch_events(
-                thread_id,
-                vec![crate::runtime::thread::ThreadEvent::Error {
-                    message:
-                        "auxiliary thread of a scripted weave; input targets the primary thread"
-                            .into(),
-                }],
-            );
-            return;
-        }
-        self.mark_dirty(thread_id);
-        let _ = pending_io;
-        // Deliberately don't derive a title from this text — a
-        // machine-rendered notification isn't a useful thread title.
-        let pending_resources = self.pending_resources_for(thread_id);
-        let new_state = {
-            let task = self.tasks.get_mut(thread_id).expect("task exists");
-            task.submit_tool_result_text(text.clone(), pending_resources);
-            task.public_state()
-        };
-        // After the submit, same as send_user_message: the driver's
-        // input_accepted effects must see the appended notification.
-        self.weave_input_accepted(thread_id, &text, pending_io);
-        self.router.broadcast_to_subscribers(
-            thread_id,
-            ServerToClient::ThreadToolResultMessage {
-                thread_id: thread_id.to_string(),
-                text,
-            },
-        );
-        self.router
-            .broadcast_task_list(ServerToClient::ThreadStateChanged {
-                thread_id: thread_id.to_string(),
-                state: new_state,
-            });
-    }
-
     /// Apply one per-thread I/O completion to its task and dispatch any
     /// resulting events.
     fn apply_io_completion(
@@ -5150,8 +4919,6 @@ impl Scheduler {
             }
             _ => {}
         }
-        self.maybe_launch_knowledge_autoquery(&thread_id, &result, pending_io);
-
         // Snapshot the tool-call outcome before handing the result to
         // the thread (which consumes it by move). The snapshot lets us
         // close out the matching `ActiveFunctionEntry` after the
@@ -5195,18 +4962,6 @@ impl Scheduler {
                 self.scripted_thread_failed(&thread_id, &message, pending_io);
             }
         }
-        let suppress_knowledge_nudge = events.iter().any(|event| {
-            matches!(
-                event,
-                crate::runtime::thread::ThreadEvent::AuditToolCall { tool_name, .. }
-                    if tool_name == crate::tools::builtin_tools::KNOWLEDGE_QUERY
-                        || tool_name == crate::tools::builtin_tools::DRAIN_KNOWLEDGE_NUDGES
-            )
-        });
-        if suppress_knowledge_nudge && let Some(task) = self.tasks.get_mut(&thread_id) {
-            task.pending_knowledge_nudges.clear();
-            task.suppress_next_knowledge_nudge = true;
-        }
         self.mark_dirty(&thread_id);
         self.router.dispatch_events(&thread_id, events);
         self.teardown_host_env_if_terminal(&thread_id);
@@ -5219,252 +4974,6 @@ impl Scheduler {
         }
     }
 
-    fn maybe_launch_knowledge_autoquery(
-        &mut self,
-        thread_id: &str,
-        result: &IoResult,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        let IoResult::ModelCall(Ok(response)) = result else {
-            return;
-        };
-        let Some(task) = self.tasks.get(thread_id) else {
-            return;
-        };
-        let config = task.config.autoquery.clone();
-        if !config.enabled || config.top_k == 0 {
-            return;
-        }
-        // Scripted-ticked threads own their retrieval through the
-        // `query_knowledge` effect (step 11 slice 3). The ambient
-        // machinery's injection and wait-gates live in
-        // `step_until_blocked`'s loop head, which scripted stepping
-        // bypasses — launching here would pay embed+rerank for nudges
-        // that cannot inject in time.
-        if self
-            .thread_ticker
-            .get(thread_id)
-            .and_then(|weave_id| self.weaves.get(weave_id))
-            .is_some_and(|weave| {
-                matches!(
-                    weave.driver,
-                    whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-                )
-            })
-        {
-            return;
-        }
-        let has_tool_use = response
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-        if !has_tool_use && !config.inject_at_terminal {
-            return;
-        }
-        let query_text = autoquery_text_from_blocks(
-            &response.content,
-            config.query_source,
-            config.max_query_chars as usize,
-        );
-        if query_text.trim().is_empty() {
-            return;
-        }
-        let caller_pod_id = task.pod_id.clone();
-        let (in_scope_server, in_scope_pod) =
-            self.in_scope_knowledge_bucket_names_for_thread(thread_id);
-        let targets = match functions::resolve_query_targets(
-            &config.buckets,
-            &in_scope_server,
-            &in_scope_pod,
-            &caller_pod_id,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(%thread_id, error = %e, "knowledge autoquery target resolution failed");
-                return;
-            }
-        };
-        if targets.is_empty() {
-            return;
-        }
-        let Some(reranker) = self
-            .rerank_providers
-            .values()
-            .next()
-            .map(|r| r.provider.clone())
-        else {
-            warn!(%thread_id, "knowledge autoquery skipped: no rerank provider configured");
-            return;
-        };
-
-        let mut buckets: Vec<Arc<dyn crate::knowledge::Bucket>> = Vec::new();
-        let mut labels: Vec<String> = Vec::new();
-        let mut embedder_name: Option<String> = None;
-        for tgt in targets {
-            let Some(entry) =
-                self.bucket_registry
-                    .find_entry(tgt.scope, tgt.pod_id.as_deref(), &tgt.name)
-            else {
-                continue;
-            };
-            if entry.active_slot.is_none() {
-                continue;
-            }
-            let hot = match tgt.scope {
-                crate::knowledge::BucketScope::Server => self.bucket_registry.hot_bucket(&tgt.name),
-                crate::knowledge::BucketScope::Pod => {
-                    let Some(pid) = tgt.pod_id.as_deref() else {
-                        continue;
-                    };
-                    self.bucket_registry.hot_bucket_pod(pid, &tgt.name)
-                }
-            };
-            let Some(bucket) = hot else {
-                if !config.hot_only {
-                    warn!(
-                        thread_id,
-                        bucket = %tgt.name,
-                        scope = %tgt.scope.as_str(),
-                        "knowledge autoquery skipped cold bucket; live path is hot-only",
-                    );
-                }
-                continue;
-            };
-            if embedder_name.is_none() {
-                embedder_name = Some(entry.config.defaults.embedder.clone());
-            }
-            labels.push(format!("{}:{}", tgt.scope.as_str(), tgt.name));
-            buckets.push(bucket);
-        }
-        if buckets.is_empty() {
-            return;
-        }
-        let Some(embedder_name) = embedder_name else {
-            return;
-        };
-        let Some(embedder) = self
-            .embedding_providers
-            .get(&embedder_name)
-            .map(|e| e.provider.clone())
-        else {
-            warn!(
-                %thread_id,
-                %embedder_name,
-                "knowledge autoquery skipped: embedder missing",
-            );
-            return;
-        };
-
-        let thread_id_s = thread_id.to_string();
-        if !self
-            .knowledge_autoquery_in_flight
-            .insert(thread_id_s.clone())
-        {
-            return;
-        }
-        let sparse_timeout_ms = self.knowledge_config.query.sparse_timeout();
-        pending_io.push(Box::pin(async move {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let engine = crate::knowledge::QueryEngine::new(embedder, reranker);
-            let params = crate::knowledge::QueryParams {
-                top_k: config.top_k as usize,
-                sparse_timeout_ms,
-                ..Default::default()
-            };
-            let result = match engine.query(&buckets, &query_text, &params, &cancel).await {
-                Ok(hits) => {
-                    let top_rerank_score = hits.first().map(|h| h.rerank_score);
-                    let injecting = hits
-                        .iter()
-                        .any(|hit| hit.rerank_score >= config.min_rerank_score);
-                    tracing::info!(
-                        thread_id = %thread_id_s,
-                        hits = hits.len(),
-                        top_rerank_score = ?top_rerank_score,
-                        min_rerank_score = config.min_rerank_score,
-                        injecting,
-                        "knowledge autoquery completed",
-                    );
-                    Ok(io_dispatch::KnowledgeAutoqueryResult {
-                        query: query_text,
-                        labels,
-                        hits,
-                    })
-                }
-                Err(e) => Err(e.to_string()),
-            };
-            SchedulerCompletion::KnowledgeAutoquery(KnowledgeAutoqueryCompletion {
-                thread_id: thread_id_s,
-                result,
-            })
-        }));
-    }
-
-    fn apply_knowledge_autoquery_completion(
-        &mut self,
-        completion: KnowledgeAutoqueryCompletion,
-        pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
-        self.knowledge_autoquery_in_flight
-            .remove(&completion.thread_id);
-        match completion.result {
-            Ok(payload) => {
-                let mut dirty = false;
-                let Some(task) = self.tasks.get_mut(&completion.thread_id) else {
-                    return;
-                };
-                if task.suppress_next_knowledge_nudge {
-                    task.suppress_next_knowledge_nudge = false;
-                    dirty = true;
-                } else {
-                    let unseen_hits: Vec<_> = payload
-                        .hits
-                        .into_iter()
-                        .filter(|hit| {
-                            hit.rerank_score >= task.config.autoquery.min_rerank_score
-                                && !task.seen_knowledge_hits.contains(&knowledge_hit_key(hit))
-                        })
-                        .collect();
-                    if let Some(nudge) = format_autoquery_nudge(
-                        &payload.query,
-                        &payload.labels,
-                        &unseen_hits,
-                        &task.config.autoquery,
-                    ) {
-                        task.seen_knowledge_hits
-                            .extend(knowledge_hit_keys(&unseen_hits));
-                        match task.internal {
-                            crate::runtime::thread::ThreadInternalState::AwaitingTools {
-                                ..
-                            }
-                            | crate::runtime::thread::ThreadInternalState::NeedsModelCall => {
-                                task.pending_knowledge_nudges.push(nudge);
-                            }
-                            crate::runtime::thread::ThreadInternalState::Completed
-                                if task.config.autoquery.inject_at_terminal =>
-                            {
-                                task.pending_knowledge_nudges.push(nudge);
-                            }
-                            _ => {}
-                        }
-                        dirty = true;
-                    }
-                }
-                if dirty {
-                    self.mark_dirty(&completion.thread_id);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    thread_id = %completion.thread_id,
-                    error = %e,
-                    "knowledge autoquery failed",
-                );
-            }
-        }
-        self.step_until_blocked(&completion.thread_id, pending_io);
-    }
-
     /// Advance `thread_id`'s state machine until it pauses, pushing new I/O to
     /// `pending_io` as requested.
     fn step_until_blocked(
@@ -5474,12 +4983,6 @@ impl Scheduler {
     ) {
         self.mark_dirty(thread_id);
         loop {
-            if self.inject_pending_knowledge_nudge(thread_id) {
-                continue;
-            }
-            if self.should_wait_for_knowledge_autoquery(thread_id) {
-                break;
-            }
             let mut events = Vec::new();
             let outcome = {
                 let Some(task) = self.tasks.get_mut(thread_id) else {
@@ -5520,31 +5023,7 @@ impl Scheduler {
                     // stepped.
                     break;
                 }
-                StepOutcome::Paused => {
-                    // Idle turn boundary. If this thread has queued
-                    // `<dispatched-thread-notification>` envelopes
-                    // waiting for an idle parent (async dispatch
-                    // follow-ups), inject the first one as a user
-                    // message and re-enter the step loop — it will
-                    // kick a fresh turn. Remaining follow-ups wait
-                    // for the next boundary.
-                    // Dormant threads keep their follow-ups queued —
-                    // dequeuing here would hand each one to the rejecting
-                    // input guard and drain the queue into the void.
-                    let has_followup = self.thread_ticker.contains_key(thread_id)
-                        && self
-                            .tasks
-                            .get(thread_id)
-                            .map(|t| !t.pending_tool_result_followups.is_empty())
-                            .unwrap_or(false);
-                    if has_followup && let Some(task) = self.tasks.get_mut(thread_id) {
-                        let notification = task.pending_tool_result_followups.remove(0);
-                        self.mark_dirty(thread_id);
-                        self.send_tool_result_text(thread_id, notification, pending_io);
-                        continue;
-                    }
-                    break;
-                }
+                StepOutcome::Paused => break,
             }
         }
         // Catch Completed/Failed/Cancelled transitions for behavior-spawned
@@ -5554,16 +5033,6 @@ impl Scheduler {
         // hook directly. Passes `pending_io` through so the hook can
         // re-fire on a queued QueueOne payload.
         self.on_behavior_thread_terminal(thread_id, pending_io);
-        // A summary turn that failed must release the weave's
-        // compacting marker (and error its Function) — no-op unless
-        // this thread is Failed while marked.
-        self.abort_builtin_compaction_if_failed(thread_id, pending_io);
-        // Check whether this thread has crossed its auto-compaction
-        // token threshold. (Compaction finalize itself fires from the
-        // builtin boundary path when the summary cycle finishes — a
-        // freshly demoted head is no longer its weave's primary, so
-        // the gate inside the hook keeps it from retriggering.)
-        self.maybe_auto_compact(thread_id, pending_io);
         // Dispatched-child terminal-state fan-out: if this thread is
         // a child awaited by a `Function::CreateThread{ThreadTerminal}`,
         // fire that Function's terminal — the delivery tag on the
@@ -5576,37 +5045,20 @@ impl Scheduler {
         self.cascade_cancel_caller_gone(thread_id, pending_io);
     }
 
-    /// Route a [`ThreadBoundary`] through the thread's ticking weave and
-    /// apply the driver's decision back onto the thread. Returns whether
-    /// the thread's state advanced: builtin-driver paths always either
-    /// change the thread's state or fail the thread (an unchanged
-    /// boundary would spin the step loop); a scripted driver may
-    /// legitimately park the thread at the boundary while it
-    /// orchestrates other threads, reported as `false` so the step loop
-    /// breaks.
-    ///
-    /// Journal choreography: pending records (`RunAgent`,
-    /// `DispatchTools`) are written to the weave before the matching
-    /// thread transition and I/O dispatch; the batched `flush_dirty` at
-    /// the end of the loop iteration lands them on disk before the lazy
-    /// I/O futures are polled (write-ahead boundary). Synchronous effects
-    /// (`Continue`, `Finish`) are recorded completed.
+    /// Route a [`ThreadBoundary`] through the thread's ticking weave.
+    /// Scripted is the only runtime driver kind (step 11 slice 6) —
+    /// load-time migration converts every persisted builtin weave, so
+    /// this is a thin admission wrapper around the scripted router.
+    /// Returns whether the thread's state advanced: a scripted driver
+    /// may legitimately park the thread at the boundary while it
+    /// orchestrates other threads, reported as `false` so the step
+    /// loop breaks instead of spinning on the same boundary.
     fn apply_thread_boundary(
         &mut self,
         thread_id: &str,
         boundary: crate::runtime::thread::ThreadBoundary,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
     ) -> bool {
-        use crate::runtime::driver::{DriverEffect, DriverFinishReason, PersistedDriverEffect};
-        use crate::runtime::thread::ThreadBoundary;
-
-        let Some((participants, max_turns)) = self
-            .tasks
-            .get(thread_id)
-            .map(|task| (task.config.participants.clone(), task.config.max_turns))
-        else {
-            return true;
-        };
         let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
             self.fail_thread_at_boundary(thread_id, "weave", "no ticking weave for thread");
             return true;
@@ -5616,216 +5068,7 @@ impl Scheduler {
             return true;
         }
         self.mark_weave_dirty(&weave_id);
-        if matches!(
-            self.weaves[&weave_id].driver,
-            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-        ) {
-            return self.apply_scripted_boundary(&weave_id, thread_id, boundary, pending_io);
-        }
-
-        match boundary {
-            ThreadBoundary::TurnStart => {
-                let effect = self
-                    .weaves
-                    .get_mut(&weave_id)
-                    .expect("checked above")
-                    .next_effect(&participants, max_turns);
-                match effect {
-                    Ok(DriverEffect::RunAgent {
-                        participant_id,
-                        turn,
-                    }) => {
-                        let generation = whisper_agent_protocol::GenerationContext::new(
-                            uuid::Uuid::new_v4().to_string(),
-                            participant_id,
-                        );
-                        let effect_id = self
-                            .weaves
-                            .get_mut(&weave_id)
-                            .expect("checked above")
-                            .record_pending_effect(PersistedDriverEffect::RunAgent {
-                                thread_id: thread_id.to_string(),
-                                generation: generation.clone(),
-                                turn,
-                            });
-                        let op_id = self.next_op_id;
-                        self.next_op_id += 1;
-                        let mut events = Vec::new();
-                        let request = self.tasks.get_mut(thread_id).and_then(|task| {
-                            task.begin_model_call(op_id, generation, effect_id, turn, &mut events)
-                        });
-                        self.router.dispatch_events(thread_id, events);
-                        match request {
-                            Some(req) => {
-                                let fut =
-                                    io_dispatch::build_io_future(self, thread_id.to_string(), req);
-                                pending_io.push(fut);
-                            }
-                            None => self.fail_thread_at_boundary(
-                                thread_id,
-                                "weave",
-                                "RunAgent effect did not apply at turn start",
-                            ),
-                        }
-                    }
-                    Ok(DriverEffect::Finish) => {
-                        self.record_completed_weave_effect(
-                            &weave_id,
-                            PersistedDriverEffect::Finish {
-                                thread_id: thread_id.to_string(),
-                                generation: None,
-                                reason: DriverFinishReason::TurnLimit,
-                            },
-                        );
-                        tracing::warn!(
-                            max_turns,
-                            thread_id = %thread_id,
-                            "driver finished cycle at turn limit"
-                        );
-                        self.finish_thread_cycle(thread_id);
-                        // A finished builtin cycle may be the compaction
-                        // summary turn — finalize rolls the weave's head
-                        // onto the continuation. No-op otherwise.
-                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
-                    }
-                    Ok(other) => self.fail_thread_at_boundary(
-                        thread_id,
-                        "driver",
-                        &format!("driver returned invalid effect at runnable boundary: {other:?}"),
-                    ),
-                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
-                }
-            }
-            ThreadBoundary::AgentCompleted {
-                generation,
-                effect_id,
-                has_tool_calls,
-            } => {
-                let weave = self.weaves.get_mut(&weave_id).expect("checked above");
-                weave.complete_effect(effect_id);
-                let effect = weave.agent_completed(
-                    &generation.participant_id,
-                    &participants,
-                    has_tool_calls,
-                );
-                match effect {
-                    Ok(DriverEffect::DispatchTools) => {
-                        let tool_use_ids: Vec<String> = self
-                            .tasks
-                            .get(thread_id)
-                            .map(|task| match &task.internal {
-                                crate::runtime::thread::ThreadInternalState::AgentBoundary {
-                                    pending_tool_uses,
-                                    ..
-                                } => pending_tool_uses
-                                    .iter()
-                                    .map(|t| t.tool_use_id.clone())
-                                    .collect(),
-                                _ => Vec::new(),
-                            })
-                            .unwrap_or_default();
-                        let dispatch_effect_id = self
-                            .weaves
-                            .get_mut(&weave_id)
-                            .expect("checked above")
-                            .record_pending_effect(PersistedDriverEffect::DispatchTools {
-                                thread_id: thread_id.to_string(),
-                                generation,
-                                tool_use_ids,
-                            });
-                        let applied = self
-                            .tasks
-                            .get_mut(thread_id)
-                            .map(|task| task.begin_tool_dispatch(dispatch_effect_id))
-                            .unwrap_or(false);
-                        if !applied {
-                            self.fail_thread_at_boundary(
-                                thread_id,
-                                "weave",
-                                "DispatchTools effect did not apply at agent boundary",
-                            );
-                        }
-                    }
-                    Ok(DriverEffect::Finish) => {
-                        self.record_completed_weave_effect(
-                            &weave_id,
-                            PersistedDriverEffect::Finish {
-                                thread_id: thread_id.to_string(),
-                                generation: Some(generation),
-                                reason: DriverFinishReason::AgentCompleted,
-                            },
-                        );
-                        self.finish_thread_cycle(thread_id);
-                        // A finished builtin cycle may be the compaction
-                        // summary turn — finalize rolls the weave's head
-                        // onto the continuation. No-op otherwise.
-                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
-                    }
-                    Ok(other) => self.fail_thread_at_boundary(
-                        thread_id,
-                        "driver",
-                        &format!(
-                            "driver returned invalid effect after agent completion: {other:?}"
-                        ),
-                    ),
-                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
-                }
-            }
-            ThreadBoundary::ToolsCompleted {
-                generation,
-                effect_id,
-            } => {
-                let weave = self.weaves.get_mut(&weave_id).expect("checked above");
-                weave.complete_effect(effect_id);
-                let effect = weave.tools_completed(&generation.participant_id, &participants);
-                match effect {
-                    Ok(DriverEffect::Continue) => {
-                        self.record_completed_weave_effect(
-                            &weave_id,
-                            PersistedDriverEffect::Continue {
-                                thread_id: thread_id.to_string(),
-                                generation,
-                                nudge_entry: None,
-                            },
-                        );
-                        let applied = self
-                            .tasks
-                            .get_mut(thread_id)
-                            .map(|task| task.continue_cycle())
-                            .unwrap_or(false);
-                        if !applied {
-                            self.fail_thread_at_boundary(
-                                thread_id,
-                                "weave",
-                                "Continue effect did not apply at tools boundary",
-                            );
-                        }
-                    }
-                    Ok(DriverEffect::Finish) => {
-                        self.record_completed_weave_effect(
-                            &weave_id,
-                            PersistedDriverEffect::Finish {
-                                thread_id: thread_id.to_string(),
-                                generation: Some(generation),
-                                reason: DriverFinishReason::ToolsCompleted,
-                            },
-                        );
-                        self.finish_thread_cycle(thread_id);
-                        // A finished builtin cycle may be the compaction
-                        // summary turn — finalize rolls the weave's head
-                        // onto the continuation. No-op otherwise.
-                        self.finalize_builtin_compaction(&weave_id, thread_id, pending_io);
-                    }
-                    Ok(other) => self.fail_thread_at_boundary(
-                        thread_id,
-                        "driver",
-                        &format!("driver returned invalid effect after tools: {other:?}"),
-                    ),
-                    Err(message) => self.fail_thread_at_boundary(thread_id, "driver", &message),
-                }
-            }
-        }
-        true
+        self.apply_scripted_boundary(&weave_id, thread_id, boundary, pending_io)
     }
 
     /// Record a synchronously-completed effect on a weave that is known
@@ -5840,11 +5083,10 @@ impl Scheduler {
         }
     }
 
-    /// Reset the ticking weave's driver cycle state after external input
-    /// was accepted into `thread_id`. The ratified input path: input
-    /// arrives at the weave, which resets its cycle and routes the
-    /// append to its primary thread. Scripted weaves additionally get an
-    /// `input_accepted` driver event (whose effects may need I/O).
+    /// Deliver accepted external input to the ticking weave's driver
+    /// as an `input_accepted` event (whose effects may need I/O). The
+    /// ratified input path: input arrives at the weave, which routes
+    /// the append to its primary thread.
     fn weave_input_accepted(
         &mut self,
         thread_id: &str,
@@ -5854,20 +5096,10 @@ impl Scheduler {
         let Some(weave_id) = self.thread_ticker.get(thread_id).cloned() else {
             return;
         };
-        let Some(weave) = self.weaves.get_mut(&weave_id) else {
-            return;
-        };
-        if matches!(
-            weave.driver,
-            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
-        ) {
-            self.scripted_input_accepted(&weave_id, thread_id, text, pending_io);
+        if !self.weaves.contains_key(&weave_id) {
             return;
         }
-        if let Err(error) = weave.input_accepted() {
-            warn!(%thread_id, weave_id = %weave_id, %error, "weave rejected input");
-        }
-        self.mark_weave_dirty(&weave_id);
+        self.scripted_input_accepted(&weave_id, thread_id, text, pending_io);
     }
 
     /// Interrupt any pending journal records on `thread_id`'s ticking
@@ -5900,24 +5132,6 @@ impl Scheduler {
     /// `scheduler/functions.rs`.
     pub(super) fn weave_cancelled(&mut self, thread_id: &str) {
         self.weave_interrupt_pending(thread_id, "cancelled");
-        // Cancelling the thread mid-compaction abandons the summary
-        // turn: clear the weave's marker so a later ordinary turn on
-        // this thread can't trip the finalize into deriving a
-        // continuation from a non-summary response (and so admission
-        // doesn't report the weave busy forever). The in-flight
-        // CompactThread Function completes as Cancelled in
-        // `execute_cancel_thread`, which owns `pending_io`.
-        if let Some(weave_id) = self.thread_ticker.get(thread_id).cloned()
-            && let Some(weave) = self.weaves.get_mut(&weave_id)
-            && let crate::runtime::driver::DriverState::BuiltinSingleAgentChat {
-                compacting: compacting @ Some(_),
-                ..
-            } = &mut weave.driver_state
-            && compacting.as_deref() == Some(thread_id)
-        {
-            *compacting = None;
-            self.mark_weave_dirty(&weave_id);
-        }
     }
 
     // ---------- cross-thread effect executors (migration step 6) ----------
@@ -6437,16 +5651,6 @@ impl Scheduler {
         result
     }
 
-    /// Apply a driver `Finish` to the thread and broadcast the events.
-    fn finish_thread_cycle(&mut self, thread_id: &str) {
-        let mut events = Vec::new();
-        if let Some(task) = self.tasks.get_mut(thread_id) {
-            task.finish_cycle(&mut events);
-        }
-        self.router.dispatch_events(thread_id, events);
-        self.mark_dirty(thread_id);
-    }
-
     /// Fail a thread at a weave boundary, resolving the thread's own
     /// pending journal records with the same message and broadcasting
     /// the error. Sibling threads' in-flight records are untouched.
@@ -6471,70 +5675,6 @@ impl Scheduler {
         }
         self.router.dispatch_events(thread_id, events);
         self.mark_dirty(thread_id);
-    }
-
-    fn should_wait_for_knowledge_autoquery(&self, thread_id: &str) -> bool {
-        self.knowledge_autoquery_in_flight.contains(thread_id)
-            && self
-                .tasks
-                .get(thread_id)
-                .map(|task| {
-                    matches!(
-                        task.internal,
-                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
-                    )
-                })
-                .unwrap_or(false)
-    }
-
-    fn inject_pending_knowledge_nudge(&mut self, thread_id: &str) -> bool {
-        // Dormant threads keep their nudges queued: injecting would kick
-        // a turn whose first boundary has no ticking weave to route it.
-        // The queue drains normally once a weave adopts the thread.
-        if !self.thread_ticker.contains_key(thread_id) {
-            return false;
-        }
-        let should_inject = self
-            .tasks
-            .get(thread_id)
-            .map(|task| {
-                !task.pending_knowledge_nudges.is_empty()
-                    && matches!(
-                        task.internal,
-                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
-                            | crate::runtime::thread::ThreadInternalState::Completed
-                    )
-                    && (matches!(
-                        task.internal,
-                        crate::runtime::thread::ThreadInternalState::NeedsModelCall
-                    ) || task.config.autoquery.inject_at_terminal)
-            })
-            .unwrap_or(false);
-        if !should_inject {
-            return false;
-        }
-        let pending_resources = self.pending_resources_for(thread_id);
-        let Some((new_state, snapshot)) = self.tasks.get_mut(thread_id).map(|task| {
-            let text = task.pending_knowledge_nudges.remove(0);
-            task.submit_server_nudge(text, pending_resources);
-            (task.public_state(), task.snapshot())
-        }) else {
-            return false;
-        };
-        self.mark_dirty(thread_id);
-        self.router.broadcast_to_subscribers(
-            thread_id,
-            ServerToClient::ThreadSnapshot {
-                thread_id: thread_id.to_string(),
-                snapshot,
-            },
-        );
-        self.router
-            .broadcast_task_list(ServerToClient::ThreadStateChanged {
-                thread_id: thread_id.to_string(),
-                state: new_state,
-            });
-        true
     }
 
     /// If the task is in a terminal state, tear down its sandbox (if any).
@@ -7387,9 +6527,6 @@ pub async fn run(
                             scheduler.apply_io_completion(io, &mut pending_io);
                             scheduler.step_until_blocked(&thread_id, &mut pending_io);
                         }
-                        SchedulerCompletion::KnowledgeAutoquery(done) => {
-                            scheduler.apply_knowledge_autoquery_completion(done, &mut pending_io);
-                        }
                         SchedulerCompletion::ScriptedQuery(done) => {
                             scheduler.apply_scripted_query_completion(done, &mut pending_io);
                         }
@@ -7575,78 +6712,6 @@ mod participant_profile_tests {
                 .unwrap_err()
                 .contains("unknown participant")
         );
-    }
-}
-
-#[cfg(test)]
-mod autoquery_tests {
-    use super::{autoquery_text_from_blocks, format_autoquery_nudge};
-    use crate::knowledge::{BucketId, ChunkId, RerankedCandidate, SearchPath, SourceRef};
-    use whisper_agent_protocol::{
-        ContentBlock, KnowledgeAutoqueryConfig, KnowledgeAutoquerySource,
-    };
-
-    #[test]
-    fn autoquery_prefers_reasoning_and_tails_long_trace() {
-        let blocks = vec![
-            ContentBlock::Thinking {
-                replay: None,
-                thinking: "first part. second part. third part.".into(),
-            },
-            ContentBlock::Text {
-                text: "visible answer".into(),
-            },
-        ];
-        let text =
-            autoquery_text_from_blocks(&blocks, KnowledgeAutoquerySource::ReasoningThenText, 18);
-        assert_eq!(text, "part. third part.");
-    }
-
-    #[test]
-    fn autoquery_can_fall_back_to_visible_text() {
-        let blocks = vec![ContentBlock::Text {
-            text: "attention mechanism failure mode".into(),
-        }];
-        let text =
-            autoquery_text_from_blocks(&blocks, KnowledgeAutoquerySource::ReasoningThenText, 200);
-        assert_eq!(text, "attention mechanism failure mode");
-    }
-
-    #[test]
-    fn autoquery_nudge_respects_score_threshold() {
-        let hit = RerankedCandidate {
-            bucket_id: BucketId::server("enwiki"),
-            chunk_id: ChunkId([7; 32]),
-            chunk_text: "Transformers use attention to model dependencies.".into(),
-            source_ref: SourceRef {
-                source_id: "Attention Is All You Need".into(),
-                locator: None,
-            },
-            source_score: 1.0,
-            source_path: SearchPath::Dense,
-            rerank_score: 0.42,
-        };
-        let mut cfg = KnowledgeAutoqueryConfig {
-            enabled: true,
-            min_rerank_score: 0.9,
-            ..Default::default()
-        };
-        assert!(
-            format_autoquery_nudge(
-                "attention",
-                &["server:enwiki".into()],
-                std::slice::from_ref(&hit),
-                &cfg,
-            )
-            .is_none()
-        );
-
-        cfg.min_rerank_score = 0.1;
-        let nudge = format_autoquery_nudge("attention", &["server:enwiki".into()], &[hit], &cfg)
-            .expect("hit above threshold should produce a nudge");
-        assert!(nudge.contains("A hot knowledge bucket"));
-        assert!(nudge.contains("Attention Is All You Need"));
-        assert!(nudge.contains("knowledge_query"));
     }
 }
 

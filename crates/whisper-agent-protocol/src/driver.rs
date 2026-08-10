@@ -84,6 +84,17 @@ pub struct KnobSpec {
     pub multiline: bool,
 }
 
+/// One row of a `DriverList` reply (step 11 slice 6): a driver name
+/// resolvable in the queried pod.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DriverListEntry {
+    pub name: String,
+    /// True when the name resolves to a server-embedded program rather
+    /// than a pod file. A pod file shadowing an embedded name reports
+    /// `false` — what you'd load is what's listed.
+    pub embedded: bool,
+}
+
 /// Everything `describe()` may return. A driver without `describe()` gets
 /// the default: no metadata, no knobs — exactly the pre-step-10 contract.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]

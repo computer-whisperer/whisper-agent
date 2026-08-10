@@ -285,7 +285,18 @@ impl ThreadConfig {
     pub fn from_thread_defaults(defaults: &ThreadDefaults) -> Self {
         Self {
             participants: ThreadParticipants::default(),
-            driver: ThreadDriverConfig::default(),
+            // A pod naming its default driver resolves here; `None`
+            // yields the tombstone builtin variant, which the server
+            // substitutes with its embedded default (plus the pod's
+            // `driver_config`) before any thread is created — see
+            // `base_thread_config_from_pod` (step 11 slice 6).
+            driver: match &defaults.driver {
+                Some(name) => ThreadDriverConfig::Scripted {
+                    name: name.clone(),
+                    config: defaults.driver_config.clone(),
+                },
+                None => ThreadDriverConfig::default(),
+            },
             model: defaults.model.clone(),
             max_tokens: defaults.max_tokens,
             max_turns: defaults.max_turns,
@@ -1635,7 +1646,6 @@ pub enum BucketLoadOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum FunctionKind {
     CreateThread,
-    CompactThread,
     CancelThread,
     RunBehavior,
     BuiltinToolCall,
@@ -2063,9 +2073,20 @@ pub enum ClientToServer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         correlation_id: Option<String>,
         pod_id: String,
-        /// Driver name as in `ThreadDriverConfig::Scripted` — the file
-        /// stem under `<pod>/drivers/`.
+        /// Driver name as in `ThreadDriverConfig::Scripted` — resolved
+        /// pod-first (`<pod>/drivers/<name>.lua`), then against the
+        /// server's embedded registry (step 11 slice 6).
         driver: String,
+    },
+    /// List the driver programs resolvable in a pod (step 11 slice 6):
+    /// the server's embedded programs plus the pod's `drivers/*.lua`
+    /// stems. Server-authoritative — the embedded default is not a pod
+    /// file, so a client deriving options from the file tree would
+    /// never see it. Reply is `DriverList`.
+    ListDrivers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
     },
     /// Read one text file under a pod. Used by the webui's generic
     /// file viewer for paths that don't route to a specialized editor
@@ -2873,6 +2894,16 @@ pub enum ServerToClient {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Reply to `ListDrivers`: every driver name resolvable in the pod,
+    /// sorted. `embedded` distinguishes the server's compiled-in
+    /// programs from pod files (a pod file shadowing an embedded name
+    /// reports as the pod entry).
+    DriverList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correlation_id: Option<String>,
+        pod_id: String,
+        drivers: Vec<driver::DriverListEntry>,
+    },
     /// Reply to `ReadPodFile`. `readonly` mirrors `FsEntry.readonly`
     /// so the viewer can hide the Save button without having to
     /// re-classify the path itself.
@@ -3215,6 +3246,8 @@ mod tests {
             backend: "anthropic".into(),
             model: "claude-default".into(),
             system_prompt_file: "system_prompt.md".into(),
+            driver: None,
+            driver_config: Default::default(),
             max_tokens: 4096,
             max_turns: 12,
             host_env: vec!["main".into()],

@@ -87,9 +87,6 @@ pub enum Function {
         config_override: Option<ThreadConfigOverride>,
         bindings_request: Option<ThreadBindingsRequest>,
     },
-    CompactThread {
-        thread_id: ThreadId,
-    },
     CancelThread {
         thread_id: ThreadId,
     },
@@ -131,9 +128,7 @@ impl Function {
     /// variants whose work isn't bound to a single thread.
     pub fn primary_thread_id(&self) -> Option<&str> {
         match self {
-            Self::CompactThread { thread_id }
-            | Self::CancelThread { thread_id }
-            | Self::Sudo { thread_id, .. } => Some(thread_id),
+            Self::CancelThread { thread_id } | Self::Sudo { thread_id, .. } => Some(thread_id),
             Self::CreateThread { .. }
             | Self::RunBehavior { .. }
             | Self::BuiltinToolCall { .. }
@@ -148,7 +143,6 @@ impl Function {
         use whisper_agent_protocol::FunctionKind as K;
         match self {
             Self::CreateThread { .. } => K::CreateThread,
-            Self::CompactThread { .. } => K::CompactThread,
             Self::CancelThread { .. } => K::CancelThread,
             Self::RunBehavior { .. } => K::RunBehavior,
             Self::BuiltinToolCall { .. } => K::BuiltinToolCall,
@@ -174,7 +168,6 @@ impl Function {
     ) {
         match self {
             Self::CreateThread { pod_id, .. } => (None, pod_id.clone(), None, None),
-            Self::CompactThread { thread_id } => (Some(thread_id.clone()), None, None, None),
             Self::CancelThread { thread_id } => (Some(thread_id.clone()), None, None, None),
             Self::RunBehavior {
                 pod_id,
@@ -338,7 +331,6 @@ impl CallerLink {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionTerminal {
     CreateThread(CreateThreadTerminal),
-    CompactThread(CompactThreadTerminal),
     CancelThread,
     RunBehavior(RunBehaviorTerminal),
     BuiltinToolCall(ToolResult),
@@ -371,11 +363,6 @@ pub struct CreateThreadTerminal {
 pub struct ThreadTerminalSummary {
     pub state: String,
     pub final_text: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactThreadTerminal {
-    pub continuation_thread_id: ThreadId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1833,17 +1833,22 @@ pub struct ChatApp {
     picker_model: Option<String>,
     picker_model_open: bool,
     /// Scripted driver picked for the next `CreateThread`. `None`
-    /// means the builtin single-agent chat driver; `Some(name)` sends
+    /// means the pod's default driver (its `thread_defaults.driver`,
+    /// or the server-embedded default); `Some(name)` sends
     /// `config_override.driver = Scripted { name }` — the server
-    /// validates that `<pod>/drivers/<name>.lua` loads at creation.
-    /// Options derive from the pod file tree's `drivers/` listing
-    /// (lazily fetched on first open), so no dedicated wire query.
+    /// resolves the name pod-first then against its embedded registry
+    /// at creation. Options come from `ListDrivers` (server-
+    /// authoritative — the embedded default is not a pod file).
     picker_driver: Option<String>,
     picker_driver_open: bool,
+    /// `ListDrivers` results per pod: every driver name resolvable
+    /// there, embedded and pod-file alike. Lazily fetched when the
+    /// picker opens; refetched per open so pod-file edits show up.
+    pod_drivers: HashMap<String, Vec<whisper_agent_protocol::driver::DriverListEntry>>,
     /// Evaluated `describe()` of the picked scripted driver — `Ok`
     /// carries the declaration the knob rows render, `Err` the
     /// load/eval failure surfaced beside the picker. `None` while
-    /// unfetched or when the builtin driver is selected. Reset (and
+    /// unfetched or when no explicit driver is picked. Reset (and
     /// re-requested) whenever the driver pick changes; pod-tab changes
     /// already reset the driver pick itself.
     picker_driver_desc: Option<Result<whisper_agent_protocol::driver::DriverDescription, String>>,
@@ -1891,12 +1896,6 @@ pub struct ChatApp {
     new_thread_system_prompt_file_buf: String,
     new_thread_system_prompt_text_buf: String,
     new_thread_compaction: Option<whisper_agent_protocol::CompactionConfigOverride>,
-    new_thread_compaction_token_threshold_buf: String,
-    new_thread_autoquery: Option<whisper_agent_protocol::KnowledgeAutoqueryConfigOverride>,
-    new_thread_autoquery_top_k_buf: String,
-    new_thread_autoquery_min_score_buf: String,
-    new_thread_autoquery_max_query_chars_buf: String,
-    new_thread_autoquery_snippet_chars_buf: String,
     new_thread_caps: Option<ThreadDefaultCaps>,
     new_thread_tools: Option<AllowMap<String>>,
     new_thread_knowledge_buckets: Option<Vec<String>>,
@@ -2994,6 +2993,7 @@ impl ChatApp {
             picker_model_open: false,
             picker_driver: None,
             picker_driver_open: false,
+            pod_drivers: HashMap::new(),
             picker_driver_desc: None,
             picker_knob_values: Default::default(),
             picker_knob_drafts: Default::default(),
@@ -3014,12 +3014,6 @@ impl ChatApp {
             new_thread_system_prompt_file_buf: String::new(),
             new_thread_system_prompt_text_buf: String::new(),
             new_thread_compaction: None,
-            new_thread_compaction_token_threshold_buf: String::new(),
-            new_thread_autoquery: None,
-            new_thread_autoquery_top_k_buf: String::new(),
-            new_thread_autoquery_min_score_buf: String::new(),
-            new_thread_autoquery_max_query_chars_buf: String::new(),
-            new_thread_autoquery_snippet_chars_buf: String::new(),
             new_thread_caps: None,
             new_thread_tools: None,
             new_thread_knowledge_buckets: None,
@@ -3975,21 +3969,7 @@ impl ChatApp {
             } => {
                 let key = (pod_id, path);
                 self.pod_files_requested.remove(&key);
-                // Driver-picker chain: if this is the root listing of
-                // the pod whose driver menu is open and it shows a
-                // `drivers/` dir, fetch that dir now so the open menu
-                // fills in without a close-and-reopen. (The picker
-                // can't fetch it blindly — `list_pod_dir` errors on a
-                // missing directory.)
-                let chain_drivers = self.picker_driver_open
-                    && key.1.is_empty()
-                    && self.picker_effective_pod_id() == Some(key.0.as_str())
-                    && entries.iter().any(|e| e.is_dir && e.name == "drivers");
-                let pod = key.0.clone();
                 self.pod_files.insert(key, entries);
-                if chain_drivers {
-                    self.ensure_pod_dir_fetched(&pod, "drivers");
-                }
             }
             ServerToClient::DriverDescribed {
                 pod_id,
@@ -4009,6 +3989,11 @@ impl ChatApp {
                         (None, None) => Ok(Default::default()),
                     });
                 }
+            }
+            ServerToClient::DriverList {
+                pod_id, drivers, ..
+            } => {
+                self.pod_drivers.insert(pod_id, drivers);
             }
             ServerToClient::PodFileContent {
                 pod_id,
@@ -7284,7 +7269,6 @@ fn default_core_tools_text() -> String {
 }
 
 const INTERNAL_BUILTIN_TOOL_OPTIONS: &[(&str, &str)] = &[
-    ("drain_knowledge_nudges", "drain knowledge nudges"),
     ("list_llm_providers", "list LLM providers"),
     ("list_mcp_hosts", "list MCP hosts"),
 ];
@@ -7458,21 +7442,8 @@ const NEW_THREAD_COMPACTION_ENABLED_KEY: &str = "new-thread:overrides:compaction
 const NEW_THREAD_COMPACTION_PROMPT_FILE_KEY: &str = "new-thread:overrides:compaction:prompt-file";
 const NEW_THREAD_COMPACTION_SUMMARY_REGEX_KEY: &str =
     "new-thread:overrides:compaction:summary-regex";
-const NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY: &str =
-    "new-thread:overrides:compaction:token-threshold";
 const NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY: &str =
     "new-thread:overrides:compaction:continuation-template";
-const NEW_THREAD_AUTOQUERY_OVERRIDE_KEY: &str = "new-thread:overrides:autoquery:override";
-const NEW_THREAD_AUTOQUERY_ENABLED_KEY: &str = "new-thread:overrides:autoquery:enabled";
-const NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY: &str = "new-thread:overrides:autoquery:hot-only";
-const NEW_THREAD_AUTOQUERY_TERMINAL_KEY: &str = "new-thread:overrides:autoquery:terminal";
-const NEW_THREAD_AUTOQUERY_BUCKETS_KEY: &str = "new-thread:overrides:autoquery:buckets";
-const NEW_THREAD_AUTOQUERY_SOURCE_KEY: &str = "new-thread:overrides:autoquery:source";
-const NEW_THREAD_AUTOQUERY_TOP_K_KEY: &str = "new-thread:overrides:autoquery:top-k";
-const NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY: &str = "new-thread:overrides:autoquery:min-score";
-const NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY: &str =
-    "new-thread:overrides:autoquery:max-query-chars";
-const NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY: &str = "new-thread:overrides:autoquery:snippet-chars";
 const NEW_THREAD_CAPS_OVERRIDE_KEY: &str = "new-thread:overrides:caps:override";
 const NEW_THREAD_CAPS_POD_MODIFY_KEY: &str = "new-thread:overrides:caps:pod-modify";
 const NEW_THREAD_CAPS_DISPATCH_KEY: &str = "new-thread:overrides:caps:dispatch";
@@ -7847,7 +7818,8 @@ impl ChatApp {
             max_turns: self.new_thread_max_turns,
             system_prompt: self.new_thread_system_prompt.clone(),
             compaction: self.new_thread_compaction.clone(),
-            autoquery: self.new_thread_autoquery.clone(),
+            // Dead wire field (step 11 slice 6): autoquery is a driver knob.
+            autoquery: None,
             caps: self.new_thread_caps,
             tools: self.new_thread_tools.clone(),
             knowledge_buckets: self.new_thread_knowledge_buckets.clone(),
@@ -7917,7 +7889,6 @@ impl ChatApp {
         count += usize::from(self.new_thread_max_turns.is_some());
         count += usize::from(self.new_thread_system_prompt.is_some());
         count += usize::from(self.new_thread_compaction.is_some());
-        count += usize::from(self.new_thread_autoquery.is_some());
         count += usize::from(self.new_thread_caps.is_some());
         count += usize::from(self.new_thread_tools.is_some());
         count += usize::from(self.new_thread_knowledge_buckets.is_some());
@@ -7990,12 +7961,6 @@ impl ChatApp {
         self.new_thread_system_prompt_file_buf.clear();
         self.new_thread_system_prompt_text_buf.clear();
         self.new_thread_compaction = None;
-        self.new_thread_compaction_token_threshold_buf.clear();
-        self.new_thread_autoquery = None;
-        self.new_thread_autoquery_top_k_buf.clear();
-        self.new_thread_autoquery_min_score_buf.clear();
-        self.new_thread_autoquery_max_query_chars_buf.clear();
-        self.new_thread_autoquery_snippet_chars_buf.clear();
         self.new_thread_caps = None;
         self.new_thread_tools = None;
         self.new_thread_knowledge_buckets = None;
@@ -8056,40 +8021,15 @@ impl ChatApp {
             .picker_pod_config()
             .map(|cfg| cfg.thread_defaults.compaction.clone())
             .unwrap_or_default();
-        self.new_thread_compaction_token_threshold_buf = base
-            .token_threshold
-            .map(|v| v.to_string())
-            .unwrap_or_default();
         self.new_thread_compaction = Some(whisper_agent_protocol::CompactionConfigOverride {
             enabled: Some(base.enabled),
             prompt_file: Some(base.prompt_file),
             summary_regex: Some(base.summary_regex),
-            token_threshold: Some(base.token_threshold),
+            // Dead wire field (step 11 slice 6): the auto-compaction
+            // threshold is a driver knob.
+            token_threshold: None,
             continuation_template: Some(base.continuation_template),
         });
-    }
-
-    fn seed_new_thread_autoquery_override(&mut self) {
-        let base = self
-            .picker_pod_config()
-            .map(|cfg| cfg.thread_defaults.autoquery.clone())
-            .unwrap_or_default();
-        self.new_thread_autoquery_top_k_buf = base.top_k.to_string();
-        self.new_thread_autoquery_min_score_buf = format_float_for_input(base.min_rerank_score);
-        self.new_thread_autoquery_max_query_chars_buf = base.max_query_chars.to_string();
-        self.new_thread_autoquery_snippet_chars_buf = base.snippet_chars.to_string();
-        self.new_thread_autoquery =
-            Some(whisper_agent_protocol::KnowledgeAutoqueryConfigOverride {
-                enabled: Some(base.enabled),
-                buckets: Some(base.buckets),
-                hot_only: Some(base.hot_only),
-                top_k: Some(base.top_k),
-                min_rerank_score: Some(base.min_rerank_score),
-                max_query_chars: Some(base.max_query_chars),
-                snippet_chars: Some(base.snippet_chars),
-                query_source: Some(base.query_source),
-                inject_at_terminal: Some(base.inject_at_terminal),
-            });
     }
 
     fn seed_new_thread_caps_override(&mut self) {
@@ -8299,32 +8239,6 @@ impl ChatApp {
                 compaction.summary_regex = Some(buf);
                 return true;
             }
-            let threshold_opts = NumericInputOpts::default()
-                .min(0.0)
-                .max(1_000_000.0)
-                .step(1000.0);
-            if numeric_input::apply_event(
-                &mut self.new_thread_compaction_token_threshold_buf,
-                &mut self.selection,
-                NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
-                &threshold_opts,
-                event,
-            ) {
-                compaction.token_threshold = if self
-                    .new_thread_compaction_token_threshold_buf
-                    .trim()
-                    .is_empty()
-                {
-                    Some(None)
-                } else {
-                    self.new_thread_compaction_token_threshold_buf
-                        .parse::<u32>()
-                        .ok()
-                        .map(|v| Some(Some(v.min(1_000_000))))
-                        .unwrap_or(compaction.token_threshold)
-                };
-                return true;
-            }
             if event.target_key() == Some(NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY) {
                 let mut buf = compaction.continuation_template.clone().unwrap_or_default();
                 text_area::apply_event(
@@ -8334,101 +8248,6 @@ impl ChatApp {
                     NEW_THREAD_COMPACTION_CONTINUATION_TEMPLATE_KEY,
                 );
                 compaction.continuation_template = Some(buf);
-                return true;
-            }
-        }
-
-        if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_OVERRIDE_KEY) {
-            if self.new_thread_autoquery.is_some() {
-                self.new_thread_autoquery = None;
-            } else {
-                self.seed_new_thread_autoquery_override();
-            }
-            return true;
-        }
-        if let Some(autoquery) = self.new_thread_autoquery.as_mut() {
-            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_ENABLED_KEY) {
-                autoquery.enabled = Some(!autoquery.enabled.unwrap_or(false));
-                return true;
-            }
-            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY) {
-                autoquery.hot_only = Some(!autoquery.hot_only.unwrap_or(true));
-                return true;
-            }
-            if event.is_click_or_activate(NEW_THREAD_AUTOQUERY_TERMINAL_KEY) {
-                autoquery.inject_at_terminal = Some(!autoquery.inject_at_terminal.unwrap_or(false));
-                return true;
-            }
-            let buckets = autoquery.buckets.get_or_insert_with(Vec::new);
-            if apply_checkbox_list_to_vec(buckets, event, NEW_THREAD_AUTOQUERY_BUCKETS_KEY) {
-                return true;
-            }
-            let mut source_pick = autoquery.query_source;
-            if radio::apply_event(
-                &mut source_pick,
-                event,
-                NEW_THREAD_AUTOQUERY_SOURCE_KEY,
-                |raw| autoquery_source_from_wire(raw).map(Some),
-            ) {
-                autoquery.query_source = source_pick;
-                return true;
-            }
-            let top_k_opts = NumericInputOpts::default().min(0.0).max(20.0).step(1.0);
-            if numeric_input::apply_event(
-                &mut self.new_thread_autoquery_top_k_buf,
-                &mut self.selection,
-                NEW_THREAD_AUTOQUERY_TOP_K_KEY,
-                &top_k_opts,
-                event,
-            ) {
-                if let Ok(v) = self.new_thread_autoquery_top_k_buf.parse::<u32>() {
-                    autoquery.top_k = Some(v.min(20));
-                }
-                return true;
-            }
-            let score_opts = NumericInputOpts::default()
-                .min(-100.0)
-                .max(100.0)
-                .step(0.05);
-            if numeric_input::apply_event(
-                &mut self.new_thread_autoquery_min_score_buf,
-                &mut self.selection,
-                NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
-                &score_opts,
-                event,
-            ) {
-                if let Ok(v) = self.new_thread_autoquery_min_score_buf.parse::<f32>() {
-                    autoquery.min_rerank_score = Some(v.clamp(-100.0, 100.0));
-                }
-                return true;
-            }
-            let chars_opts = NumericInputOpts::default()
-                .min(0.0)
-                .max(50_000.0)
-                .step(250.0);
-            if numeric_input::apply_event(
-                &mut self.new_thread_autoquery_max_query_chars_buf,
-                &mut self.selection,
-                NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
-                &chars_opts,
-                event,
-            ) {
-                if let Ok(v) = self.new_thread_autoquery_max_query_chars_buf.parse::<u32>() {
-                    autoquery.max_query_chars = Some(v.min(50_000));
-                }
-                return true;
-            }
-            let snippet_opts = NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0);
-            if numeric_input::apply_event(
-                &mut self.new_thread_autoquery_snippet_chars_buf,
-                &mut self.selection,
-                NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
-                &snippet_opts,
-                event,
-            ) {
-                if let Ok(v) = self.new_thread_autoquery_snippet_chars_buf.parse::<u32>() {
-                    autoquery.snippet_chars = Some(v.min(5_000));
-                }
                 return true;
             }
         }
@@ -8496,11 +8315,6 @@ impl ChatApp {
         if let Some(buckets) = self.new_thread_knowledge_buckets.as_mut()
             && apply_checkbox_list_to_vec(buckets, event, NEW_THREAD_KNOWLEDGE_BUCKETS_KEY)
         {
-            if let Some(autoquery) = self.new_thread_autoquery.as_mut()
-                && let Some(autoquery_buckets) = autoquery.buckets.as_mut()
-            {
-                autoquery_buckets.retain(|name| buckets.iter().any(|allowed| allowed == name));
-            }
             return true;
         }
 
@@ -8771,25 +8585,19 @@ impl ChatApp {
             SelectAction::Toggle => {
                 self.close_other_pickers(PICKER_DRIVER);
                 self.picker_driver_open = !self.picker_driver_open;
-                // Options derive from the pod's `drivers/` directory.
-                // `list_pod_dir` errors on a missing directory and most
-                // pods have none, so fetch the pod ROOT first (always
-                // valid) and only chain the `drivers/` fetch once the
-                // root listing proves the dir exists — either here
-                // (root already cached) or in the `PodDirListing`
-                // arrival arm (root fetch kicked just now). The open
-                // menu fills in live as listings land.
+                // Server-authoritative option list (step 11 slice 6):
+                // the embedded default is not a pod file, so the old
+                // pod-file-tree derivation could never list it.
+                // Refetch on every open — cheap, and pod-file edits
+                // show up without a reconnect; the open menu fills in
+                // when the listing lands.
                 if self.picker_driver_open
                     && let Some(pod) = self.picker_effective_pod_id().map(str::to_owned)
                 {
-                    self.ensure_pod_dir_fetched(&pod, "");
-                    let root_key = (pod.clone(), String::new());
-                    let has_drivers_dir = self.pod_files.get(&root_key).is_some_and(|entries| {
-                        entries.iter().any(|e| e.is_dir && e.name == "drivers")
+                    self.send(ClientToServer::ListDrivers {
+                        correlation_id: None,
+                        pod_id: pod,
                     });
-                    if has_drivers_dir {
-                        self.ensure_pod_dir_fetched(&pod, "drivers");
-                    }
                 }
             }
             SelectAction::Dismiss => self.picker_driver_open = false,
@@ -11051,12 +10859,6 @@ impl ChatApp {
             self.render_new_thread_compaction_override(),
         );
 
-        let autoquery_section = editor_section(
-            "Knowledge Autoquery",
-            "Per-thread automatic retrieval targets inside the selected pod's in-scope buckets.",
-            self.render_new_thread_autoquery_override(),
-        );
-
         let caps_section = editor_section(
             "Capability Caps",
             "Override the thread's starting typed caps, bounded by the pod allow ceiling.",
@@ -11093,7 +10895,6 @@ impl ChatApp {
             .gap(tokens::SPACE_5),
             column([
                 knowledge_access_section,
-                autoquery_section,
                 tools_section,
                 caps_section,
                 tool_surface_section,
@@ -11216,15 +11017,6 @@ impl ChatApp {
                 "Using pod compaction defaults.",
             );
         };
-        let token_threshold = numeric_input(
-            NEW_THREAD_COMPACTION_TOKEN_THRESHOLD_KEY,
-            &self.new_thread_compaction_token_threshold_buf,
-            &self.selection,
-            NumericInputOpts::default()
-                .min(0.0)
-                .max(1_000_000.0)
-                .step(1000.0),
-        );
         form([
             form_item([
                 form_label("override"),
@@ -11266,11 +11058,6 @@ impl ChatApp {
                 )),
             ]),
             form_item([
-                form_label("token threshold"),
-                form_control(token_threshold),
-                form_description("Empty means no threshold override."),
-            ]),
-            form_item([
                 form_label("continuation template"),
                 form_control(
                     text_area(
@@ -11280,156 +11067,6 @@ impl ChatApp {
                     )
                     .height(Size::Fixed(80.0)),
                 ),
-            ]),
-        ])
-    }
-
-    fn render_new_thread_autoquery_override(&self) -> El {
-        let Some(autoquery) = self.new_thread_autoquery.as_ref() else {
-            return self.render_override_activation_row(
-                false,
-                NEW_THREAD_AUTOQUERY_OVERRIDE_KEY,
-                "",
-                "Using pod autoquery defaults.",
-            );
-        };
-        let buckets = autoquery.buckets.as_deref().unwrap_or(&[]);
-        let bucket_groups = self.current_autoquery_bucket_groups();
-        let has_bucket_options = bucket_groups.iter().any(|(_, options)| !options.is_empty());
-        let bucket_widget = if has_bucket_options {
-            grouped_checkbox_column(NEW_THREAD_AUTOQUERY_BUCKETS_KEY, buckets, bucket_groups)
-        } else {
-            paragraph("(no in-scope buckets)").muted().small()
-        };
-        let bucket_hint = if buckets.is_empty() {
-            "empty = all in-scope hot buckets"
-        } else {
-            "selected in-scope hot buckets only"
-        };
-        form([
-            form_item([
-                form_label("override"),
-                form_control(self.render_override_activation_row(
-                    true,
-                    NEW_THREAD_AUTOQUERY_OVERRIDE_KEY,
-                    "Autoquery override active.",
-                    "",
-                )),
-            ]),
-            form_item([
-                form_label("enabled"),
-                form_control(
-                    row([
-                        checkbox(
-                            NEW_THREAD_AUTOQUERY_ENABLED_KEY,
-                            autoquery.enabled.unwrap_or(false),
-                        ),
-                        text("enabled").muted().small(),
-                    ])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center),
-                ),
-            ]),
-            form_item([
-                form_label("hot only"),
-                form_control(
-                    row([
-                        checkbox(
-                            NEW_THREAD_AUTOQUERY_HOT_ONLY_KEY,
-                            autoquery.hot_only.unwrap_or(true),
-                        ),
-                        text("hot buckets only").muted().small(),
-                    ])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center),
-                ),
-            ]),
-            form_item([
-                form_label("terminal turns"),
-                form_control(
-                    row([
-                        checkbox(
-                            NEW_THREAD_AUTOQUERY_TERMINAL_KEY,
-                            autoquery.inject_at_terminal.unwrap_or(false),
-                        ),
-                        text("inject at terminal turns").muted().small(),
-                    ])
-                    .gap(tokens::SPACE_2)
-                    .align(Align::Center),
-                ),
-            ]),
-            form_item([
-                form_label("query source"),
-                // Five prose-length choices do not fit reliably in a
-                // horizontal toggle strip at the modal's narrowest column.
-                // A radio column preserves one-of-many semantics and keeps
-                // every focus ring inside the scroll viewport.
-                form_control(radio_group(
-                    NEW_THREAD_AUTOQUERY_SOURCE_KEY,
-                    &autoquery_source_label(
-                        autoquery
-                            .query_source
-                            .unwrap_or(KnowledgeAutoquerySource::default()),
-                    ),
-                    [
-                        ("reasoning_then_text", "Reasoning then text"),
-                        ("text_then_reasoning", "Text then reasoning"),
-                        ("reasoning_and_text", "Reasoning and text"),
-                        ("reasoning_only", "Reasoning only"),
-                        ("text_only", "Text only"),
-                    ],
-                )),
-            ]),
-            form_item([
-                form_label("target buckets"),
-                form_control(bucket_widget),
-                form_description(
-                    "Subset for this thread's automatic nudges. Options are limited \
-                     by the pod's server bucket grants plus its pod-scope buckets.",
-                ),
-            ]),
-            paragraph(bucket_hint).muted().small(),
-            form_item([
-                form_label("top k"),
-                form_control(numeric_input(
-                    NEW_THREAD_AUTOQUERY_TOP_K_KEY,
-                    &self.new_thread_autoquery_top_k_buf,
-                    &self.selection,
-                    NumericInputOpts::default().min(0.0).max(20.0).step(1.0),
-                )),
-            ]),
-            form_item([
-                form_label("min rerank"),
-                form_control(numeric_input(
-                    NEW_THREAD_AUTOQUERY_MIN_SCORE_KEY,
-                    &self.new_thread_autoquery_min_score_buf,
-                    &self.selection,
-                    NumericInputOpts::default()
-                        .min(-100.0)
-                        .max(100.0)
-                        .step(0.05),
-                )),
-            ]),
-            form_item([
-                form_label("query chars"),
-                form_control(numeric_input(
-                    NEW_THREAD_AUTOQUERY_MAX_QUERY_CHARS_KEY,
-                    &self.new_thread_autoquery_max_query_chars_buf,
-                    &self.selection,
-                    NumericInputOpts::default()
-                        .min(0.0)
-                        .max(50_000.0)
-                        .step(250.0),
-                )),
-            ]),
-            form_item([
-                form_label("snippet chars"),
-                form_control(numeric_input(
-                    NEW_THREAD_AUTOQUERY_SNIPPET_CHARS_KEY,
-                    &self.new_thread_autoquery_snippet_chars_buf,
-                    &self.selection,
-                    NumericInputOpts::default().min(0.0).max(5_000.0).step(50.0),
-                )),
             ]),
         ])
     }
@@ -12140,29 +11777,6 @@ impl ChatApp {
                 if allow.mcp_hosts.len() == 1 { "" } else { "s" },
             ),
         }
-    }
-
-    fn current_autoquery_bucket_groups(&self) -> Vec<(&'static str, Vec<(String, String)>)> {
-        let Some(cfg) = self.picker_pod_config() else {
-            return Vec::new();
-        };
-        let pod_id = self.picker_effective_pod_id();
-        let groups = self.autoquery_bucket_groups_for(cfg, pod_id);
-        let Some(allowed) = self.new_thread_knowledge_buckets.as_ref() else {
-            return groups;
-        };
-        groups
-            .into_iter()
-            .map(|(label, options)| {
-                (
-                    label,
-                    options
-                        .into_iter()
-                        .filter(|(value, _)| allowed.iter().any(|v| v == value))
-                        .collect(),
-                )
-            })
-            .collect()
     }
 
     /// Pod's configured default backend for new threads, or `None`
@@ -21936,28 +21550,25 @@ impl ChatApp {
         select_menu(PICKER_BACKEND, options)
     }
 
-    /// Driver options: the builtin chat driver plus every `*.lua` in
-    /// the pod's `drivers/` directory. The listing is fetched lazily
-    /// on first open (`handle_driver_pick`); until it lands only the
-    /// builtin row shows, and the open menu fills in live when the
-    /// `PodDirListing` arrives. A missing `drivers/` dir lists as
-    /// empty — builtin-only is the correct read of that pod.
+    /// Driver options: the "Pod default" sentinel plus every name the
+    /// server reports resolvable in the pod — embedded programs and
+    /// pod `drivers/*.lua` alike (`ListDrivers`, fetched on open in
+    /// `handle_driver_pick`). Until the listing lands only the default
+    /// row shows; the open menu fills in live when `DriverList`
+    /// arrives.
     fn driver_menu(&self) -> El {
-        let mut options: Vec<(String, String)> = vec![(
-            PICKER_INHERIT.to_string(),
-            "Builtin single-agent chat".to_string(),
-        )];
-        if let Some(pod) = self.picker_effective_pod_id() {
-            let key = (pod.to_string(), "drivers".to_string());
-            if let Some(entries) = self.pod_files.get(&key) {
-                for entry in entries {
-                    if entry.is_dir {
-                        continue;
-                    }
-                    if let Some(name) = entry.name.strip_suffix(".lua") {
-                        options.push((name.to_string(), format!("{name} — scripted")));
-                    }
-                }
+        let mut options: Vec<(String, String)> =
+            vec![(PICKER_INHERIT.to_string(), "Pod default".to_string())];
+        if let Some(pod) = self.picker_effective_pod_id()
+            && let Some(entries) = self.pod_drivers.get(pod)
+        {
+            for entry in entries {
+                let label = if entry.embedded {
+                    format!("{} — scripted (embedded)", entry.name)
+                } else {
+                    format!("{} — scripted", entry.name)
+                };
+                options.push((entry.name.clone(), label));
             }
         }
         select_menu(PICKER_DRIVER, options)
@@ -21966,7 +21577,7 @@ impl ChatApp {
     fn driver_label(&self) -> String {
         match self.picker_driver.as_deref() {
             Some(name) => name.to_string(),
-            None => "Builtin chat".to_string(),
+            None => "Pod default".to_string(),
         }
     }
 
@@ -21985,7 +21596,7 @@ impl ChatApp {
                     }),
                 None => "scripted (Lua) driver from the pod's drivers/ directory".to_string(),
             },
-            None => "how turns are driven".to_string(),
+            None => "how turns are driven — the pod's default driver unless overridden".to_string(),
         }
     }
 
@@ -22486,6 +22097,8 @@ fn fresh_pod_config_stub(name: String, mut backend_names: Vec<String>) -> PodCon
             backend: default_backend,
             model: String::new(),
             system_prompt_file: "system_prompt.md".into(),
+            driver: None,
+            driver_config: Default::default(),
             max_tokens: 16384,
             max_turns: 30,
             host_env: Vec::new(),

@@ -50,7 +50,6 @@ pub(crate) struct IoCompletion {
 /// Unified completion type the scheduler's `FuturesUnordered` carries.
 pub(crate) enum SchedulerCompletion {
     Io(IoCompletion),
-    KnowledgeAutoquery(KnowledgeAutoqueryCompletion),
     /// A scripted weave's `query_knowledge` effect resolved (step 11
     /// slice 3 — the first async non-thread effect). Routed to the
     /// weave, not a thread: the journal record resolves and the driver
@@ -66,11 +65,6 @@ pub(crate) enum SchedulerCompletion {
     SudoInner(SudoInnerCompletion),
 }
 
-pub(crate) struct KnowledgeAutoqueryCompletion {
-    pub(crate) thread_id: String,
-    pub(crate) result: Result<KnowledgeAutoqueryResult, String>,
-}
-
 pub(crate) struct ScriptedQueryCompletion {
     pub(crate) weave_id: String,
     /// Driver-supplied correlation token, echoed on the event.
@@ -81,12 +75,6 @@ pub(crate) struct ScriptedQueryCompletion {
     /// Clip applied to each hit's chunk text before it crosses into Lua.
     pub(crate) snippet_chars: usize,
     pub(crate) result: Result<Vec<crate::knowledge::RerankedCandidate>, String>,
-}
-
-pub(crate) struct KnowledgeAutoqueryResult {
-    pub(crate) query: String,
-    pub(crate) labels: Vec<String>,
-    pub(crate) hits: Vec<crate::knowledge::RerankedCandidate>,
 }
 
 /// Result of a sudo'd inner tool invocation. `result` is the usual

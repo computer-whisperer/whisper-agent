@@ -1,14 +1,19 @@
-//! Driver policy — durable thread events in, requested effects out.
+//! Driver vocabulary — the persisted effect journal, driver state, and
+//! relationship metadata shared by the scheduler and the scripted (Lua)
+//! executor in [`lua`].
 //!
-//! The scheduler remains responsible for executing effects and integrating I/O.
-//! This module owns only conversational policy: which participant runs next,
-//! whether a model response enters the tool loop, and when a cycle finishes.
+//! The builtin policy state machine that used to live here died in step
+//! 11 slice 6; scripted drivers are the only runtime kind. The
+//! `BuiltinSingleAgentChat` variants below survive as deserialize-only
+//! tombstones so pre-slice-6 thread/weave JSON still loads — the
+//! scheduler's `migrate_builtin_weaves` converts them at load and
+//! nothing constructs them at runtime.
 
 pub mod lua;
 
 use serde::{Deserialize, Serialize};
 use whisper_agent_protocol::{
-    GenerationContext, GenerationRunId, ParticipantId, ThreadDriverConfig, ThreadParticipants,
+    GenerationContext, GenerationRunId, ParticipantId, ThreadDriverConfig,
 };
 
 pub type DriverEffectId = u64;
@@ -43,19 +48,14 @@ pub struct ThreadRelationship {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DriverState {
+    /// Deserialize-only tombstone for pre-slice-6 weave/thread JSON.
+    /// Load-time migration replaces it with synthesized `Scripted`
+    /// state; nothing constructs or matches on it at runtime.
     BuiltinSingleAgentChat {
         #[serde(default)]
         cycles_started: u64,
         #[serde(default)]
         turns_in_cycle: u32,
-        /// Set while a compaction summary turn is running on the named
-        /// thread (the weave's primary at launch). Weave-persisted so a
-        /// compaction in flight during shutdown finalizes on restart —
-        /// the summary prompt is already in the transcript, the turn
-        /// completes, and the finalize hook sees this marker. Replaces
-        /// the old `InFlightOps::COMPACTING` bit on `Thread` (step 8):
-        /// coordination state belongs to the weave, threads stay
-        /// policy-free.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacting: Option<String>,
     },
@@ -101,26 +101,6 @@ impl DriverState {
             },
         }
     }
-}
-
-/// Error for builtin policy functions invoked against a scripted weave —
-/// the scheduler routes scripted drivers through the event/effect loop,
-/// never through these.
-fn scripted_misroute(site: &str) -> String {
-    format!("scripted driver routed to builtin policy ({site}); this is a scheduler bug")
-}
-
-/// Effect vocabulary currently consumed by `Thread`. These are requests, not
-/// side effects themselves; provider/tool handles remain scheduler-owned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverEffect {
-    RunAgent {
-        participant_id: ParticipantId,
-        turn: u32,
-    },
-    DispatchTools,
-    Continue,
-    Finish,
 }
 
 /// Durable, executor-enriched form of a driver request. The pure policy effect
@@ -487,202 +467,9 @@ impl DriverEffectJournal {
     }
 }
 
-/// Reset driver-local cycle state after external input is appended.
-pub fn input_accepted(config: &ThreadDriverConfig, state: &mut DriverState) -> Result<(), String> {
-    match (config, state) {
-        (
-            ThreadDriverConfig::BuiltinSingleAgentChat,
-            DriverState::BuiltinSingleAgentChat {
-                cycles_started,
-                turns_in_cycle,
-                ..
-            },
-        ) => {
-            *cycles_started = cycles_started.saturating_add(1);
-            *turns_in_cycle = 0;
-            Ok(())
-        }
-        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
-            Err(scripted_misroute("input_accepted"))
-        }
-    }
-}
-
-/// Ask the driver what to do at a runnable turn boundary.
-pub fn next_effect(
-    config: &ThreadDriverConfig,
-    state: &mut DriverState,
-    participants: &ThreadParticipants,
-    max_turns: u32,
-) -> Result<DriverEffect, String> {
-    match (config, state) {
-        (
-            ThreadDriverConfig::BuiltinSingleAgentChat,
-            DriverState::BuiltinSingleAgentChat { turns_in_cycle, .. },
-        ) => {
-            if *turns_in_cycle >= max_turns {
-                return Ok(DriverEffect::Finish);
-            }
-            *turns_in_cycle += 1;
-            Ok(DriverEffect::RunAgent {
-                participant_id: participants.default_responder.clone(),
-                turn: *turns_in_cycle,
-            })
-        }
-        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
-            Err(scripted_misroute("next_effect"))
-        }
-    }
-}
-
-/// Interpret one completed agent response. The compatibility driver enters a
-/// tool loop iff the response requested tools; otherwise it yields for input.
-pub fn agent_completed(
-    config: &ThreadDriverConfig,
-    state: &DriverState,
-    participant_id: &ParticipantId,
-    participants: &ThreadParticipants,
-    has_tool_calls: bool,
-) -> Result<DriverEffect, String> {
-    match (config, state) {
-        (
-            ThreadDriverConfig::BuiltinSingleAgentChat,
-            DriverState::BuiltinSingleAgentChat { .. },
-        ) => {
-            if participant_id != &participants.default_responder {
-                return Err(format!(
-                    "builtin single-agent driver received completion from `{participant_id}`, expected `{}`",
-                    participants.default_responder
-                ));
-            }
-            Ok(if has_tool_calls {
-                DriverEffect::DispatchTools
-            } else {
-                DriverEffect::Finish
-            })
-        }
-        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
-            Err(scripted_misroute("agent_completed"))
-        }
-    }
-}
-
-/// Interpret completion of all tools requested by an agent turn.
-pub fn tools_completed(
-    config: &ThreadDriverConfig,
-    state: &DriverState,
-    participant_id: &ParticipantId,
-    participants: &ThreadParticipants,
-) -> Result<DriverEffect, String> {
-    match (config, state) {
-        (
-            ThreadDriverConfig::BuiltinSingleAgentChat,
-            DriverState::BuiltinSingleAgentChat { .. },
-        ) => {
-            if participant_id != &participants.default_responder {
-                return Err(format!(
-                    "builtin single-agent driver received tools from `{participant_id}`, expected `{}`",
-                    participants.default_responder
-                ));
-            }
-            Ok(DriverEffect::Continue)
-        }
-        (ThreadDriverConfig::Scripted { .. }, _) | (_, DriverState::Scripted { .. }) => {
-            Err(scripted_misroute("tools_completed"))
-        }
-    }
-}
-
-pub fn turns_in_cycle(state: &DriverState) -> u32 {
-    match state {
-        DriverState::BuiltinSingleAgentChat { turns_in_cycle, .. } => *turns_in_cycle,
-        DriverState::Scripted { .. } => 0,
-    }
-}
-
-/// One-time bridge for thread JSON written before driver state existed.
-pub fn import_legacy_turn_count(state: &mut DriverState, legacy_turns: u32) {
-    if legacy_turns == 0 {
-        return;
-    }
-    match state {
-        DriverState::BuiltinSingleAgentChat { turns_in_cycle, .. } if *turns_in_cycle == 0 => {
-            *turns_in_cycle = legacy_turns;
-        }
-        DriverState::BuiltinSingleAgentChat { .. } | DriverState::Scripted { .. } => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn builtin_driver_runs_responder_tools_then_responder() {
-        let config = ThreadDriverConfig::default();
-        let participants = ThreadParticipants::default();
-        let mut state = DriverState::default();
-        input_accepted(&config, &mut state).unwrap();
-
-        let first = next_effect(&config, &mut state, &participants, 4).unwrap();
-        assert_eq!(
-            first,
-            DriverEffect::RunAgent {
-                participant_id: participants.default_responder.clone(),
-                turn: 1,
-            }
-        );
-        assert_eq!(
-            agent_completed(
-                &config,
-                &state,
-                &participants.default_responder,
-                &participants,
-                true,
-            )
-            .unwrap(),
-            DriverEffect::DispatchTools
-        );
-        assert_eq!(
-            tools_completed(
-                &config,
-                &state,
-                &participants.default_responder,
-                &participants,
-            )
-            .unwrap(),
-            DriverEffect::Continue
-        );
-        assert!(matches!(
-            next_effect(&config, &mut state, &participants, 4).unwrap(),
-            DriverEffect::RunAgent { turn: 2, .. }
-        ));
-    }
-
-    #[test]
-    fn builtin_driver_finishes_at_turn_limit() {
-        let config = ThreadDriverConfig::default();
-        let participants = ThreadParticipants::default();
-        let mut state = DriverState::default();
-        input_accepted(&config, &mut state).unwrap();
-        assert!(matches!(
-            next_effect(&config, &mut state, &participants, 1).unwrap(),
-            DriverEffect::RunAgent { turn: 1, .. }
-        ));
-        assert_eq!(
-            next_effect(&config, &mut state, &participants, 1).unwrap(),
-            DriverEffect::Finish
-        );
-    }
-
-    #[test]
-    fn legacy_turn_count_only_fills_empty_state() {
-        let mut state = DriverState::default();
-        import_legacy_turn_count(&mut state, 3);
-        assert_eq!(turns_in_cycle(&state), 3);
-        import_legacy_turn_count(&mut state, 7);
-        assert_eq!(turns_in_cycle(&state), 3);
-    }
 
     #[test]
     fn builtin_state_has_stable_tagged_wire_shape() {
