@@ -371,7 +371,7 @@ impl Scheduler {
                 config_override,
                 bindings_request,
             } => {
-                self.launch_create_thread(
+                let _created = self.launch_create_thread(
                     id,
                     pod_id,
                     initial_message,
@@ -1026,7 +1026,7 @@ impl Scheduler {
         // Parent's pod is the target; ParentLink carries the lineage.
         let pod_id = self.tasks.get(parent_thread_id).map(|t| t.pod_id.clone());
         let spec = Function::CreateThread {
-            pod_id,
+            pod_id: pod_id.clone(),
             initial_message: Some(args.prompt.clone()),
             initial_attachments: Vec::new(),
             parent: Some(crate::functions::ParentLink {
@@ -1034,8 +1034,8 @@ impl Scheduler {
                 tool_use_id: tool_use_id.clone(),
             }),
             wait_mode: crate::functions::WaitMode::ThreadTerminal,
-            config_override: args.config_override,
-            bindings_request: args.bindings_override,
+            config_override: args.config_override.clone(),
+            bindings_request: args.bindings_override.clone(),
         };
         let caller = CallerLink::ThreadToolCall {
             thread_id: parent_thread_id.to_string(),
@@ -1089,9 +1089,31 @@ impl Scheduler {
                 )
             }));
         } else {
-            let delivery = FunctionDelivery::ToolResultFollowup {
-                parent_thread_id: parent_thread_id.to_string(),
-                parent_tool_use_id: tool_use_id.clone(),
+            // Delivery-shape selection is the scripted gate-off (step
+            // 11 slice 4): a scripted-ticked parent's callback is a
+            // driver event wired through the journal + watcher pair —
+            // `FunctionDelivery::None` leaves the Function owning
+            // creation and cascade-cancel only, and machine text never
+            // rides the input path on a scripted weave.
+            let scripted_weave = self
+                .thread_ticker
+                .get(parent_thread_id)
+                .filter(|weave_id| {
+                    self.weaves.get(*weave_id).is_some_and(|weave| {
+                        matches!(
+                            weave.driver,
+                            whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                        )
+                    })
+                })
+                .cloned();
+            let delivery = if scripted_weave.is_some() {
+                FunctionDelivery::None
+            } else {
+                FunctionDelivery::ToolResultFollowup {
+                    parent_thread_id: parent_thread_id.to_string(),
+                    parent_tool_use_id: tool_use_id.clone(),
+                }
             };
             let fn_id = match self.register_function_with_delivery(spec, caller, delivery) {
                 Ok(id) => id,
@@ -1108,17 +1130,79 @@ impl Scheduler {
                     return;
                 }
             };
-            self.launch_function(fn_id, pending_io);
-            let child_id = self
-                .active_functions
-                .get(&fn_id)
-                .and_then(|e| e.awaiting_child_thread_id.clone())
-                .unwrap_or_default();
-            let ack = format!(
-                "Dispatched child thread `{child_id}` in the background. Its final result will \
-                 be delivered as a fresh user message once the child terminates; you can \
-                 continue working in the meantime."
+            // Launched directly (not via `launch_function`) for the
+            // returned child id: the registry entry can already be
+            // gone when a fast child terminates during launch, so a
+            // read-back of `awaiting_child_thread_id` is unreliable.
+            let child_id = self.launch_create_thread(
+                fn_id,
+                pod_id,
+                Some(args.prompt.clone()),
+                Vec::new(),
+                Some(crate::functions::ParentLink {
+                    thread_id: parent_thread_id.to_string(),
+                    tool_use_id: tool_use_id.clone(),
+                }),
+                crate::functions::WaitMode::ThreadTerminal,
+                args.config_override,
+                args.bindings_override,
+                pending_io,
             );
+            let Some(child_id) = child_id else {
+                // Creation failed: the Function already completed with
+                // the error and no delivery will ever fire. Tell the
+                // model the truth instead of acking a dispatch that
+                // never happened (the old path acked with an empty
+                // child id here).
+                pending_io.push(immediate_tool_error(
+                    parent_thread_id.to_string(),
+                    op_id,
+                    tool_use_id,
+                    "dispatch_thread: child thread creation failed".into(),
+                ));
+                return;
+            };
+            let ack = if let Some(weave_id) = scripted_weave {
+                // Durable half then in-memory half: the pending
+                // journal record is what a restart heals from; the
+                // watcher is the live index onto it.
+                if let Some(weave) = self.weaves.get_mut(&weave_id) {
+                    let effect_id = weave.record_pending_effect(
+                        crate::runtime::driver::PersistedDriverEffect::DispatchCallback {
+                            parent_thread_id: parent_thread_id.to_string(),
+                            tool_use_id: tool_use_id.clone(),
+                            child_thread_id: child_id.clone(),
+                        },
+                    );
+                    self.mark_weave_dirty(&weave_id);
+                    self.scripted_dispatch_watchers.insert(
+                        child_id.clone(),
+                        super::scripted::ScriptedDispatchWatcher {
+                            weave_id,
+                            parent_thread_id: parent_thread_id.to_string(),
+                            tool_use_id: tool_use_id.clone(),
+                            child_thread_id: child_id.clone(),
+                            effect_id,
+                        },
+                    );
+                    // The child may have terminated during its launch
+                    // step — before the watcher existed. Same edge
+                    // `launch_create_thread` re-checks for the
+                    // Function itself.
+                    self.complete_scripted_dispatch_for_child(&child_id, pending_io);
+                }
+                format!(
+                    "Dispatched child thread `{child_id}` in the background. Its outcome \
+                     will be reported to this thread's coordinating driver when it \
+                     terminates; you can continue working in the meantime."
+                )
+            } else {
+                format!(
+                    "Dispatched child thread `{child_id}` in the background. Its final result will \
+                     be delivered as a fresh user message once the child terminates; you can \
+                     continue working in the meantime."
+                )
+            };
             let parent_id = parent_thread_id.to_string();
             pending_io.push(Box::pin(async move {
                 crate::runtime::io_dispatch::SchedulerCompletion::Io(
@@ -3049,6 +3133,12 @@ impl Scheduler {
     /// with `awaiting_child_thread_id = Some(child)`; the scheduler's
     /// thread-terminal hook fires `complete_function` once the child
     /// reaches Completed/Failed/Cancelled.
+    ///
+    /// Returns the created child's id (`None` when creation failed) —
+    /// the entry in `active_functions` can already be GONE by then (a
+    /// child that terminated during its launch step completes the
+    /// Function synchronously), so callers needing the id must take it
+    /// from the return value, not read it back from the registry.
     #[allow(clippy::too_many_arguments)]
     fn launch_create_thread(
         &mut self,
@@ -3061,7 +3151,7 @@ impl Scheduler {
         config_override: Option<whisper_agent_protocol::ThreadConfigOverride>,
         bindings_request: Option<whisper_agent_protocol::ThreadBindingsRequest>,
         pending_io: &mut FuturesUnordered<SchedulerFuture>,
-    ) {
+    ) -> Option<String> {
         // Pull requester + correlation_id from the caller-link so
         // `create_task` routes `ThreadCreated` broadcasts the same way
         // the pre-migration interactive handler did.
@@ -3109,7 +3199,7 @@ impl Scheduler {
                     }),
                     pending_io,
                 );
-                return;
+                return None;
             }
         };
         self.mark_dirty(&thread_id);
@@ -3130,7 +3220,7 @@ impl Scheduler {
                     id,
                     FunctionOutcome::Success(FunctionTerminal::CreateThread(
                         crate::functions::CreateThreadTerminal {
-                            thread_id,
+                            thread_id: thread_id.clone(),
                             final_result: None,
                         },
                     )),
@@ -3165,6 +3255,7 @@ impl Scheduler {
                 }
             }
         }
+        Some(thread_id)
     }
 
     /// Thread-terminal hook that closes out any Function waiting on
@@ -3340,6 +3431,7 @@ impl Scheduler {
             // registered Functions targeting them.
             if let Some(child_id) = newly_cancelled_child {
                 self.complete_functions_awaiting_thread(&child_id, pending_io);
+                self.complete_scripted_dispatch_for_child(&child_id, pending_io);
                 self.cascade_cancel_caller_gone(&child_id, pending_io);
             }
         }
@@ -3392,6 +3484,7 @@ impl Scheduler {
         // parent with registered Functions pointing back at it, cancel
         // them via caller-gone cascade.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
+        self.complete_scripted_dispatch_for_child(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
         // A compaction in flight on this thread was abandoned by the
         // cancel (the weave's marker was cleared in `weave_cancelled`);

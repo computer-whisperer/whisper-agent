@@ -399,6 +399,15 @@ fn tool_use_block(id: &str, name: &str) -> ContentBlock {
     }
 }
 
+fn tool_use_block_with_input(id: &str, name: &str, input: serde_json::Value) -> ContentBlock {
+    ContentBlock::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input,
+        replay: None,
+    }
+}
+
 // ---------- derive_thread ----------
 
 #[tokio::test]
@@ -3449,6 +3458,39 @@ impl Harness {
             })
             .collect()
     }
+
+    /// The child thread id of the weave's (sole) journaled dispatch
+    /// callback — how a test finds the thread `dispatch_thread` spawned.
+    fn dispatch_child_of(&self, weave_id: &str) -> String {
+        self.sched.weaves[weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .find_map(|r| match &r.effect {
+                PersistedDriverEffect::DispatchCallback {
+                    child_thread_id, ..
+                } => Some(child_thread_id.clone()),
+                _ => None,
+            })
+            .expect("dispatch callback journaled")
+    }
+
+    /// Text of entries titled_chat's dispatch flush appended (author
+    /// "dispatch").
+    fn dispatch_notifications(&self, thread_id: &str) -> Vec<String> {
+        self.sched.tasks[thread_id]
+            .conversation
+            .messages()
+            .iter()
+            .filter(|message| message.effective_author().as_str() == "dispatch")
+            .flat_map(|message| {
+                message.content.iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
 }
 
 /// The autoquery knob on an unprovisioned pod (no buckets in scope)
@@ -3842,4 +3884,468 @@ async fn pending_scripted_queries_heal_to_query_failed_at_load() {
     );
     assert_eq!(h.scripted_data(&weave_id).get("aq_pending"), None);
     assert!(h.nudge_messages(&primary).is_empty());
+}
+
+/// The flagship async-dispatch arc (step 11 slice 4): the model
+/// dispatches a child with sync=false, the ack rides the normal tool
+/// path, the turn finishes, and the child's later completion arrives as
+/// `dispatch_completed` — the driver appends an attributed notification
+/// and runs a fresh turn (builtin injection expressed in driver code).
+/// The builtin followup queue stays untouched: machine text never rides
+/// the input path on a scripted weave.
+#[tokio::test]
+async fn titled_chat_async_dispatch_round_trip() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Survey weave retention in the background".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block_with_input(
+            "toolu-disp",
+            "dispatch_thread",
+            serde_json::json!({"prompt": "Survey weave retention rules", "sync": false}),
+        )],
+        &mut pending_io,
+    );
+    // The intercept ran inside the boundary step: child created,
+    // callback journaled Pending, watcher armed.
+    let child = h.dispatch_child_of(&weave_id);
+    assert!(h.sched.scripted_dispatch_watchers.contains_key(&child));
+    assert!(matches!(
+        h.internal_of(&child),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingTools { .. }
+    ));
+
+    // Ack lands (harness stand-in for the immediate-ack future), the
+    // turn continues and finishes while the child still works.
+    h.respond_tool(&primary, "toolu-disp", "dispatched ack", &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    h.respond_model(
+        &primary,
+        vec![text_block("Dispatched; I'll report when it lands.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert!(h.dispatch_notifications(&primary).is_empty());
+
+    // Child terminal → watcher fires → quiescent primary gets the
+    // notification appended and a fresh turn.
+    h.respond_model(
+        &child,
+        vec![text_block("Retention is weave-unit, terminal-only.")],
+        &mut pending_io,
+    );
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the notification kicked a fresh turn on the quiescent primary"
+    );
+    let notifications = h.dispatch_notifications(&primary);
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        notifications[0].contains(&format!("[dispatched thread {child} completed]"))
+            && notifications[0].contains("Retention is weave-unit, terminal-only."),
+        "notification carries the child's final text: {:?}",
+        notifications[0]
+    );
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert_eq!(record.outcome, DriverEffectOutcome::Completed);
+    assert!(!h.sched.scripted_dispatch_watchers.contains_key(&child));
+    assert!(
+        h.sched.tasks[&primary]
+            .pending_tool_result_followups
+            .is_empty(),
+        "the builtin injection queue never saw the callback"
+    );
+
+    h.respond_model(
+        &primary,
+        vec![text_block("The survey says: weave-unit retention.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+}
+
+/// A dispatch terminal landing mid-cycle stores instead of moving the
+/// primary (the movement contract): the record resolves immediately,
+/// but the notification waits in driver state until the cycle finishes,
+/// then flushes as append + fresh turn.
+#[tokio::test]
+async fn titled_chat_async_dispatch_stores_while_busy() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Kick off the background survey".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block_with_input(
+            "toolu-disp",
+            "dispatch_thread",
+            serde_json::json!({"prompt": "survey", "sync": false}),
+        )],
+        &mut pending_io,
+    );
+    let child = h.dispatch_child_of(&weave_id);
+    h.respond_tool(&primary, "toolu-disp", "dispatched ack", &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+
+    // Child completes while the primary is mid-turn: store-only.
+    h.respond_model(&child, vec![text_block("Early result.")], &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "a busy primary is never moved by the dispatch handler"
+    );
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert_eq!(
+        record.outcome,
+        DriverEffectOutcome::Completed,
+        "the record resolves at live delivery even when the driver stores"
+    );
+    assert!(h.dispatch_notifications(&primary).is_empty());
+    assert_eq!(
+        h.scripted_data(&weave_id)["disp_pending"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // The cycle finishes → the stored notification flushes.
+    h.respond_model(
+        &primary,
+        vec![text_block("Done thinking.")],
+        &mut pending_io,
+    );
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "finish flushed the stored notification into a fresh turn"
+    );
+    let notifications = h.dispatch_notifications(&primary);
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains("Early result."));
+    assert_eq!(h.scripted_data(&weave_id).get("disp_pending"), None);
+
+    h.respond_model(
+        &primary,
+        vec![text_block("Reporting the early result.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+}
+
+/// Cancelling the PARENT with a child in flight (review finding, slice
+/// 4): the cascade cancels the child, whose `dispatch_failed` arrives
+/// right behind the primary's death notice. The driver must store, not
+/// flush — a `run_agent` against the corpse would fault the activation
+/// and clobber the user's Cancelled state with a driver Failed. Input
+/// then revives the primary and the stored notification flushes at the
+/// revived cycle's finish.
+#[tokio::test]
+async fn titled_chat_parent_cancel_with_inflight_dispatch_stays_cancelled() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Spawn the background job".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block_with_input(
+            "toolu-disp",
+            "dispatch_thread",
+            serde_json::json!({"prompt": "job", "sync": false}),
+        )],
+        &mut pending_io,
+    );
+    let child = h.dispatch_child_of(&weave_id);
+    h.respond_tool(&primary, "toolu-disp", "dispatched ack", &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Waiting.")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    h.sched.execute_cancel_thread(&primary, &mut pending_io);
+    assert!(
+        matches!(h.internal_of(&primary), ThreadInternalState::Cancelled),
+        "the cancel sticks — no driver-failure clobber: {:?}",
+        h.internal_of(&primary)
+    );
+    assert!(matches!(
+        h.internal_of(&child),
+        ThreadInternalState::Cancelled
+    ));
+    assert!(
+        h.dispatch_notifications(&primary).is_empty(),
+        "no notification appended to a corpse"
+    );
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert!(matches!(
+        &record.outcome,
+        DriverEffectOutcome::Failed { message } if message.contains("cancelled")
+    ));
+    assert_eq!(h.scripted_data(&weave_id)["dead"], serde_json::json!(true));
+    assert_eq!(
+        h.scripted_data(&weave_id)["disp_pending"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    // Input revives the head; the stored notification flushes at the
+    // revived cycle's finish.
+    h.sched.send_user_message(
+        &primary,
+        "Never mind, continue".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Back online.")], &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "revived finish flushed the stored notification into a fresh turn"
+    );
+    let notifications = h.dispatch_notifications(&primary);
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].contains("failed: child thread was cancelled"));
+}
+
+/// An externally cancelled child reports through `dispatch_failed` —
+/// the driver hears the loss (message names the cancel) instead of
+/// waiting forever, and the journal record fails.
+#[tokio::test]
+async fn titled_chat_async_dispatch_reports_a_cancelled_child() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Start the background job".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block_with_input(
+            "toolu-disp",
+            "dispatch_thread",
+            serde_json::json!({"prompt": "doomed job", "sync": false}),
+        )],
+        &mut pending_io,
+    );
+    let child = h.dispatch_child_of(&weave_id);
+    h.respond_tool(&primary, "toolu-disp", "dispatched ack", &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Running.")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    h.sched.execute_cancel_thread(&child, &mut pending_io);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the failure notification kicked a fresh turn"
+    );
+    let notifications = h.dispatch_notifications(&primary);
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        notifications[0].contains("failed: child thread was cancelled"),
+        "notification names the cancel: {:?}",
+        notifications[0]
+    );
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert!(matches!(
+        &record.outcome,
+        DriverEffectOutcome::Failed { message } if message.contains("cancelled")
+    ));
+    assert!(!h.sched.scripted_dispatch_watchers.contains_key(&child));
+}
+
+/// The restart contract (slice 4): a callback whose delivery the crash
+/// swallowed — child completed, watcher gone with the process — heals
+/// at load into a notice built from the child's persisted final state.
+/// The shutdown interrupt must exempt the async record (else the heal
+/// scans Pending and finds nothing), the record stays Pending until
+/// delivery, and the next activation appends the notification with the
+/// REAL result — reconnect, not loss.
+#[tokio::test]
+async fn pending_dispatch_callbacks_reconnect_at_load() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h.create_scripted_thread("titled_chat").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+
+    h.sched.send_user_message(
+        &primary,
+        "Long survey please".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![tool_use_block_with_input(
+            "toolu-disp",
+            "dispatch_thread",
+            serde_json::json!({"prompt": "long survey", "sync": false}),
+        )],
+        &mut pending_io,
+    );
+    let child = h.dispatch_child_of(&weave_id);
+    h.respond_tool(&primary, "toolu-disp", "dispatched ack", &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Waiting.")], &mut pending_io);
+
+    // Crash window: the in-memory watcher dies with the process; the
+    // child's completion then has nobody to tell (this also pins that
+    // an unwatched terminal delivers nothing).
+    h.sched.scripted_dispatch_watchers.clear();
+    h.respond_model(
+        &child,
+        vec![text_block("Post-crash findings.")],
+        &mut pending_io,
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert!(h.dispatch_notifications(&primary).is_empty());
+
+    // Load path: the shutdown interrupt exempts the async record...
+    h.sched
+        .weaves
+        .get_mut(&weave_id)
+        .unwrap()
+        .interrupt_all_pending("task was in-flight at last shutdown");
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert_eq!(
+        record.outcome,
+        DriverEffectOutcome::Pending,
+        "the shutdown interrupt leaves the async record for the heal"
+    );
+    // ...and the heal derives a completion notice from the child's
+    // persisted final state, leaving the record Pending until delivery.
+    h.sched.heal_pending_scripted_dispatches();
+    assert!(h.sched.scripted_dispatch_watchers.is_empty());
+    assert!(h.sched.scripted_dispatch_notices.contains_key(&weave_id));
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert_eq!(record.outcome, DriverEffectOutcome::Pending);
+
+    // First activation after the restart delivers the notice: record
+    // resolves, notification appends with the real result, fresh turn.
+    h.sched
+        .send_user_message(&primary, "Any news?".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let record = h.sched.weaves[&weave_id]
+        .effect_journal
+        .records()
+        .iter()
+        .find(|r| matches!(&r.effect, PersistedDriverEffect::DispatchCallback { .. }))
+        .unwrap();
+    assert_eq!(record.outcome, DriverEffectOutcome::Completed);
+    let notifications = h.dispatch_notifications(&primary);
+    assert_eq!(notifications.len(), 1);
+    assert!(
+        notifications[0].contains("Post-crash findings."),
+        "reconnect delivered the REAL result, not a loss notice: {:?}",
+        notifications[0]
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(!h.sched.scripted_dispatch_notices.contains_key(&weave_id));
 }

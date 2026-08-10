@@ -259,6 +259,51 @@ impl Scheduler {
                 queue.push_back(ScriptedEvent::QueryFailed { id, message });
             }
         }
+        if let Some(notices) = self.scripted_dispatch_notices.remove(weave_id) {
+            // Same resolve-AT-DELIVERY contract as the query notices
+            // above; salvaged notices whose records already resolved
+            // live find no Pending match and no-op.
+            if let Some(weave) = self.weaves.get_mut(weave_id) {
+                let mut dirty = false;
+                for notice in &notices {
+                    let pending: Vec<DriverEffectId> = weave
+                        .effect_journal
+                        .records()
+                        .iter()
+                        .filter(|record| {
+                            record.outcome == crate::runtime::driver::DriverEffectOutcome::Pending
+                                && matches!(
+                                    &record.effect,
+                                    PersistedDriverEffect::DispatchCallback {
+                                        tool_use_id,
+                                        child_thread_id,
+                                        ..
+                                    } if tool_use_id == &notice.tool_use_id
+                                        && child_thread_id == &notice.child_thread_id
+                                )
+                        })
+                        .map(|record| record.id)
+                        .collect();
+                    for record_id in pending {
+                        match &notice.outcome {
+                            Ok(_) => weave.complete_effect(record_id),
+                            Err(message) => weave.fail_effect(record_id, message.as_str()),
+                        }
+                        dirty = true;
+                    }
+                }
+                if dirty {
+                    self.mark_weave_dirty(weave_id);
+                }
+            }
+            let queue = self
+                .scripted_events
+                .entry(weave_id.to_string())
+                .or_default();
+            for notice in notices {
+                queue.push_back(notice.into_event());
+            }
+        }
         self.scripted_events
             .entry(weave_id.to_string())
             .or_default()
@@ -268,18 +313,32 @@ impl Scheduler {
         }
         let mut vm_calls = 0usize;
         let mut failure: Option<String> = None;
-        'drain: while let Some(event) = self
-            .scripted_events
-            .get_mut(weave_id)
-            .and_then(|queue| queue.pop_front())
-        {
-            vm_calls += 1;
-            if vm_calls > MAX_VM_CALLS_PER_ACTIVATION {
+        'drain: loop {
+            // Cap check BEFORE the pop (and only when another event is
+            // actually waiting): a cap-tripping event must stay in the
+            // queue for the salvage arm below — popping first would
+            // drop it unprocessed, and for loss facts and dispatch
+            // terminals (whose journal records the preamble already
+            // resolved) that drop is permanent.
+            if vm_calls >= MAX_VM_CALLS_PER_ACTIVATION
+                && self
+                    .scripted_events
+                    .get(weave_id)
+                    .is_some_and(|queue| !queue.is_empty())
+            {
                 failure = Some(format!(
                     "driver event cascade exceeded {MAX_VM_CALLS_PER_ACTIVATION} VM calls in one activation"
                 ));
                 break;
             }
+            let Some(event) = self
+                .scripted_events
+                .get_mut(weave_id)
+                .and_then(|queue| queue.pop_front())
+            else {
+                break;
+            };
+            vm_calls += 1;
             let Some(weave) = self.weaves.get(weave_id) else {
                 break;
             };
@@ -355,6 +414,7 @@ impl Scheduler {
         if let Some(queue) = self.scripted_events.remove(weave_id) {
             let mut dead_threads: Vec<(String, String)> = Vec::new();
             let mut dead_queries: Vec<(String, String)> = Vec::new();
+            let mut dead_dispatches: Vec<ScriptedDispatchNotice> = Vec::new();
             for event in queue {
                 match event {
                     ScriptedEvent::ThreadFailed { thread_id, message } => {
@@ -373,6 +433,34 @@ impl Scheduler {
                          re-issue if still needed"
                             .into(),
                     )),
+                    // Dispatch terminals re-stash LOSSLESS (both
+                    // directions): the payload is small and durable,
+                    // so an undelivered completion keeps its result
+                    // instead of degrading. Records that already
+                    // resolved no-op at the next drain's match scan.
+                    ScriptedEvent::DispatchCompleted {
+                        thread_id,
+                        tool_use_id,
+                        child_thread_id,
+                        result,
+                        usage,
+                    } => dead_dispatches.push(ScriptedDispatchNotice {
+                        parent_thread_id: thread_id,
+                        tool_use_id,
+                        child_thread_id,
+                        outcome: Ok((result, usage)),
+                    }),
+                    ScriptedEvent::DispatchFailed {
+                        thread_id,
+                        tool_use_id,
+                        child_thread_id,
+                        message,
+                    } => dead_dispatches.push(ScriptedDispatchNotice {
+                        parent_thread_id: thread_id,
+                        tool_use_id,
+                        child_thread_id,
+                        outcome: Err(message),
+                    }),
                     _ => {}
                 }
             }
@@ -387,6 +475,12 @@ impl Scheduler {
                     .entry(weave_id.to_string())
                     .or_default()
                     .extend(dead_queries);
+            }
+            if !dead_dispatches.is_empty() {
+                self.scripted_dispatch_notices
+                    .entry(weave_id.to_string())
+                    .or_default()
+                    .extend(dead_dispatches);
             }
         }
         if let Some(message) = failure {
@@ -1415,6 +1509,175 @@ impl Scheduler {
         for thread_id in ticked {
             self.step_until_blocked(&thread_id, pending_io);
         }
+    }
+
+    /// Terminal fan-out for async dispatch callbacks owed to scripted
+    /// weave drivers (step 11 slice 4). Fires at every site where
+    /// `complete_functions_awaiting_thread` fires; no-ops unless
+    /// `child_thread_id` is a watched child in a terminal state (a
+    /// defensive non-terminal call leaves the watcher armed). Builds
+    /// the terminal outcome from the child's state, resolves the
+    /// pending `DispatchCallback` record, and delivers the event.
+    pub(super) fn complete_scripted_dispatch_for_child(
+        &mut self,
+        child_thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        if !self
+            .scripted_dispatch_watchers
+            .contains_key(child_thread_id)
+        {
+            return;
+        }
+        let outcome = match self.tasks.get(child_thread_id) {
+            Some(task) => match task.public_state() {
+                whisper_agent_protocol::ThreadStateLabel::Completed => Ok((
+                    super::compaction::extract_last_assistant_text(task),
+                    scripted_dispatch_usage(task),
+                )),
+                whisper_agent_protocol::ThreadStateLabel::Failed => Err(task
+                    .failure_detail()
+                    .unwrap_or_else(|| "child thread failed".to_string())),
+                whisper_agent_protocol::ThreadStateLabel::Cancelled => {
+                    Err("child thread was cancelled".to_string())
+                }
+                _ => return,
+            },
+            None => Err("child thread no longer exists".to_string()),
+        };
+        let watcher = self
+            .scripted_dispatch_watchers
+            .remove(child_thread_id)
+            .expect("checked above");
+        self.deliver_scripted_dispatch_terminal(watcher, outcome, pending_io);
+    }
+
+    /// Resolve a dispatch callback's journal record and deliver its
+    /// terminal event to the dispatching weave, then step the weave's
+    /// ticked threads (the slice-3 async-delivery shape — see
+    /// `apply_scripted_query_completion` for the origin/stepping
+    /// rationale).
+    fn deliver_scripted_dispatch_terminal(
+        &mut self,
+        watcher: ScriptedDispatchWatcher,
+        outcome: Result<(String, lua::ScriptedDispatchUsage), String>,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) {
+        let ScriptedDispatchWatcher {
+            weave_id,
+            parent_thread_id,
+            tool_use_id,
+            child_thread_id,
+            effect_id,
+        } = watcher;
+        let Some(weave) = self.weaves.get_mut(&weave_id) else {
+            // The weave retired while the child ran (retention sweep,
+            // pod removal); its journal went with it — nobody to tell.
+            warn!(%weave_id, %child_thread_id, "dispatch callback resolved for a gone weave; dropping");
+            return;
+        };
+        match &outcome {
+            Ok(_) => weave.complete_effect(effect_id),
+            Err(message) => weave.fail_effect(effect_id, message.as_str()),
+        }
+        self.mark_weave_dirty(&weave_id);
+        let event = match outcome {
+            Ok((result, usage)) => ScriptedEvent::DispatchCompleted {
+                thread_id: parent_thread_id,
+                tool_use_id,
+                child_thread_id,
+                result,
+                usage,
+            },
+            Err(message) => ScriptedEvent::DispatchFailed {
+                thread_id: parent_thread_id,
+                tool_use_id,
+                child_thread_id,
+                message,
+            },
+        };
+        let origin = self
+            .weaves
+            .get(&weave_id)
+            .and_then(|weave| weave.primary_thread_id().map(str::to_string))
+            .unwrap_or_default();
+        self.run_scripted_driver(&weave_id, &origin, event, pending_io);
+        let mut ticked: Vec<String> = self
+            .weaves
+            .get(&weave_id)
+            .map(|weave| {
+                weave
+                    .ticked_thread_ids()
+                    .filter(|thread_id| {
+                        self.thread_ticker.get(*thread_id).map(String::as_str) == Some(&weave_id)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ticked.sort_by_key(|thread_id| thread_id != &origin);
+        for thread_id in ticked {
+            self.step_until_blocked(&thread_id, pending_io);
+        }
+    }
+}
+
+/// One async dispatch callback owed to a scripted weave driver, indexed
+/// by child thread id in `Scheduler::scripted_dispatch_watchers`. The
+/// durable twin is the pending `DispatchCallback` journal record whose
+/// id `effect_id` carries.
+pub(super) struct ScriptedDispatchWatcher {
+    pub weave_id: String,
+    pub parent_thread_id: String,
+    pub tool_use_id: String,
+    pub child_thread_id: String,
+    pub effect_id: DriverEffectId,
+}
+
+/// A dispatch terminal fact awaiting delivery at the weave's next
+/// activation (load heal, or an activation-fault re-stash). Unlike a
+/// query loss, the completed payload is durable and re-stashes
+/// lossless.
+pub(super) struct ScriptedDispatchNotice {
+    pub parent_thread_id: String,
+    pub tool_use_id: String,
+    pub child_thread_id: String,
+    pub outcome: Result<(String, lua::ScriptedDispatchUsage), String>,
+}
+
+impl ScriptedDispatchNotice {
+    fn into_event(self) -> ScriptedEvent {
+        match self.outcome {
+            Ok((result, usage)) => ScriptedEvent::DispatchCompleted {
+                thread_id: self.parent_thread_id,
+                tool_use_id: self.tool_use_id,
+                child_thread_id: self.child_thread_id,
+                result,
+                usage,
+            },
+            Err(message) => ScriptedEvent::DispatchFailed {
+                thread_id: self.parent_thread_id,
+                tool_use_id: self.tool_use_id,
+                child_thread_id: self.child_thread_id,
+                message,
+            },
+        }
+    }
+}
+
+/// Lifetime usage totals for a dispatched child's terminal event —
+/// the same numbers the builtin `<dispatched-thread-notification>`
+/// envelope reports.
+pub(super) fn scripted_dispatch_usage(task: &Thread) -> lua::ScriptedDispatchUsage {
+    lua::ScriptedDispatchUsage {
+        total_tokens: task
+            .total_usage
+            .input_tokens
+            .saturating_add(task.total_usage.output_tokens),
+        tool_uses: super::dispatch::count_tool_uses(&task.conversation),
+        duration_ms: (task.last_active - task.created_at)
+            .num_milliseconds()
+            .max(0),
     }
 }
 

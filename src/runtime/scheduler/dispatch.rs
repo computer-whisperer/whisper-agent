@@ -67,7 +67,7 @@ pub(super) fn render_dispatch_notification(
     out
 }
 
-fn count_tool_uses(conv: &whisper_agent_protocol::Conversation) -> u32 {
+pub(super) fn count_tool_uses(conv: &whisper_agent_protocol::Conversation) -> u32 {
     use whisper_agent_protocol::{ContentBlock, Role};
     let mut n: u32 = 0;
     for msg in conv.messages() {

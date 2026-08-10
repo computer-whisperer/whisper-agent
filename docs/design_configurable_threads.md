@@ -955,6 +955,147 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    launch→flight→completion path is fixture-untestable in the
    harness today (fake embed/rerank providers + a fake Bucket are
    feasible but nontrivial — a future harness investment).
+   **Slice 4 ratified 2026-08-10** (four forks via AskUserQuestion):
+   async dispatch callbacks via the driver contract. Ground truth
+   that shaped the slice: `dispatch_thread(sync=true)` is just a
+   parked tool call and already works on scripted threads — the
+   slice is entirely the `sync=false` path, where the builtin
+   renders a `<dispatched-thread-notification>` envelope and
+   injects it as fresh input on the parent. On scripted weaves that
+   path was worse than half-alive: a primary's callback rode
+   `input_accepted` indistinguishable from human input (the
+   roundtable would deliberate a round on an XML envelope), an
+   auxiliary's callback was silently DESTROYED (the 7b input guard
+   refuses auxiliaries, and both delivery paths drop the envelope
+   on refusal — the queued path dequeues first), and the Function
+   registry is memory-only, so restart orphans every async callback
+   for all weaves even though the child survives and its terminal
+   state is durable on disk.
+   **Delivery ratified: driver events, builtin injection gated off
+   scripted-ticked parents** (the autoquery gate-off mirror; here
+   the gate is delivery-shape selection at tool registration).
+   The driver decides what a callback means: append + run, feed
+   coordination state, or drop. Auxiliary dispatches Just Work
+   (delivery is weave-level, tagged with the dispatching thread).
+   This DISSOLVES the step-9 `input_accepted` source gap rather
+   than answering it: dispatch callbacks were the only machine text
+   on the input path, so once they're gated off, no `source` field
+   is needed. REJECTED: `source` field on `input_accepted` (keeps
+   the injection the driver can't suppress or reroute; auxiliaries
+   still lose callbacks); both-event-and-source (vocabulary with no
+   consumer).
+   **Restart ratified: journal + reconnect.** Scripted async
+   dispatches journal a pending
+   `DispatchCallback{tool_use_id, child_thread_id}` record on the
+   dispatching weave (exempt from bulk resolvers via slice 3's
+   `is_async_non_thread`), indexed by an in-memory watcher map
+   keyed by child thread id, rebuilt from pending records at load.
+   Child still live at load → watcher re-arms; child already
+   terminal (the common case — the persister heals mid-flight
+   children to Failed before `load_state`) → notice queued for the
+   weave's first activation, built from the child's persisted final
+   state; child gone → failure notice. Resolve-at-delivery: the
+   record stays Pending until the driver hears the event, so a
+   crash anywhere before delivery re-derives the notice next load.
+   Unlike a query (whose future dies with the process), the
+   dispatch payload is durable — undelivered completions re-stash
+   losslessly instead of degrading to loss notices. Scripted async
+   dispatch thereby becomes reliable across restart, EXCEEDING the
+   builtin, which keeps its lossy restart until conversion.
+   REJECTED: parity punt (driver waits forever on an event that
+   never comes, or must track dispatch age defensively).
+   **Event shape ratified: split events, raw fields.**
+   `dispatch_completed{thread_id (the dispatching parent),
+   tool_use_id, child_thread_id, result, usage{total_tokens,
+   tool_uses, duration_ms}}` and `dispatch_failed{thread_id,
+   tool_use_id, child_thread_id, message}`; cancellation folds into
+   `dispatch_failed` with a cancel message. Correlation is by
+   `tool_use_id`, which `agent_completed.tool_calls` already
+   exposes — a driver sees itself dispatch. Drivers format their
+   own notification text in Lua (visible user-role attributed
+   provenance via `append_entry`). REJECTED: single event + status
+   enum (breaks the `*_completed`/`*_failed` vocabulary symmetry);
+   carrying the builtin's pre-rendered XML envelope (redundant
+   payload; the webui's envelope-reattachment path doesn't apply to
+   driver-appended attributed entries anyway).
+   **Store-don't-move amended: scoped to parked boundaries.** A
+   dispatch result usually arrives while the parent is QUIESCENT —
+   no boundary will ever re-fire, so the strict rule would strand
+   the result until the next human input. The contract now reads:
+   async handlers may move quiescent threads (`append_entry` +
+   `run_agent` both admit Idle/Completed — the dispatch handler
+   appends the notification and runs a fresh turn, matching builtin
+   behavior); when the thread is parked at a boundary the handler
+   must store and let the re-fired boundary move it, exactly as
+   slice 3 ratified. The driver always knows its own parking
+   discipline, and `run_agent` on a parked thread refuses loudly
+   (activation fault) rather than corrupting anything. After
+   delivery the applier steps every ticked thread (the slice-3
+   shape), so parked boundaries re-fire either way. REJECTED:
+   strict store-don't-move plus a new wake/idle boundary event
+   (a new event kind whose only consumer is this corner, and one
+   extra driver activation of latency on every quiescent delivery).
+   **Slice 4 landed 2026-08-10.**
+   `ScriptedEvent::{DispatchCompleted, DispatchFailed}` +
+   `ScriptedDispatchUsage`;
+   `PersistedDriverEffect::DispatchCallback{parent_thread_id,
+   tool_use_id, child_thread_id}` in `is_async_non_thread()` (the
+   record is scheduler-authored — the model called the tool — but
+   the journal owns it because the pending record is what survives
+   restart). Registration: the async branch of
+   `register_dispatch_thread_tool` selects delivery shape by the
+   parent's ticker (scripted → `FunctionDelivery::None` + journal +
+   watcher; the Function keeps creation and cascade-cancel only);
+   `launch_create_thread` now RETURNS the child id and the dispatch
+   path calls it directly — the registry read-back was unreliable
+   when a fast child terminated during launch (the same edge the
+   watcher re-checks after arming). Incidental fix: async-dispatch
+   creation failure now returns a tool ERROR (previously acked
+   success with an empty child id). Live delivery:
+   `complete_scripted_dispatch_for_child` fires at every terminal
+   fan-out site (step tail, cascade-cancel, execute_cancel_thread),
+   resolves the record, delivers with weave primary as origin, and
+   steps all ticked threads (the slice-3 shape). Restart:
+   `heal_pending_scripted_dispatches` re-arms watchers for live
+   children and derives notices from persisted final state for
+   terminal/gone ones; notices drain in the activation preamble
+   after query losses, resolving records at delivery; the salvage
+   arm re-stashes dispatch terminals LOSSLESS in both directions.
+   Weave removal purges watchers + notices at all three sites.
+   titled_chat: `busy`/`dead` flags gate flush-vs-store; quiescent
+   flush = `append_entry` (author "dispatch") + `run_agent`; dedupe
+   by (tool_use_id, child). Harness: five tests — the flagship
+   round trip (incl. the builtin followup queue staying empty), the
+   busy stash, cancelled-child reporting, parent-cancel containment,
+   and the restart reconnect arc (shutdown-interrupt exemption,
+   Pending-until-delivery, REAL result after the crash window).
+   **Reviewed (same session), verdict sound after fixes.** Fixes
+   taken: the activation cap check now runs BEFORE the pop, only
+   when another event is waiting — the cap-tripping event previously
+   dropped unprocessed, which for loss facts and dispatch terminals
+   (records already resolved in the preamble) was permanent loss;
+   titled_chat marks the primary `dead` on its `thread_failed` and
+   stores dispatch terminals until input revives it — previously a
+   plain UI cancel of a parent with a child in flight cascaded into
+   `run_agent` against the corpse, faulting the activation and
+   clobbering the user's Cancelled with a driver Failed (regression
+   test added); the driver dedupe keys (tool_use_id, child), robust
+   to backends reusing tool ids across turns. Accepted, recorded:
+   a driver FAULTING on the dispatch event itself loses that
+   delivery (the record resolved pre-VM; the activation fails
+   loudly, the weave needs its program fixed anyway, and the result
+   stays readable on the child thread — resolving post-VM would
+   invert the write-ahead discipline; same pre-existing shape as a
+   fault on `query_completed`); a crash between the thread flush
+   (notification appended) and the weave flush (record + dedupe
+   state) re-appends the notification once at reload —
+   at-least-once, the documented contract; the ticker-adoption race
+   can leave SEVERAL stale builtin injections (one queued envelope
+   per idle boundary), not one — same accepted class, wording
+   corrected here; a dormant-but-alive child at load re-arms a
+   watcher that waits for external input to revive the child —
+   record stays Pending, nothing lies or leaks, near-unreachable
+   since dispatched children are seeded and stepped at creation.
 
 ## Open questions (flagged, not ratified)
 

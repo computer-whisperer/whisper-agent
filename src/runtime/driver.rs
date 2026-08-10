@@ -232,6 +232,25 @@ pub enum PersistedDriverEffect {
         #[serde(default)]
         buckets: Vec<String>,
     },
+    /// One asynchronous `dispatch_thread(sync=false)` callback owed to
+    /// this weave's driver (step 11 slice 4). Journaled pending when
+    /// the scheduler registers the dispatch for a scripted-ticked
+    /// parent and resolved when the terminal event
+    /// (`dispatch_completed` / `dispatch_failed`) delivers. Unlike
+    /// `query_knowledge` this record is scheduler-authored (the model
+    /// called the tool; no driver effect issued it) — the journal
+    /// still owns it because the pending record is what makes the
+    /// callback survive a restart: the load heal rebuilds the watcher
+    /// (child still live) or derives the terminal notice from the
+    /// child's persisted final state (child already terminal).
+    DispatchCallback {
+        /// The dispatching thread — whose tool call this callback
+        /// answers. Also what lets the load heal rebuild the terminal
+        /// event's attribution.
+        parent_thread_id: String,
+        tool_use_id: String,
+        child_thread_id: String,
+    },
     /// Head-advance: a referenced thread this weave ticks was promoted to
     /// primary; the previous primary (if any) was demoted to a dormant
     /// auxiliary. This is the journaled `compaction`-roll primitive —
@@ -270,14 +289,20 @@ impl PersistedDriverEffect {
 
     /// Whether a pending record of this effect resolves on its own
     /// terms rather than with any thread's fate (step 11 slice 3).
-    /// Async non-thread effects (`query_knowledge`) are settled by
-    /// their live completion or by the load-time loss heal delivering
-    /// `query_failed` — the thread-scoped bulk resolvers and the
-    /// shutdown interrupt must leave them alone, or the record lies
-    /// while the future still flies and the heal finds nothing to
-    /// report.
+    /// Async non-thread effects (`query_knowledge`,
+    /// `dispatch_callback`) are settled by their live completion or by
+    /// the load-time loss heal delivering their failure event — the
+    /// thread-scoped bulk resolvers and the shutdown interrupt must
+    /// leave them alone, or the record lies while the work still
+    /// flies and the heal finds nothing to report. (For
+    /// `dispatch_callback` the exemption is doubly load-bearing: the
+    /// dispatched child SURVIVES a restart, so the pending record is
+    /// what lets the load heal reconnect the callback at all.)
     pub fn is_async_non_thread(&self) -> bool {
-        matches!(self, Self::QueryKnowledge { .. })
+        matches!(
+            self,
+            Self::QueryKnowledge { .. } | Self::DispatchCallback { .. }
+        )
     }
 }
 

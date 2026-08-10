@@ -877,6 +877,25 @@ pub struct Scheduler {
     /// same in-memory-only rebuild-at-load contract (which is also why
     /// the shutdown interrupt exempts async non-thread records).
     scripted_query_notices: HashMap<String, Vec<(String, String)>>,
+    /// Async `dispatch_thread(sync=false)` callbacks owed to scripted
+    /// weave drivers, keyed by CHILD thread id (a child has exactly
+    /// one dispatch Function awaiting it). The durable form is the
+    /// pending `DispatchCallback` journal record on the dispatching
+    /// weave; this map is the in-memory index, rebuilt from pending
+    /// records at load for children still alive (the reconnect half of
+    /// slice 4's restart contract). The thread-terminal fan-out checks
+    /// it wherever `complete_functions_awaiting_thread` fires.
+    scripted_dispatch_watchers: HashMap<String, scripted::ScriptedDispatchWatcher>,
+    /// Deferred dispatch terminal facts: `DispatchCallback` records
+    /// found pending at load whose child is already terminal (the
+    /// common restart case — the persister heals mid-flight children
+    /// to Failed before `load_state`) or gone, plus undelivered
+    /// terminal events re-stashed by a failed activation drain.
+    /// Delivered at the weave's first/next activation after deaths and
+    /// query losses; the journal record resolves AT DELIVERY (same
+    /// rebuild-at-load contract as `scripted_query_notices`). Unlike a
+    /// query, the payload is durable — completions re-stash lossless.
+    scripted_dispatch_notices: HashMap<String, Vec<scripted::ScriptedDispatchNotice>>,
     /// Behavior ids whose `state.json` needs writeback. Keyed by
     /// `(pod_id, behavior_id)`. Serialization through this set (rather
     /// than tokio::spawn per update) means two rapid state changes
@@ -1106,6 +1125,8 @@ impl Scheduler {
                 scripted_load_notices: HashMap::new(),
                 scripted_queries_in_flight: HashMap::new(),
                 scripted_query_notices: HashMap::new(),
+                scripted_dispatch_watchers: HashMap::new(),
+                scripted_dispatch_notices: HashMap::new(),
                 dirty_behaviors: HashSet::new(),
                 stream_tx,
                 usage_tx,
@@ -3441,6 +3462,7 @@ impl Scheduler {
             }
         }
         self.heal_pending_scripted_queries();
+        self.heal_pending_scripted_dispatches();
     }
 
     /// `query_knowledge` records still pending at load: the process
@@ -3486,6 +3508,91 @@ impl Scheduler {
             if !lost.is_empty() {
                 self.scripted_query_notices.insert(weave_id.clone(), lost);
             }
+        }
+    }
+
+    /// `dispatch_callback` records still pending at load — the
+    /// reconnect half of slice 4's restart contract. Unlike a query
+    /// (whose future died with the process), the dispatched child is a
+    /// real thread that survived: if it's still live the watcher
+    /// re-arms and the callback fires whenever the child terminates;
+    /// if it's already terminal (the common case — the persister heals
+    /// mid-flight children to Failed before this runs) or gone, the
+    /// terminal notice is derived from its persisted final state and
+    /// queued for the weave's first activation. Journal records stay
+    /// Pending until delivery, same as the query heal above.
+    fn heal_pending_scripted_dispatches(&mut self) {
+        let mut watchers: Vec<scripted::ScriptedDispatchWatcher> = Vec::new();
+        let mut notices: Vec<(String, scripted::ScriptedDispatchNotice)> = Vec::new();
+        for (weave_id, weave) in &self.weaves {
+            if !matches!(
+                weave.driver,
+                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+            ) {
+                continue;
+            }
+            for record in weave.effect_journal.records() {
+                if !matches!(
+                    record.outcome,
+                    crate::runtime::driver::DriverEffectOutcome::Pending
+                ) {
+                    continue;
+                }
+                let crate::runtime::driver::PersistedDriverEffect::DispatchCallback {
+                    parent_thread_id,
+                    tool_use_id,
+                    child_thread_id,
+                } = &record.effect
+                else {
+                    continue;
+                };
+                let outcome = match self.tasks.get(child_thread_id) {
+                    Some(task) => match task.public_state() {
+                        ThreadStateLabel::Completed => Ok((
+                            compaction::extract_last_assistant_text(task),
+                            scripted::scripted_dispatch_usage(task),
+                        )),
+                        ThreadStateLabel::Failed => Err(task
+                            .failure_detail()
+                            .unwrap_or_else(|| "child thread failed".to_string())),
+                        ThreadStateLabel::Cancelled => {
+                            Err("child thread was cancelled".to_string())
+                        }
+                        // Still live — reconnect the watcher and let
+                        // the terminal fan-out fire it in due course.
+                        _ => {
+                            watchers.push(scripted::ScriptedDispatchWatcher {
+                                weave_id: weave_id.clone(),
+                                parent_thread_id: parent_thread_id.clone(),
+                                tool_use_id: tool_use_id.clone(),
+                                child_thread_id: child_thread_id.clone(),
+                                effect_id: record.id,
+                            });
+                            continue;
+                        }
+                    },
+                    None => Err("child thread no longer exists".to_string()),
+                };
+                notices.push((
+                    weave_id.clone(),
+                    scripted::ScriptedDispatchNotice {
+                        parent_thread_id: parent_thread_id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        child_thread_id: child_thread_id.clone(),
+                        outcome,
+                    },
+                ));
+            }
+        }
+        for watcher in watchers {
+            self.scripted_dispatch_watchers
+                .insert(watcher.child_thread_id.clone(), watcher);
+        }
+        for (weave_id, notice) in notices {
+            self.scripted_dispatch_notices
+                .entry(weave_id)
+                .or_default()
+                .push(notice);
         }
     }
 
@@ -5465,6 +5572,7 @@ impl Scheduler {
         // parent and has just died, cancel any Functions still
         // targeting it as their `ThreadToolCall` caller.
         self.complete_functions_awaiting_thread(thread_id, pending_io);
+        self.complete_scripted_dispatch_for_child(thread_id, pending_io);
         self.cascade_cancel_caller_gone(thread_id, pending_io);
     }
 
@@ -6654,6 +6762,9 @@ impl Scheduler {
                 self.scripted_query_notices.remove(&weave_id);
                 self.scripted_queries_in_flight
                     .retain(|(w, _), _| w != &weave_id);
+                self.scripted_dispatch_notices.remove(&weave_id);
+                self.scripted_dispatch_watchers
+                    .retain(|_, watcher| watcher.weave_id != weave_id);
                 self.router.drop_weave(&weave_id);
             } else {
                 self.mark_weave_dirty(&weave_id);
@@ -6706,6 +6817,9 @@ impl Scheduler {
             self.scripted_query_notices.remove(weave_id);
             self.scripted_queries_in_flight
                 .retain(|(w, _), _| w != weave_id);
+            self.scripted_dispatch_notices.remove(weave_id);
+            self.scripted_dispatch_watchers
+                .retain(|_, watcher| &watcher.weave_id != weave_id);
             self.router.drop_weave(weave_id);
         }
         for weave_id in weaves_to_flush {

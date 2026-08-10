@@ -146,6 +146,56 @@ pub enum ScriptedEvent {
     /// the material re-issues the query. The store-don't-move contract
     /// on [`Self::QueryCompleted`] applies here identically.
     QueryFailed { id: String, message: String },
+    /// An async `dispatch_thread(sync=false)` child of `thread_id`
+    /// (the dispatching parent) reached Completed (step 11 slice 4).
+    /// `tool_use_id` correlates with the dispatch call the driver saw
+    /// in `agent_completed.tool_calls`; `result` is the child's final
+    /// assistant text; `usage` its lifetime totals. May also be
+    /// delivered at the weave's first activation after a restart when
+    /// the child finished but the event hadn't landed — like
+    /// `thread_failed`, treat it as an idempotent fact (dedupe by
+    /// `tool_use_id`).
+    ///
+    /// Movement contract (amends slice 3's store-don't-move, ratified
+    /// 2026-08-10): this event usually arrives while the parent is
+    /// QUIESCENT — no boundary will re-fire on its own — so the
+    /// handler MAY move a quiescent thread (`append_entry` +
+    /// `run_agent` both admit Idle/Completed; that pair is the
+    /// builtin-parity response). When the parent is parked at a
+    /// boundary, store the fact and let the re-fired boundary move it
+    /// exactly as slice 3 ratified — the driver knows its own parking
+    /// discipline, and `run_agent` on a parked thread refuses loudly.
+    /// After delivery the scheduler steps the weave's ticked threads,
+    /// so parked boundaries re-fire either way.
+    DispatchCompleted {
+        thread_id: String,
+        tool_use_id: String,
+        child_thread_id: String,
+        result: String,
+        usage: ScriptedDispatchUsage,
+    },
+    /// The async dispatch terminated without a result: the child
+    /// failed, was cancelled (message says which), no longer exists,
+    /// or — delivered at the weave's first activation after a restart
+    /// — was healed dead by the persister while the process was down.
+    /// Idempotent fact; the movement contract on
+    /// [`Self::DispatchCompleted`] applies here identically.
+    DispatchFailed {
+        thread_id: String,
+        tool_use_id: String,
+        child_thread_id: String,
+        message: String,
+    },
+}
+
+/// Lifetime usage totals of a dispatched child, crossing into Lua on
+/// [`ScriptedEvent::DispatchCompleted`]. Mirrors the builtin
+/// `<dispatched-thread-notification>` usage block.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedDispatchUsage {
+    pub total_tokens: u32,
+    pub tool_uses: u32,
+    pub duration_ms: i64,
 }
 
 /// One reranked hit crossing into Lua. `bucket` is the resolved
@@ -863,6 +913,70 @@ mod tests {
         "#;
         let out = run_event(src_failed, "qf", &json!({}), &failed).unwrap();
         assert_eq!(out.state, json!({"id": "q1", "message": "lost to restart"}));
+    }
+
+    #[test]
+    fn dispatch_events_are_readable_from_lua() {
+        // Pins the Lua-side shape of the async dispatch terminal: the
+        // usage block arrives as a nested table with numeric fields,
+        // and correlation rides tool_use_id.
+        let src = r#"
+            function on_event(state, event)
+              if event.kind == "dispatch_completed" then
+                return { state = {
+                  parent = event.thread_id,
+                  tu = event.tool_use_id,
+                  child = event.child_thread_id,
+                  result = event.result,
+                  tokens = event.usage.total_tokens,
+                  tools = event.usage.tool_uses,
+                  slow = event.usage.duration_ms > 1000,
+                } }
+              end
+              return { state = state }
+            end
+        "#;
+        let event = ScriptedEvent::DispatchCompleted {
+            thread_id: "parent-1".into(),
+            tool_use_id: "tu-7".into(),
+            child_thread_id: "child-9".into(),
+            result: "Найдено: the answer is 42.".into(),
+            usage: ScriptedDispatchUsage {
+                total_tokens: 1234,
+                tool_uses: 3,
+                duration_ms: 45_000,
+            },
+        };
+        let out = run_event(src, "dc", &json!({}), &event).unwrap();
+        assert_eq!(
+            out.state,
+            json!({
+                "parent": "parent-1",
+                "tu": "tu-7",
+                "child": "child-9",
+                "result": "Найдено: the answer is 42.",
+                "tokens": 1234,
+                "tools": 3,
+                "slow": true,
+            })
+        );
+
+        let failed = ScriptedEvent::DispatchFailed {
+            thread_id: "parent-1".into(),
+            tool_use_id: "tu-7".into(),
+            child_thread_id: "child-9".into(),
+            message: "child thread was cancelled".into(),
+        };
+        let src_failed = r#"
+            function on_event(state, event)
+              return { state = { tu = event.tool_use_id, message = event.message } }
+            end
+        "#;
+        let out = run_event(src_failed, "df", &json!({}), &failed).unwrap();
+        assert_eq!(
+            out.state,
+            json!({"tu": "tu-7", "message": "child thread was cancelled"})
+        );
     }
 
     #[test]

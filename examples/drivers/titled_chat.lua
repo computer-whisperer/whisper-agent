@@ -23,6 +23,14 @@
 -- tools holds until the query resolves, and unseen hits ride into the
 -- next model call as a nudge: the builtin autoquery loop (step 11
 -- slice 3) expressed in driver code.
+--
+-- Async dispatch (step 11 slice 4): when the model dispatches a child
+-- with sync=false, its terminal arrives as dispatch_completed /
+-- dispatch_failed. Quiescent primary: append the notification as an
+-- attributed entry and run a fresh turn (the builtin injection,
+-- expressed in driver code). Mid-cycle: store, and flush when the
+-- cycle finishes — the movement contract on dispatch_completed in
+-- driver/lua.rs.
 
 local TITLE_PROMPT = "You write conversation titles. Reply with the "
   .. "title only: 3 to 8 words, no quotes, no trailing punctuation."
@@ -70,6 +78,22 @@ local function format_nudge(hits)
   return out
 end
 
+-- Append every stored dispatch notification to the primary and run a
+-- fresh turn on it. Callers guarantee the primary is quiescent (busy
+-- unset): append_entry and run_agent both admit an idle, completed, or
+-- input-holding thread, and refuse loudly mid-cycle.
+local function flush_dispatches(state)
+  local effects = {}
+  for _, text in ipairs(state.disp_pending) do
+    effects[#effects + 1] = { kind = "append_entry",
+      thread_id = state.primary, author = "dispatch", text = text }
+  end
+  state.disp_pending = nil
+  effects[#effects + 1] = { kind = "run_agent", thread_id = state.primary }
+  state.busy = true
+  return effects
+end
+
 -- Trim, unquote, collapse whitespace, drop a trailing period, clip.
 -- The FINAL trim matters: unquoting can reveal whitespace ('" "'),
 -- and the scheduler trims before its empty-title refusal — the Lua
@@ -101,8 +125,13 @@ function on_event(state, event, config)
 
   if k == "input_accepted" then
     state.primary = state.primary or event.thread_id
-    if event.thread_id == state.primary and not state.opening then
-      state.opening = clip(event.text, 500)
+    if event.thread_id == state.primary then
+      -- Input revives a dead primary; stored dispatch notifications
+      -- flush at the revived cycle's finish.
+      state.dead = nil
+      if not state.opening then
+        state.opening = clip(event.text, 500)
+      end
     end
     return { state = state }
   end
@@ -112,6 +141,13 @@ function on_event(state, event, config)
       -- Driver-run turn on a seeded thread that never saw
       -- input_accepted: the conversation head is whoever turns first.
       state.primary = event.thread_id
+    end
+    if event.thread_id == state.primary then
+      -- Cycle opening: dispatch terminals arriving from here to the
+      -- finish store instead of moving the thread. A turn also proves
+      -- the primary is alive again.
+      state.busy = true
+      state.dead = nil
     end
     return { effects = { { kind = "run_agent", thread_id = event.thread_id } },
              state = state }
@@ -175,6 +211,9 @@ function on_event(state, event, config)
       return { effects = effects, state = state }
     end
 
+    -- Cycle closing: the primary is quiescent once finish_cycle
+    -- applies, so stored dispatch notifications can flush below.
+    state.busy = nil
     local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
     if not state.title_requested then
       -- First completed reply: ask a (cheap, knob-configured) model
@@ -193,6 +232,13 @@ function on_event(state, event, config)
           .. "User: " .. (state.opening or "") .. "\n\n"
           .. "Assistant: " .. clip(event.text, 500) } },
         source_thread_id = event.thread_id }
+    end
+    if state.disp_pending and #state.disp_pending > 0 then
+      -- Dispatch terminals landed mid-cycle; deliver them now that
+      -- the cycle is closing (finish, then append + fresh turn).
+      for _, e in ipairs(flush_dispatches(state)) do
+        effects[#effects + 1] = e
+      end
     end
     return { effects = effects, state = state }
   end
@@ -262,6 +308,40 @@ function on_event(state, event, config)
     return { state = state }
   end
 
+  if k == "dispatch_completed" or k == "dispatch_failed" then
+    -- Terminal facts can re-deliver across a restart (the record
+    -- resolves at delivery; a crash before the flush re-derives the
+    -- notice): dedupe by (tool call, child) — the scheduler-side
+    -- correlation pair, robust to a backend reusing tool_use_ids
+    -- across turns.
+    local seen_key = event.tool_use_id .. "\t" .. event.child_thread_id
+    state.disp_seen = state.disp_seen or {}
+    if state.disp_seen[seen_key] then
+      return { state = state }
+    end
+    state.disp_seen[seen_key] = true
+    local text
+    if k == "dispatch_completed" then
+      text = "[dispatched thread " .. event.child_thread_id
+        .. " completed]\n" .. event.result
+    else
+      text = "[dispatched thread " .. event.child_thread_id
+        .. " failed: " .. event.message .. "]"
+    end
+    state.disp_pending = state.disp_pending or {}
+    state.disp_pending[#state.disp_pending + 1] = text
+    if state.busy or state.dead or not state.primary then
+      -- Mid-cycle, dead, or headless: store only. Moving the primary
+      -- from here would fault against a parked boundary or a corpse
+      -- (a cancelled parent's cascade cancels its child, and that
+      -- child's dispatch_failed arrives right behind the death
+      -- notice); input revives the primary and the notifications
+      -- flush at the revived cycle's finish.
+      return { state = state }
+    end
+    return { effects = flush_dispatches(state), state = state }
+  end
+
   if k == "thread_failed" then
     if state.title_thread and event.thread_id == state.title_thread then
       -- The title model died; keep the truncation placeholder and
@@ -270,6 +350,13 @@ function on_event(state, event, config)
       -- titling is cosmetic.
       state.title_thread = nil
       return { effects = { { kind = "complete_run" } }, state = state }
+    end
+    if event.thread_id == state.primary then
+      -- The head is a corpse (failed or cancelled) until input
+      -- revives it: dispatch terminals must store, not flush — a
+      -- run_agent against it would fault the activation and clobber
+      -- the cancel with a driver failure.
+      state.dead = true
     end
     return { state = state }
   end
