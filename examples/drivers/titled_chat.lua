@@ -31,6 +31,24 @@
 -- expressed in driver code). Mid-cycle: store, and flush when the
 -- cycle finishes — the movement contract on dispatch_completed in
 -- driver/lua.rs.
+--
+-- Compaction (step 11 slice 5): the builtin flow composed from weave
+-- primitives. Trigger is driver-owned — the `compaction.token_threshold`
+-- knob compares the thread's cumulative input tokens at each cycle
+-- close (the builtin auto-trigger's operand) and issues
+-- request_compaction; the client's manual compact arrives as the same
+-- compaction_ready event with reason "manual". The event carries the
+-- thread's RESOLVED prompt/regex/template. Flow: append the prompt at
+-- quiescence and run the summary turn; extract the <summary> with
+-- regex_capture (the configured Rust regex verbatim); derive the
+-- continuation inheriting the old head's setup, config, and bindings
+-- (setup_from/config_from/bindings_from — pod drift must not leak
+-- across the roll); advance_head; run the continuation seeded with the
+-- filled-in template. Extraction failure matches the builtin: the head
+-- stays Completed, no continuation, no retry. `state.cp` phases:
+-- "req" (request in flight) -> "ready" (config held, waiting for
+-- quiescence) -> "prompted" (summary turn running) -> "derive"
+-- (continuation being created) -> nil.
 
 local TITLE_PROMPT = "You write conversation titles. Reply with the "
   .. "title only: 3 to 8 words, no quotes, no trailing punctuation."
@@ -94,6 +112,27 @@ local function flush_dispatches(state)
   return effects
 end
 
+-- Append the held compaction prompt to the quiescent primary and run
+-- the summary turn. Callers guarantee quiescence (busy unset); the
+-- author is "user" for builtin parity — the model sees the prompt as
+-- an ordinary user message.
+local function start_summary_turn(state)
+  state.cp = "prompted"
+  state.busy = true
+  return {
+    { kind = "append_entry", thread_id = state.primary, author = "user",
+      text = state.cp_prompt },
+    { kind = "run_agent", thread_id = state.primary },
+  }
+end
+
+local function clear_compaction(state)
+  state.cp = nil
+  state.cp_prompt = nil
+  state.cp_regex = nil
+  state.cp_template = nil
+end
+
 -- Trim, unquote, collapse whitespace, drop a trailing period, clip.
 -- The FINAL trim matters: unquoting can reveal whitespace ('" "'),
 -- and the scheduler trims before its empty-title refusal — the Lua
@@ -116,6 +155,10 @@ function describe()
       { id = "title.model", label = "Title model", type = "model" },
       { id = "autoquery", label = "Knowledge autoquery", type = "boolean",
         default = false },
+      -- Absent = manual-only, the builtin token_threshold=None default.
+      { id = "compaction.token_threshold",
+        label = "Auto-compaction threshold (tokens)", type = "integer",
+        min = 1 },
     },
   }
 end
@@ -129,6 +172,19 @@ function on_event(state, event, config)
       -- Input revives a dead primary; stored dispatch notifications
       -- flush at the revived cycle's finish.
       state.dead = nil
+      -- The cycle effectively begins at acceptance: the turn is
+      -- coming but may lag (resource warmup parks the thread in a
+      -- state that admits append_entry yet refuses run_agent), so
+      -- anything that would move the primary from here to turn_start
+      -- must store, not start. Review fix, slice 5.
+      state.busy = true
+      -- Input supersedes an in-flight compaction the same way it
+      -- supersedes a model call: a held request, a running summary
+      -- turn, or a wedged marker from a faulted roll all clear — the
+      -- reply to THIS message must never be regex-tested as a
+      -- summary, and the threshold simply re-requests at the next
+      -- close. Review fix, slice 5.
+      clear_compaction(state)
       if not state.opening then
         state.opening = clip(event.text, 500)
       end
@@ -211,6 +267,38 @@ function on_event(state, event, config)
       return { effects = effects, state = state }
     end
 
+    if state.cp == "prompted" then
+      -- The summary turn came back. Extract with the CONFIGURED regex
+      -- verbatim; success rolls the weave, failure matches the builtin
+      -- (head stays Completed, no continuation, no retry).
+      local effects = { { kind = "finish_cycle", thread_id = event.thread_id } }
+      local body = regex_capture(state.cp_regex, event.text)
+      if body then
+        -- Keep busy set: the roll is one continuous busy period, so
+        -- dispatch terminals keep storing until the continuation runs
+        -- (they flush at ITS first close).
+        state.cp = "derive"
+        local seed = string.gsub(state.cp_template, "{{summary}}",
+          function() return body end)
+        effects[#effects + 1] = { kind = "derive_thread",
+          relationship = "compaction",
+          setup_from = state.primary,
+          config_from = state.primary,
+          bindings_from = state.primary,
+          seed = { { author = "user", text = seed } },
+          source_thread_id = state.primary }
+      else
+        clear_compaction(state)
+        state.busy = nil
+        if state.disp_pending and #state.disp_pending > 0 then
+          for _, e in ipairs(flush_dispatches(state)) do
+            effects[#effects + 1] = e
+          end
+        end
+      end
+      return { effects = effects, state = state }
+    end
+
     -- Cycle closing: the primary is quiescent once finish_cycle
     -- applies, so stored dispatch notifications can flush below.
     state.busy = nil
@@ -235,9 +323,26 @@ function on_event(state, event, config)
     end
     if state.disp_pending and #state.disp_pending > 0 then
       -- Dispatch terminals landed mid-cycle; deliver them now that
-      -- the cycle is closing (finish, then append + fresh turn).
+      -- the cycle is closing (finish, then append + fresh turn). A
+      -- held compaction waits — the flush cycle's close serves it.
       for _, e in ipairs(flush_dispatches(state)) do
         effects[#effects + 1] = e
+      end
+    elseif state.cp == "ready" then
+      -- A compaction held while the cycle ran; the head is quiescent
+      -- once finish_cycle applies, so the summary turn starts now.
+      for _, e in ipairs(start_summary_turn(state)) do
+        effects[#effects + 1] = e
+      end
+    elseif not state.cp then
+      -- Self-detected trigger (the builtin auto-compaction operand:
+      -- cumulative input tokens vs the knob). The answer arrives as
+      -- compaction_ready in this same activation's drain.
+      local threshold = config and config["compaction.token_threshold"]
+      if threshold and event.thread_usage.input_tokens > threshold then
+        state.cp = "req"
+        effects[#effects + 1] = { kind = "request_compaction",
+          thread_id = event.thread_id }
       end
     end
     return { effects = effects, state = state }
@@ -248,6 +353,47 @@ function on_event(state, event, config)
       state.title_thread = event.thread_id
       return { effects = { { kind = "run_agent", thread_id = event.thread_id } },
                state = state }
+    end
+    if event.relationship == "compaction" then
+      -- The roll: the continuation becomes the head (the old one is
+      -- demoted to a dormant auxiliary by advance_head) and runs its
+      -- seeded first turn. Stored dispatch notifications now target
+      -- the new head and flush at its first close.
+      state.primary = event.thread_id
+      clear_compaction(state)
+      state.busy = true
+      return { effects = {
+        { kind = "advance_head", thread_id = event.thread_id },
+        { kind = "run_agent", thread_id = event.thread_id },
+      }, state = state }
+    end
+    return { state = state }
+  end
+
+  if k == "compaction_ready" then
+    if event.thread_id ~= state.primary
+      or state.cp == "prompted" or state.cp == "derive" then
+      -- Stale head, or already mid-flow (events can re-deliver).
+      return { state = state }
+    end
+    state.cp_prompt = event.prompt
+    state.cp_regex = event.summary_regex
+    state.cp_template = event.continuation_template
+    if state.busy or state.dead then
+      -- Mid-cycle or corpse: hold. The close (or the revived cycle's
+      -- close) starts the summary turn.
+      state.cp = "ready"
+      return { state = state }
+    end
+    return { effects = start_summary_turn(state), state = state }
+  end
+
+  if k == "compaction_refused" then
+    -- Only the driver's own request can be refused this way (manual
+    -- refusals bounce to the client); drop the in-flight marker so a
+    -- later crossing re-requests.
+    if event.thread_id == state.primary and state.cp == "req" then
+      state.cp = nil
     end
     return { state = state }
   end
@@ -357,6 +503,11 @@ function on_event(state, event, config)
       -- run_agent against it would fault the activation and clobber
       -- the cancel with a driver failure.
       state.dead = true
+      -- A dying summary turn abandons the compaction (the builtin's
+      -- restart contract: heal-to-Failed never resumes a summary);
+      -- a held request dies with the head too — the user compacts
+      -- again after input revives it.
+      clear_compaction(state)
     end
     return { state = state }
   end

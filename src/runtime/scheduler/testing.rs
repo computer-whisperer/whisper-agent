@@ -4349,3 +4349,627 @@ async fn pending_dispatch_callbacks_reconnect_at_load() {
     ));
     assert!(!h.sched.scripted_dispatch_notices.contains_key(&weave_id));
 }
+
+/// Drive a fresh titled_chat weave through its opening exchange and
+/// close the title job, leaving the primary Completed and quiescent —
+/// the launch state for the slice-5 compaction tests.
+async fn settled_titled_chat(
+    knobs: std::collections::BTreeMap<String, serde_json::Value>,
+) -> (Harness, String, String) {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let primary = h
+        .create_scripted_thread_with_config("titled_chat", knobs)
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+    h.sched.send_user_message(
+        &primary,
+        "Opening question".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(
+        &primary,
+        vec![text_block("Opening reply.")],
+        &mut pending_io,
+    );
+    let title_thread = h.title_thread_of(&weave_id);
+    h.respond_model(&title_thread, vec![text_block("A Title")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    (h, primary, weave_id)
+}
+
+impl Harness {
+    fn title_thread_of(&self, weave_id: &str) -> String {
+        self.sched.weaves[weave_id]
+            .threads
+            .iter()
+            .find(|r| {
+                r.relationship
+                    .as_ref()
+                    .is_some_and(|rel| rel.kind == "title")
+            })
+            .expect("title thread derived")
+            .thread_id
+            .clone()
+    }
+
+    /// Send the client's manual CompactThread message (the scripted
+    /// branch routes it to the driver as `compaction_ready`).
+    fn compact_message(&mut self, thread_id: &str) {
+        let mut pending_io = FuturesUnordered::new();
+        self.sched.apply_client_message(
+            7,
+            whisper_agent_protocol::ClientToServer::CompactThread {
+                thread_id: thread_id.into(),
+                correlation_id: None,
+            },
+            &mut pending_io,
+        );
+    }
+
+    /// The weave ref carrying a `compaction` relationship — the
+    /// continuation thread — with its recorded source.
+    fn compaction_continuation(&self, weave_id: &str) -> (String, String) {
+        let r = self.sched.weaves[weave_id]
+            .threads
+            .iter()
+            .find(|r| {
+                r.relationship
+                    .as_ref()
+                    .is_some_and(|rel| rel.kind == "compaction")
+            })
+            .expect("compaction continuation derived");
+        (
+            r.thread_id.clone(),
+            r.relationship
+                .as_ref()
+                .and_then(|rel| rel.source.as_ref())
+                .map(|s| s.thread_id.clone())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+/// The manual compaction path on a scripted weave (step 11 slice 5),
+/// end to end: the client message routes to the driver as
+/// `compaction_ready` instead of the builtin Function, the driver runs
+/// the summary turn with the resolved prompt appended as an ordinary
+/// user message, extracts with the configured regex, derives the
+/// continuation inheriting the OLD head's setup verbatim (pod drift
+/// must not leak across the roll), advances the head, and runs the
+/// seeded first turn. The old head stays Completed as a dormant
+/// auxiliary.
+#[tokio::test]
+async fn titled_chat_manual_compaction_rolls_the_weave() {
+    let (mut h, primary, weave_id) = settled_titled_chat(Default::default()).await;
+    let mut pending_io = FuturesUnordered::new();
+
+    // Pod drift after the head launched: the continuation must NOT
+    // pick this up — its setup copies the old head's verbatim.
+    h.sched.pods.get_mut(TEST_POD).unwrap().system_prompt = "DRIFTED PROMPT".into();
+
+    h.compact_message(&primary);
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the summary turn started on the quiescent head"
+    );
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+    let prompt_appended = h.sched.tasks[&primary]
+        .conversation
+        .messages()
+        .iter()
+        .any(|m| {
+            m.role == whisper_agent_protocol::Role::User
+                && m.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        ContentBlock::Text { text } if text.contains("Produce a compact summary")
+                    )
+                })
+        });
+    assert!(
+        prompt_appended,
+        "the resolved prompt rode in as a user message"
+    );
+
+    h.respond_model(
+        &primary,
+        vec![text_block("Here it is.\n<summary>ROLLED SUMMARY</summary>")],
+        &mut pending_io,
+    );
+
+    let (continuation, source) = h.compaction_continuation(&weave_id);
+    assert_eq!(
+        source, primary,
+        "the relationship edge points at the old head"
+    );
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(continuation.as_str()),
+        "advance_head promoted the continuation"
+    );
+    let old_ref = h.sched.weaves[&weave_id]
+        .threads
+        .iter()
+        .find(|r| r.thread_id == primary)
+        .unwrap();
+    assert!(!old_ref.ticks, "the old head is a dormant auxiliary");
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert!(
+        matches!(
+            h.internal_of(&continuation),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the continuation's seeded first turn is running"
+    );
+    assert_eq!(
+        h.sched.tasks[&continuation]
+            .conversation
+            .system_prompt_text(),
+        "you are a test agent",
+        "setup_from copied the old head's prefix — pod drift did not leak"
+    );
+    let seeded = h.sched.tasks[&continuation]
+        .conversation
+        .messages()
+        .iter()
+        .any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Text { text } if text.contains("ROLLED SUMMARY")
+                        && text.contains("continues a previous conversation")
+                )
+            })
+        });
+    assert!(
+        seeded,
+        "the continuation template carried the extracted summary"
+    );
+    let data = h.scripted_data(&weave_id);
+    assert_eq!(data["primary"], continuation.as_str());
+    assert!(
+        data["cp"].is_null(),
+        "compaction state cleared after the roll"
+    );
+
+    h.respond_model(&continuation, vec![text_block("Resumed.")], &mut pending_io);
+    assert!(matches!(
+        h.internal_of(&continuation),
+        ThreadInternalState::Completed
+    ));
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        3,
+        "old head + title thread + continuation; no second title job"
+    );
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                &r.effect,
+                PersistedDriverEffect::AdvanceHead { thread_id, .. } if thread_id == &continuation
+            )),
+        "the roll journaled its advance_head"
+    );
+}
+
+/// Driver-owned auto-compaction (step 11 slice 5): the
+/// `compaction.token_threshold` knob compares the cumulative usage the
+/// `agent_completed` event now carries, issues `request_compaction`,
+/// and the `compaction_ready` answer lands in the same activation's
+/// drain — the summary turn starts immediately on the quiescent head.
+#[tokio::test]
+async fn titled_chat_threshold_crossing_requests_and_rolls() {
+    let (mut h, primary, weave_id) = settled_titled_chat(
+        [(
+            "compaction.token_threshold".to_string(),
+            serde_json::json!(50_000),
+        )]
+        .into_iter()
+        .collect(),
+    )
+    .await;
+    let mut pending_io = FuturesUnordered::new();
+    assert!(
+        !h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(&r.effect, PersistedDriverEffect::RequestCompaction { .. })),
+        "under the threshold no request fires"
+    );
+
+    h.sched
+        .tasks
+        .get_mut(&primary)
+        .unwrap()
+        .total_usage
+        .input_tokens = 60_000;
+    h.sched
+        .send_user_message(&primary, "More.".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("A long reply.")], &mut pending_io);
+
+    assert!(
+        matches!(
+            h.internal_of(&primary),
+            ThreadInternalState::AwaitingModel { .. }
+        ),
+        "the crossing close chained straight into the summary turn"
+    );
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                (&r.effect, &r.outcome),
+                (
+                    PersistedDriverEffect::RequestCompaction { thread_id },
+                    DriverEffectOutcome::Completed,
+                ) if thread_id == &primary
+            )),
+        "the request journaled Completed"
+    );
+
+    h.respond_model(
+        &primary,
+        vec![text_block("<summary>AUTO SUMMARY</summary>")],
+        &mut pending_io,
+    );
+    let (continuation, _) = h.compaction_continuation(&weave_id);
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(continuation.as_str())
+    );
+    assert!(matches!(
+        h.internal_of(&continuation),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    assert!(
+        h.sched.tasks[&continuation]
+            .conversation
+            .messages()
+            .iter()
+            .any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::Text { text } if text.contains("AUTO SUMMARY")
+            ))),
+        "the continuation carries the extracted summary"
+    );
+}
+
+/// Extraction failure matches the builtin: the head stays Completed
+/// and primary, no continuation spawns, the marker clears — and a
+/// LATER manual compact is not wedged.
+#[tokio::test]
+async fn titled_chat_extraction_failure_leaves_the_head_standing() {
+    let (mut h, primary, weave_id) = settled_titled_chat(Default::default()).await;
+    let mut pending_io = FuturesUnordered::new();
+
+    h.compact_message(&primary);
+    h.respond_model(
+        &primary,
+        vec![text_block("I would rather not summarize.")],
+        &mut pending_io,
+    );
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(primary.as_str()),
+        "no roll happened"
+    );
+    assert_eq!(
+        h.sched.weaves[&weave_id].threads.len(),
+        2,
+        "primary + title thread only — no continuation"
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert!(h.scripted_data(&weave_id)["cp"].is_null());
+
+    // The failed attempt left nothing wedged: compact again, succeed.
+    h.compact_message(&primary);
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+    h.respond_model(
+        &primary,
+        vec![text_block("<summary>SECOND TRY</summary>")],
+        &mut pending_io,
+    );
+    let (continuation, _) = h.compaction_continuation(&weave_id);
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(continuation.as_str())
+    );
+}
+
+/// Refusals on the scripted path: a compaction-disabled thread bounces
+/// the manual message at the shared admission (no summary turn, no
+/// driver state), the driver's own request gets `compaction_refused`
+/// and clears its marker (journal Failed — auditable), and a
+/// non-primary target refuses with the head named.
+#[tokio::test]
+async fn scripted_compaction_refusals_do_not_wedge() {
+    let mut h = harness().await;
+    h.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    let mut pending_io = FuturesUnordered::new();
+    let primary = h
+        .sched
+        .create_task(
+            None,
+            None,
+            None,
+            Some(ThreadConfigOverride {
+                driver: Some(ThreadDriverConfig::Scripted {
+                    name: "titled_chat".into(),
+                    config: [(
+                        "compaction.token_threshold".to_string(),
+                        serde_json::json!(50_000),
+                    )]
+                    .into_iter()
+                    .collect(),
+                }),
+                compaction: Some(whisper_agent_protocol::CompactionConfigOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut pending_io,
+        )
+        .unwrap();
+    let weave_id = h.weave_of(&primary);
+    h.sched
+        .send_user_message(&primary, "Hello".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Hi.")], &mut pending_io);
+    let title_thread = h.title_thread_of(&weave_id);
+    h.respond_model(&title_thread, vec![text_block("Refusals")], &mut pending_io);
+
+    // (a) Manual on a disabled thread: bounced at admission.
+    h.compact_message(&primary);
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+    assert!(h.scripted_data(&weave_id)["cp"].is_null());
+
+    // (b) The driver's own request refuses the same way and clears the
+    // in-flight marker via compaction_refused.
+    h.sched
+        .tasks
+        .get_mut(&primary)
+        .unwrap()
+        .total_usage
+        .input_tokens = 60_000;
+    h.sched
+        .send_user_message(&primary, "More.".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    h.respond_model(&primary, vec![text_block("Still here.")], &mut pending_io);
+    assert!(
+        matches!(h.internal_of(&primary), ThreadInternalState::Completed),
+        "no summary turn — the request was refused"
+    );
+    assert!(h.scripted_data(&weave_id)["cp"].is_null());
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                (&r.effect, &r.outcome),
+                (
+                    PersistedDriverEffect::RequestCompaction { .. },
+                    DriverEffectOutcome::Failed { message },
+                ) if message.contains("disabled")
+            )),
+        "the refusal journaled Failed"
+    );
+
+    // (c) A non-primary target refuses at the shared admission.
+    let err = h
+        .sched
+        .deliver_manual_compaction(&weave_id, &title_thread, &mut pending_io)
+        .unwrap_err();
+    assert!(
+        err.contains("not the weave's current primary"),
+        "refusal names the head rule: {err}"
+    );
+}
+
+/// Restart mid-summary-turn abandons the compaction (the builtin's
+/// documented contract): the healed head's `thread_failed` clears the
+/// driver's marker at the next activation, input revives the head, and
+/// a fresh manual compact runs the full roll.
+#[tokio::test]
+async fn restart_mid_summary_turn_abandons_the_compaction() {
+    let (mut h, primary, weave_id) = settled_titled_chat(Default::default()).await;
+    h.compact_message(&primary);
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+    let title_thread = h.title_thread_of(&weave_id);
+
+    // Snapshot and restart: the persister heals the in-flight summary
+    // turn to Failed before load.
+    let weave = h.sched.weaves[&weave_id].clone();
+    let mut threads = Vec::new();
+    for tid in [&primary, &title_thread] {
+        let mut task = h.sched.tasks[tid.as_str()].clone();
+        if task.is_in_flight() {
+            let mut events = Vec::new();
+            task.heal_to_idle("task was in-flight at last shutdown", &mut events);
+            task.fail("resume", "task was in-flight at last shutdown");
+        }
+        threads.push(task);
+    }
+    let mut fresh = harness().await;
+    fresh.install_driver("titled_chat", TITLED_CHAT_DRIVER);
+    fresh.sched.load_state(crate::pod::persist::LoadedState {
+        pods: Vec::new(),
+        threads,
+        weaves: vec![weave],
+    });
+
+    // Input revives the head; the death notice cleared the marker
+    // before the input event ran.
+    let mut pending_io = FuturesUnordered::new();
+    fresh
+        .sched
+        .send_user_message(&primary, "revive".into(), Vec::new(), &mut pending_io);
+    fresh.sched.step_until_blocked(&primary, &mut pending_io);
+    assert!(matches!(
+        fresh.internal_of(&primary),
+        ThreadInternalState::AwaitingModel { .. }
+    ));
+    let data = fresh.scripted_data(&weave_id);
+    assert!(
+        data["cp"].is_null(),
+        "the abandoned compaction left no marker"
+    );
+    assert!(data["dead"].is_null(), "input revived the head");
+    fresh.respond_model(&primary, vec![text_block("Back.")], &mut pending_io);
+    assert!(matches!(
+        fresh.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    // The abandoned compaction does not poison a retry.
+    fresh.compact_message(&primary);
+    assert_eq!(fresh.scripted_data(&weave_id)["cp"], "prompted");
+    fresh.respond_model(
+        &primary,
+        vec![text_block("<summary>AFTER RESTART</summary>")],
+        &mut pending_io,
+    );
+    let (continuation, _) = fresh.compaction_continuation(&weave_id);
+    assert_eq!(
+        fresh.sched.weaves[&weave_id].primary_thread_id(),
+        Some(continuation.as_str())
+    );
+}
+
+/// `setup_from` is exclusive with explicit `system_prompt` /
+/// `disable_tools`: the combination journals a Failed derive record
+/// (auditable, not silent) and faults the activation.
+#[tokio::test]
+async fn derive_setup_from_is_exclusive_with_explicit_setup() {
+    let mut h = harness().await;
+    h.install_driver(
+        "bad_inherit",
+        r#"
+            function on_event(state, event)
+              if event.kind == "turn_start" then
+                return { effects = { { kind = "derive_thread",
+                  relationship = "x", setup_from = event.thread_id,
+                  system_prompt = "boom" } }, state = state }
+              end
+              return { state = state }
+            end
+        "#,
+    );
+    let primary = h.create_scripted_thread("bad_inherit").unwrap();
+    let weave_id = h.weave_of(&primary);
+    let mut pending_io = FuturesUnordered::new();
+    h.sched
+        .send_user_message(&primary, "go".into(), Vec::new(), &mut pending_io);
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    let detail = h.sched.tasks[&primary]
+        .failure_detail()
+        .expect("the bad combination fails the activation's origin thread");
+    assert!(detail.contains("exclusive"), "{detail}");
+    assert!(
+        h.sched.weaves[&weave_id]
+            .effect_journal
+            .records()
+            .iter()
+            .any(|r| matches!(
+                (&r.effect, &r.outcome),
+                (
+                    PersistedDriverEffect::DeriveThread { thread_id: None, .. },
+                    DriverEffectOutcome::Failed { message },
+                ) if message.contains("exclusive")
+            )),
+        "static faults journal like every refusal"
+    );
+}
+
+/// Review fix (slice 5): input supersedes an in-flight compaction.
+/// Typing while the summary turn runs heals the in-flight call and
+/// clears the driver's marker — the reply to the user's message is
+/// NOT regex-tested as a summary (with the compaction prompt still in
+/// context it could genuinely match and roll the weave, swallowing
+/// the user's message), and a wedged marker from a faulted roll heals
+/// the same way. A fresh manual compact afterwards runs normally.
+#[tokio::test]
+async fn input_during_summary_turn_supersedes_the_compaction() {
+    let (mut h, primary, weave_id) = settled_titled_chat(Default::default()).await;
+    let mut pending_io = FuturesUnordered::new();
+
+    h.compact_message(&primary);
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+
+    // The user keeps typing mid-summary-turn.
+    h.sched.send_user_message(
+        &primary,
+        "actually, one more thing".into(),
+        Vec::new(),
+        &mut pending_io,
+    );
+    h.sched.step_until_blocked(&primary, &mut pending_io);
+    assert!(
+        h.scripted_data(&weave_id)["cp"].is_null(),
+        "input cleared the in-flight compaction"
+    );
+
+    // Even a summary-shaped reply must not roll the weave now.
+    h.respond_model(
+        &primary,
+        vec![text_block("<summary>NOT A SUMMARY</summary>")],
+        &mut pending_io,
+    );
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(primary.as_str()),
+        "no roll: the superseded compaction never finalizes"
+    );
+    assert!(matches!(
+        h.internal_of(&primary),
+        ThreadInternalState::Completed
+    ));
+
+    // The superseded compaction leaves nothing wedged.
+    h.compact_message(&primary);
+    assert_eq!(h.scripted_data(&weave_id)["cp"], "prompted");
+    h.respond_model(
+        &primary,
+        vec![text_block("<summary>REAL SUMMARY</summary>")],
+        &mut pending_io,
+    );
+    let (continuation, _) = h.compaction_continuation(&weave_id);
+    assert_eq!(
+        h.sched.weaves[&weave_id].primary_thread_id(),
+        Some(continuation.as_str())
+    );
+}

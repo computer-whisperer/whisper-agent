@@ -232,6 +232,15 @@ pub enum PersistedDriverEffect {
         #[serde(default)]
         buckets: Vec<String>,
     },
+    /// The driver asked for a thread's resolved compaction config
+    /// (step 11 slice 5). Synchronous: answered within the same
+    /// activation by a `compaction_ready` / `compaction_refused`
+    /// event, so the record never rests Pending — Completed means the
+    /// config was delivered, Failed carries the refusal. The
+    /// compaction flow itself journals through the ordinary effects
+    /// the driver composes it from (`append_entry`, `run_agent`,
+    /// `derive_thread`, `advance_head`).
+    RequestCompaction { thread_id: String },
     /// One asynchronous `dispatch_thread(sync=false)` callback owed to
     /// this weave's driver (step 11 slice 4). Journaled pending when
     /// the scheduler registers the dispatch for a scripted-ticked

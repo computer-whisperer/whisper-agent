@@ -35,7 +35,9 @@
 //! state already tracks as in progress.
 //!
 //! Each event runs in a fresh, sandboxed VM: table/string/math/utf8
-//! stdlib only, with the base-library escape hatches stripped on top
+//! stdlib plus one injected helper — `regex_capture(pattern, text)`,
+//! a deterministic Rust-regex extraction (step 11 slice 5) — with the
+//! base-library escape hatches stripped on top
 //! (pcall/xpcall — they could swallow the instruction-budget error;
 //! load/dofile/loadfile — filesystem and stdin reach; collectgarbage,
 //! print, math.random — nondeterminism), plus a memory ceiling and an
@@ -79,12 +81,21 @@ pub enum ScriptedEvent {
     /// requested (empty when none). Authoring note: reasoning can be
     /// large — drivers that stash it into state bloat their persisted
     /// JSON.
+    ///
+    /// `usage` is the completed model call's own token usage;
+    /// `thread_usage` the thread's cumulative totals across its
+    /// lifetime — the operand of the builtin auto-compaction
+    /// threshold, exposed so a driver can own that policy (step 11
+    /// slice 5: a driver self-detects "context is outgrowing the
+    /// thread" and composes compaction from weave primitives).
     AgentCompleted {
         thread_id: String,
         participant_id: String,
         text: String,
         reasoning: String,
         tool_calls: Vec<ScriptedToolCall>,
+        usage: ScriptedCallUsage,
+        thread_usage: ScriptedCallUsage,
     },
     /// Every tool requested by the last agent turn has a result.
     ToolsCompleted {
@@ -186,6 +197,40 @@ pub enum ScriptedEvent {
         child_thread_id: String,
         message: String,
     },
+    /// A compaction of `thread_id` may proceed (step 11 slice 5).
+    /// Delivered in answer to the driver's own `request_compaction`
+    /// effect (`reason = "driver"`) or to the client's manual
+    /// CompactThread message on a scripted weave (`reason =
+    /// "manual"`). Carries the thread's RESOLVED compaction config —
+    /// `prompt` (the pod-relative `prompt_file` read at delivery
+    /// time, or the built-in default), `summary_regex` (Rust-regex
+    /// source for [`regex_capture`]-based extraction, group 1 = the
+    /// summary body), and `continuation_template` (`{{summary}}`
+    /// substitutes) — because pod-dir resolution is scheduler
+    /// business and freezing the texts at creation would let a pod's
+    /// prompt-file edits silently stop applying.
+    ///
+    /// The scheduler validated only structure (the weave ticks the
+    /// thread, the thread is the current primary, compaction is
+    /// enabled). Idleness is the DRIVER's business: store the fact
+    /// while the primary is mid-cycle and act at quiescence — better
+    /// than the builtin, which rejects a non-idle compact outright.
+    /// Like every event, may re-deliver; a driver already compacting
+    /// stores or drops it.
+    CompactionReady {
+        thread_id: String,
+        reason: String,
+        prompt: String,
+        summary_regex: String,
+        continuation_template: String,
+    },
+    /// A `request_compaction` effect was refused — the thread is not
+    /// the weave's ticked primary, or its config disables compaction.
+    /// Delivered so the driver can clear its own in-flight marker
+    /// (the `query_failed` precedent: effects must not fail
+    /// invisibly). Manual refusals bounce to the requesting client
+    /// instead and never reach the driver.
+    CompactionRefused { thread_id: String, message: String },
 }
 
 /// Lifetime usage totals of a dispatched child, crossing into Lua on
@@ -196,6 +241,28 @@ pub struct ScriptedDispatchUsage {
     pub total_tokens: u32,
     pub tool_uses: u32,
     pub duration_ms: i64,
+}
+
+/// Token usage crossing into Lua on [`ScriptedEvent::AgentCompleted`]
+/// — the wire shape of the protocol `Usage` struct, used both for the
+/// completed call and for the thread's cumulative totals.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct ScriptedCallUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
+}
+
+impl From<&whisper_agent_protocol::Usage> for ScriptedCallUsage {
+    fn from(usage: &whisper_agent_protocol::Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        }
+    }
 }
 
 /// One reranked hit crossing into Lua. `bucket` is the resolved
@@ -306,6 +373,29 @@ pub enum ScriptedEffect {
         seed: Vec<ScriptedSeedEntry>,
         #[serde(default)]
         source_thread_id: Option<String>,
+        /// Copy the named thread's setup prefix verbatim — system
+        /// prompt + tool manifest — into the derived thread,
+        /// realigning the default responder's frozen profile (step 11
+        /// slice 5: the compaction-continuation shape, where
+        /// re-reading the pod's current `system_prompt.md` would
+        /// silently swap personalities across the roll). The source
+        /// must be referenced by this weave. Exclusive with
+        /// `system_prompt` and `disable_tools` — the combination
+        /// refuses at execution.
+        #[serde(default)]
+        setup_from: Option<String>,
+        /// Copy the named thread's config — participants, profiles,
+        /// model, max_tokens, max_turns, tunables, compaction,
+        /// autoquery — and its origin marker. Explicit `model` /
+        /// `backend` / `max_turns` fields layer on top afterward.
+        /// The source must be referenced by this weave.
+        #[serde(default)]
+        config_from: Option<String>,
+        /// Copy the named thread's bindings — backend, named host_env
+        /// entries, mcp_hosts. The source must be referenced by this
+        /// weave. Explicit `backend` layers on top afterward.
+        #[serde(default)]
+        bindings_from: Option<String>,
     },
     /// Set a referenced thread's display title (step 11). Last-write-
     /// wins: a driver's model-generated title overwrites the
@@ -352,6 +442,19 @@ pub enum ScriptedEffect {
         snippet_chars: Option<u32>,
         #[serde(default)]
         hot_only: Option<bool>,
+    },
+    /// Ask the scheduler for the thread's resolved compaction config
+    /// (step 11 slice 5). Answered within the same activation's drain
+    /// by `compaction_ready` (validation passed — prompt, regex, and
+    /// template resolved) or `compaction_refused` (not the ticked
+    /// primary, or compaction disabled). The driver then composes the
+    /// flow itself: append the prompt, run the summary turn, extract
+    /// with `regex_capture`, derive the continuation, advance the
+    /// head. The round trip exists because `prompt_file` resolves
+    /// against the pod directory — scheduler business — at request
+    /// time, not creation time.
+    RequestCompaction {
+        thread_id: String,
     },
     /// Promote a referenced, self-ticked thread to primary; the previous
     /// primary becomes a dormant auxiliary. The compaction-roll primitive.
@@ -467,6 +570,70 @@ fn sandboxed_vm() -> Result<Lua, String> {
         },
     );
     hook_installed.map_err(|e| format!("lua instruction hook: {e}"))?;
+    // `regex_capture(pattern, text)` — the one injected helper (step
+    // 11 slice 5). Lua patterns cannot express the configured
+    // `summary_regex` (Rust-regex syntax; the default's end-anchor
+    // handles nested tags), so extraction gets a real engine. Returns
+    // `capture, nil` (group 1 when the pattern has groups — nil if
+    // the group didn't participate in the match — or the whole match
+    // for a group-less pattern), `nil, nil` on no match, or
+    // `nil, err` for a bad/oversized pattern, oversized text, or
+    // non-UTF-8 input. Every refusal is an error RETURN, never a Lua
+    // error — pcall is stripped, so a raised error would be an
+    // uncatchable activation fault.
+    //
+    // The instruction budget meters Lua instructions, not Rust time,
+    // so both operands are bounded here (review fix, slice 5): the
+    // compiled pattern at 64 KiB (the builtin summary regex needs a
+    // few hundred bytes; regex search worst-cases at compiled-size ×
+    // text-length when the lazy DFA degrades) and the text at 1 MiB
+    // (a summary reply is bounded by max_tokens, far below this).
+    const REGEX_PATTERN_SIZE_LIMIT: usize = 64 * 1024;
+    const REGEX_TEXT_LIMIT: usize = 1024 * 1024;
+    let regex_capture = lua
+        .create_function(
+            move |_, (pattern, text): (mlua::LuaString, mlua::LuaString)| {
+                let Ok(pattern) = pattern.to_str() else {
+                    return Ok((
+                        None,
+                        Some("regex_capture: pattern is not valid UTF-8".into()),
+                    ));
+                };
+                let Ok(text) = text.to_str() else {
+                    return Ok((None, Some("regex_capture: text is not valid UTF-8".into())));
+                };
+                if text.len() > REGEX_TEXT_LIMIT {
+                    return Ok((
+                        None,
+                        Some(format!(
+                            "regex_capture: text exceeds {REGEX_TEXT_LIMIT} bytes"
+                        )),
+                    ));
+                }
+                let compiled = regex::RegexBuilder::new(&pattern)
+                    .size_limit(REGEX_PATTERN_SIZE_LIMIT)
+                    .build();
+                Ok(match compiled {
+                    Ok(re) => match re.captures(&text) {
+                        Some(caps) => {
+                            let capture = if re.captures_len() > 1 {
+                                caps.get(1)
+                            } else {
+                                caps.get(0)
+                            }
+                            .map(|m| m.as_str().to_string());
+                            (capture, None)
+                        }
+                        None => (None, None),
+                    },
+                    Err(e) => (None, Some(format!("regex_capture: {e}"))),
+                })
+            },
+        )
+        .map_err(|e| format!("lua regex_capture: {e}"))?;
+    lua.globals()
+        .set("regex_capture", regex_capture)
+        .map_err(|e| format!("lua regex_capture install: {e}"))?;
     Ok(lua)
 }
 
@@ -770,11 +937,17 @@ mod tests {
                 { kind = "query_knowledge", id = "q2", query = "cold archive",
                   buckets = { "server:wiki" }, top_k = 3, snippet_chars = 200,
                   hot_only = false },
+                { kind = "request_compaction", thread_id = "t-main" },
+                { kind = "derive_thread", relationship = "compaction",
+                  setup_from = "t-main", config_from = "t-main",
+                  bindings_from = "t-main",
+                  seed = { { author = "user", text = "summary" } },
+                  source_thread_id = "t-main" },
               } }
             end
         "#;
         let out = run_event(src_ok, "vocab", &json!({}), &event_turn_start("t", 1)).unwrap();
-        assert_eq!(out.effects.len(), 12);
+        assert_eq!(out.effects.len(), 14);
         assert!(matches!(
             &out.effects[0],
             ScriptedEffect::ResolveTools { decisions, .. }
@@ -837,6 +1010,165 @@ mod tests {
                 snippet_chars: Some(200),
                 hot_only: Some(false),
             }
+        );
+        assert_eq!(
+            out.effects[12],
+            ScriptedEffect::RequestCompaction {
+                thread_id: "t-main".into(),
+            }
+        );
+        assert!(
+            matches!(
+                &out.effects[13],
+                ScriptedEffect::DeriveThread {
+                    setup_from: Some(s),
+                    config_from: Some(c),
+                    bindings_from: Some(b),
+                    system_prompt: None,
+                    disable_tools: false,
+                    ..
+                } if s == "t-main" && c == "t-main" && b == "t-main"
+            ),
+            "granular inheritance directives decode: {:?}",
+            out.effects[13]
+        );
+    }
+
+    #[test]
+    fn agent_completed_carries_call_and_thread_usage() {
+        // Pins the Lua-side shape of the usage payloads (step 11 slice
+        // 5): per-call and cumulative, both plain integer tables — the
+        // material a driver's self-detected compaction threshold reads.
+        let src = r#"
+            function on_event(state, event)
+              if event.kind == "agent_completed" then
+                return { state = {
+                  call_in = event.usage.input_tokens,
+                  call_out = event.usage.output_tokens,
+                  cached = event.usage.cache_read_input_tokens,
+                  total_in = event.thread_usage.input_tokens,
+                  over = event.thread_usage.input_tokens > 200000,
+                } }
+              end
+              return { state = state }
+            end
+        "#;
+        let event = ScriptedEvent::AgentCompleted {
+            thread_id: "t".into(),
+            participant_id: "assistant".into(),
+            text: "done".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            usage: ScriptedCallUsage {
+                input_tokens: 120_000,
+                output_tokens: 900,
+                cache_read_input_tokens: 80_000,
+                cache_creation_input_tokens: 0,
+            },
+            thread_usage: ScriptedCallUsage {
+                input_tokens: 250_000,
+                output_tokens: 4_200,
+                cache_read_input_tokens: 200_000,
+                cache_creation_input_tokens: 1_000,
+            },
+        };
+        let out = run_event(src, "usage", &json!({}), &event).unwrap();
+        assert_eq!(
+            out.state,
+            json!({
+                "call_in": 120_000,
+                "call_out": 900,
+                "cached": 80_000,
+                "total_in": 250_000,
+                "over": true,
+            })
+        );
+    }
+
+    #[test]
+    fn compaction_events_are_readable_and_regex_capture_extracts() {
+        // The compaction_ready payload crosses into Lua intact, and
+        // `regex_capture` runs the CONFIGURED Rust-regex verbatim —
+        // including the default's end-anchor, which must pick the
+        // OUTER close tag when the body verbatim-quotes a nested
+        // <summary> pair (the case Lua patterns cannot express).
+        let src = r#"
+            function on_event(state, event)
+              if event.kind == "compaction_ready" then
+                local body, err = regex_capture(event.summary_regex, state.reply)
+                return { state = {
+                  reason = event.reason,
+                  prompt = event.prompt,
+                  template = event.continuation_template,
+                  body = body,
+                  err = err,
+                } }
+              end
+              if event.kind == "compaction_refused" then
+                return { state = { refused = event.message } }
+              end
+              return { state = state }
+            end
+        "#;
+        let event = ScriptedEvent::CompactionReady {
+            thread_id: "t".into(),
+            reason: "manual".into(),
+            prompt: "Summarize yourself.".into(),
+            summary_regex: r"(?s)<summary>\s*(.*?\S)\s*</summary>\s*\z".into(),
+            continuation_template: "Continue: {{summary}}".into(),
+        };
+        let state = json!({
+            "reply": "<summary>outer <summary>inner</summary> tail</summary>",
+        });
+        let out = run_event(src, "compact", &state, &event).unwrap();
+        assert_eq!(out.state["reason"], "manual");
+        assert_eq!(out.state["prompt"], "Summarize yourself.");
+        assert_eq!(out.state["template"], "Continue: {{summary}}");
+        assert_eq!(
+            out.state["body"], "outer <summary>inner</summary> tail",
+            "end-anchored extraction lands on the outer close tag"
+        );
+        assert!(out.state["err"].is_null());
+
+        let refused = ScriptedEvent::CompactionRefused {
+            thread_id: "t".into(),
+            message: "compaction is disabled for this thread".into(),
+        };
+        let out = run_event(src, "compact", &json!({}), &refused).unwrap();
+        assert_eq!(
+            out.state["refused"],
+            "compaction is disabled for this thread"
+        );
+    }
+
+    #[test]
+    fn regex_capture_no_match_groupless_and_bad_patterns() {
+        let src = r#"
+            function on_event(state, event)
+              local miss, miss_err = regex_capture("<x>(.*)</x>", "nothing here")
+              local whole, whole_err = regex_capture("[a-z]+", "abc123")
+              local bad, bad_err = regex_capture("(unclosed", "text")
+              return { state = {
+                miss = miss == nil,
+                miss_err = miss_err == nil,
+                whole = whole,
+                whole_err = whole_err == nil,
+                bad = bad == nil,
+                bad_err = bad_err ~= nil,
+              } }
+            end
+        "#;
+        let out = run_event(src, "regex", &json!({}), &event_turn_start("t", 1)).unwrap();
+        assert_eq!(
+            out.state,
+            json!({
+                "miss": true,
+                "miss_err": true,
+                "whole": "abc",
+                "whole_err": true,
+                "bad": true,
+                "bad_err": true,
+            })
         );
     }
 

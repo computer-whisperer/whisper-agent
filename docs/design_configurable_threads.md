@@ -1097,6 +1097,176 @@ thread tier demoted to drill-down) is deferred to the final-naming step.
    record stays Pending, nothing lies or leaks, near-unreachable
    since dispatched children are seeded and stepped at creation.
 
+10. **Step 11 slice 5 ratified 2026-08-10: compaction parity for
+   scripted drivers.** Ground truth that shaped the slice: the
+   builtin's four policy functions were already titled_chat's Lua
+   verbatim, and slices 1–4 covered titling, autoquery, and async
+   dispatch — compaction is the LAST builtin capability the scripted
+   contract lacks. The scripted side was deliberately stubbed:
+   manual `CompactThread` refuses scripted weaves ("a driver
+   composes compaction from weave primitives"), `maybe_auto_compact`
+   early-returns on scripted tickers, and while the primitives exist
+   (`append_entry`, `derive_thread` + seed, `advance_head`), a
+   driver could not learn "compact now" (no trigger event, no usage
+   visibility on `agent_completed`), could not run the configured
+   Rust-regex `summary_regex`, and could not reproduce the
+   continuation's inheritance (setup prefix copied verbatim so pod
+   drift doesn't leak, profiles realigned, config + bindings
+   carried — intricate tested Rust inside
+   `finalize_builtin_compaction`). Four forks ratified:
+   - *Staging: parity first.* This slice puts compaction in the
+     scripted contract and titled_chat (completing the parity
+     proof); the conversion proper — pod `thread_defaults.driver`
+     surface, program resolution for a universal default,
+     legacy-weave migration, builtin deletion — is the NEXT slice.
+     REJECTED: one big slice (review surface too large); convert
+     first (regression window: new threads would lose /compact and
+     auto-compact until parity landed).
+   - *Trigger: driver self-detect.* `agent_completed` gains usage
+     payloads — `usage` (the completed call) and `thread_usage`
+     (the thread's cumulative `total_usage`, the operand of the
+     builtin's threshold check), each with the four `Usage` fields.
+     titled_chat declares an Integer knob
+     `compaction.token_threshold` (0/unset = off, matching the
+     builtin's manual-only default) and compares cumulative input
+     tokens at its cycle-closing boundary. The scheduler's own
+     auto-trigger stays builtin-only; its scripted early-return is
+     now permanent law, deleted with the builtin next slice.
+     REJECTED: scheduler-emitted auto trigger (uniform config
+     surface, but policy belongs to the driver; the thread-config
+     `token_threshold` splitting meaning across driver kinds is the
+     accepted cost); both-at-once (surface without a consumer).
+   - *Resolved-config round trip.* The driver needs the thread's
+     resolved compaction texts (pod-relative `prompt_file`,
+     `summary_regex`, `continuation_template`) — pod-dir resolution
+     is scheduler business. New effect
+     `request_compaction {thread_id}`: the scheduler validates
+     (weave ticks the thread, thread is the current primary,
+     `compaction.enabled`) and answers with driver event
+     `compaction_ready {thread_id, reason: "driver", prompt,
+     summary_regex, continuation_template}`; refusal journals the
+     effect failure and delivers
+     `compaction_refused {thread_id, message}` so the driver can
+     clear its own marker (the query_failed precedent — effects
+     must not fail invisibly). The manual client message on a
+     scripted weave stops refusing: it branches BEFORE Function
+     registration, runs the same validation, and delivers
+     `compaction_ready {reason: "manual"}`; refusals bounce to the
+     client as a correlated Error, but success sends NO positive
+     ack (resolved at review, replacing this entry's earlier "and
+     acks" wording) — the visible UX is the driver appending the
+     summary prompt and streaming the turn, and a client wanting a
+     correlated ack is a UI-slice protocol question, not a driver
+     one. The Function registry's `CompactThread` (and its
+     terminal shape) stays builtin-only and dies with the builtin. Idle-ness is NOT
+     checked scheduler-side for scripted weaves — the driver knows
+     its own parking discipline and stores the request until the
+     cycle closes (better than the builtin, which rejects non-idle
+     outright).
+   - *Continuation inheritance: granular reference-fields on
+     `derive_thread`.* Three optional by-reference copy directives,
+     each naming a thread the weave references: `setup_from` (copy
+     the source's setup prefix verbatim — system prompt + tool
+     manifest — realigning the default responder's frozen profile;
+     exclusive with `system_prompt`/`disable_tools`, the
+     combination refuses at execution), `config_from` (copy
+     participants, profiles, model, max_tokens, max_turns,
+     tunables, compaction, autoquery, and the origin marker;
+     explicit `model`/`backend`/`max_turns` layer on top),
+     `bindings_from` (copy backend + named host_env + mcp_hosts).
+     The machinery is `finalize_builtin_compaction`'s snapshot
+     code refactored into shared helpers — the builtin finalize
+     consumes the same helpers until it dies. titled_chat's
+     compaction derive sets all three to the old head; its title
+     derive keeps using none. REJECTED: a single `inherit_from`
+     bundle (opinionated composite; composable pieces chosen —
+     "much easier to get subtly wrong" accepted as the cost of
+     flexibility); inline content fields (Lua holding manifest
+     bytes).
+   - *Extraction: Rust-regex helper.* The Lua environment gains
+     `regex_capture(pattern, text)` — group-1 capture (whole match
+     when the pattern has no groups) or nil + error message,
+     backed by the linear-time regex crate (no catastrophic
+     backtracking from driver-supplied patterns). The configured
+     `summary_regex` rides `compaction_ready` and runs verbatim;
+     the default's end-anchored nested-tag handling is preserved.
+     REJECTED: hand-rolled Lua extraction (custom `summary_regex`
+     configs silently unsupported; Lua patterns cannot express the
+     end-anchor).
+   - *titled_chat flow* (the parity-proof shape): threshold
+     crossing or `compaction_ready` while busy/dead stores a
+     wanted-marker; at quiescence, append the prompt (author
+     "user") + `run_agent`, mark prompted; the summary turn's
+     `agent_completed` extracts via `regex_capture` — success
+     derives the continuation (all three `_from` refs + seeded
+     continuation template), `thread_derived` advances the head,
+     updates `state.primary`, and runs the first turn; extraction
+     failure finishes the cycle and clears the marker (builtin
+     parity: thread left Completed, no continuation, no retry).
+     `compaction_refused` and a primary `thread_failed` clear the
+     marker. Restart mid-summary-turn abandons the compaction
+     (thread healed to Failed → `thread_failed` clears) — the
+     builtin's documented restart contract, unchanged.
+
+   **Slice 5 landed 2026-08-10** (same session as ratification).
+   Contract: `usage`/`thread_usage` on `agent_completed`
+   (`ScriptedCallUsage`, the four protocol Usage fields);
+   `compaction_ready`/`compaction_refused` events;
+   `request_compaction` effect (journal record
+   `PersistedDriverEffect::RequestCompaction` — synchronous, never
+   rests Pending); `derive_thread` grew
+   `setup_from`/`config_from`/`bindings_from` with the builtin
+   finalize's machinery refactored into shared helpers
+   (`inherited_config_override`, `inherited_bindings_request`,
+   `setup_prefix_snapshot`, `apply_setup_snapshot` in
+   compaction.rs) — the builtin path verified field-for-field
+   unchanged; `_from` validation failures journal a Failed
+   DeriveThread record before faulting; `regex_capture` injected
+   into the sandbox. Manual routing branches in
+   `apply_client_message` ahead of Function registration;
+   `deliver_manual_compaction` runs the driver and steps ticked
+   threads origin-first; `weave_request_compaction` answers in the
+   same activation drain. titled_chat: `compaction.token_threshold`
+   Integer knob + the cp machine. Harness: seven tests (manual roll
+   incl. a pod-drift trap on the setup copy, threshold self-detect,
+   extraction-failure retry, three refusal shapes, restart
+   abandonment + retry, exclusivity fault journaling,
+   input-supersedes) + three Lua contract tests.
+   **Reviewed (same session), verdict sound after fixes.** Fixes
+   taken: (1) titled_chat's `input_accepted` on the primary now
+   sets `busy` (the cycle begins at acceptance — resource warmup
+   parks a thread in a state that admits `append_entry` yet
+   refuses `run_agent`, so a manual compact in that window
+   previously faulted the primary) and CLEARS any in-flight
+   compaction (input supersedes: a reply to the user's message is
+   never regex-tested as a summary, and a marker wedged by a
+   faulted roll — driver faults fire no `thread_failed`, so
+   nothing else clears it — now heals on the next message instead
+   of blocking compaction forever); regression test added. (2)
+   `regex_capture` hardened: the instruction budget meters Lua
+   instructions, not Rust time, so both operands are bounded
+   (pattern 64 KiB compiled, text 1 MiB) and arguments arrive as
+   Lua strings with UTF-8 refusals as error RETURNS — previously
+   a non-UTF-8 argument raised an uncatchable conversion error
+   that faulted the activation; group-1 semantics made strict (a
+   non-participating group returns nil, not the whole match). (3)
+   The manual-path ack contradiction resolved in favor of the
+   code: no positive ack (see the amended bullet above). Accepted,
+   recorded: a steady stream of dispatch terminals starves a held
+   compaction (each close prefers the flush; every deferral does
+   real work); the scripted continuation carries no placeholder
+   title (the builtin's rode `send_user_message`'s derive_title —
+   cosmetic); the fork-mid-compaction guard is builtin-only
+   (scripted cp is opaque JSON; forking mid-summary copies the
+   prompt into the fork — revisit when the builtin and its guard
+   die next slice); `thread_derived`/`compaction_ready` are not in
+   the activation-cap salvage arm (a >16-VM-call activation can
+   drop them; titled_chat's flows never approach the cap —
+   pre-existing class shared with title derives); a torn flush
+   (threads before weaves) can leave `cp="prompted"` on disk with
+   no summary turn — the next close fails extraction and
+   self-heals, and input clears it too.
+
 ## Open questions (flagged, not ratified)
 
 - Entry storage: copies on pollution (accepted initially; fan-out is small)

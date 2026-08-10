@@ -17,7 +17,9 @@
 use tracing::warn;
 
 use super::{Scheduler, SchedulerFuture, io_dispatch};
-use crate::runtime::driver::lua::{self, ScriptedEffect, ScriptedEvent, ScriptedToolCall};
+use crate::runtime::driver::lua::{
+    self, ScriptedCallUsage, ScriptedEffect, ScriptedEvent, ScriptedToolCall,
+};
 use crate::runtime::driver::{
     DriverEffectId, DriverFinishReason, DriverState, EntryRef, PersistedDriverEffect,
     ThreadRelationship,
@@ -65,7 +67,7 @@ impl Scheduler {
                     weave.complete_effect(effect_id);
                     self.mark_weave_dirty(weave_id);
                 }
-                let (text, reasoning, tool_calls) = self
+                let (text, reasoning, tool_calls, usage, thread_usage) = self
                     .tasks
                     .get(thread_id)
                     .map(|task| {
@@ -86,6 +88,14 @@ impl Scheduler {
                             last_assistant_text(task),
                             last_assistant_reasoning(task),
                             calls,
+                            // The turn-log entry for this call was pushed at
+                            // integration, before the boundary fired.
+                            task.turn_log
+                                .entries
+                                .last()
+                                .map(|entry| ScriptedCallUsage::from(&entry.usage))
+                                .unwrap_or_default(),
+                            ScriptedCallUsage::from(&task.total_usage),
                         )
                     })
                     .unwrap_or_default();
@@ -95,6 +105,8 @@ impl Scheduler {
                     text,
                     reasoning,
                     tool_calls,
+                    usage,
+                    thread_usage,
                 }
             }
             ThreadBoundary::ToolsCompleted {
@@ -598,19 +610,115 @@ impl Scheduler {
                 max_turns,
                 seed,
                 source_thread_id,
+                setup_from,
+                config_from,
+                bindings_from,
             } => {
-                let config_override = ThreadConfigOverride {
-                    model,
-                    max_turns,
-                    system_prompt: system_prompt.map(|text| SystemPromptChoice::Text { text }),
-                    tools: disable_tools.then(AllowMap::deny_all),
-                    ..Default::default()
+                // Validate the inheritance directives up front; a
+                // failure journals like every refusal (auditable, not
+                // silent) before faulting the activation.
+                let validate_source = |sched: &Self, field: &str, id: &Option<String>| {
+                    let Some(id) = id else { return Ok(()) };
+                    // Each inheritance source must be a thread this
+                    // weave references — drivers curate their own
+                    // topology, they don't reach across weaves.
+                    let referenced = sched
+                        .weaves
+                        .get(weave_id)
+                        .is_some_and(|weave| weave.threads.iter().any(|r| &r.thread_id == id));
+                    if !referenced {
+                        return Err(format!(
+                            "derive_thread: `{field}` thread `{id}` is not referenced by this weave"
+                        ));
+                    }
+                    if !sched.tasks.contains_key(id) {
+                        return Err(format!(
+                            "derive_thread: `{field}` thread `{id}` no longer exists"
+                        ));
+                    }
+                    Ok(())
                 };
-                let bindings_request =
-                    backend.map(|backend| whisper_agent_protocol::ThreadBindingsRequest {
-                        backend: Some(backend),
-                        ..Default::default()
-                    });
+                let validation =
+                    if setup_from.is_some() && (system_prompt.is_some() || disable_tools) {
+                        // A verbatim setup snapshot and an explicit
+                        // prompt/tool strip cannot compose — the snapshot
+                        // would overwrite both after creation.
+                        Err(
+                            "derive_thread: `setup_from` is exclusive with `system_prompt` and \
+                         `disable_tools`"
+                                .to_string(),
+                        )
+                    } else {
+                        validate_source(self, "config_from", &config_from)
+                            .and_then(|()| validate_source(self, "bindings_from", &bindings_from))
+                            .and_then(|()| validate_source(self, "setup_from", &setup_from))
+                    };
+                if let Err(message) = validation {
+                    if let Some(weave) = self.weaves.get_mut(weave_id) {
+                        weave.record_failed_effect(
+                            crate::runtime::driver::PersistedDriverEffect::DeriveThread {
+                                thread_id: None,
+                                relationship: ThreadRelationship {
+                                    kind: relationship,
+                                    source: None,
+                                },
+                                seed_entries: seed.len(),
+                            },
+                            message.as_str(),
+                        );
+                        self.mark_weave_dirty(weave_id);
+                    }
+                    return Err(message);
+                }
+                // Snapshot everything up front — the derive below takes
+                // `&mut self`.
+                let config_source = config_from
+                    .as_ref()
+                    .and_then(|id| self.tasks.get(id))
+                    .map(|task| (task.config.clone(), task.origin.clone()));
+                let bindings_source = bindings_from
+                    .as_ref()
+                    .and_then(|id| self.tasks.get(id))
+                    .map(|task| task.bindings.clone());
+                let setup_source =
+                    setup_from
+                        .as_ref()
+                        .and_then(|id| self.tasks.get(id))
+                        .map(|task| {
+                            (
+                                super::compaction::setup_prefix_snapshot(task),
+                                task.config.participant_profiles.clone(),
+                            )
+                        });
+
+                let (mut config_override, origin) = match config_source {
+                    Some((old_config, origin)) => (
+                        super::compaction::inherited_config_override(&old_config),
+                        origin,
+                    ),
+                    None => (ThreadConfigOverride::default(), None),
+                };
+                // Explicit fields layer on top of the inherited base.
+                if model.is_some() {
+                    config_override.model = model;
+                }
+                if max_turns.is_some() {
+                    config_override.max_turns = max_turns;
+                }
+                if let Some(text) = system_prompt {
+                    config_override.system_prompt = Some(SystemPromptChoice::Text { text });
+                }
+                if disable_tools {
+                    config_override.tools = Some(AllowMap::deny_all());
+                }
+                let mut bindings_request = bindings_source
+                    .as_ref()
+                    .map(super::compaction::inherited_bindings_request);
+                if backend.is_some() {
+                    bindings_request
+                        .get_or_insert_with(Default::default)
+                        .backend = backend;
+                }
                 let seed_messages: Vec<Message> = seed
                     .into_iter()
                     .map(|entry| Message::user_text(entry.text).with_author(entry.author))
@@ -628,9 +736,12 @@ impl Scheduler {
                     bindings_request,
                     seed_messages,
                     relationship_meta,
-                    None,
+                    origin,
                     pending_io,
                 )?;
+                if let Some((parent_setup, source_profiles)) = setup_source {
+                    self.apply_setup_snapshot(&new_id, parent_setup, &source_profiles);
+                }
                 self.scripted_events
                     .entry(weave_id.to_string())
                     .or_default()
@@ -663,6 +774,9 @@ impl Scheduler {
                 hot_only,
                 pending_io,
             ),
+            ScriptedEffect::RequestCompaction { thread_id } => {
+                self.weave_request_compaction(weave_id, &thread_id)
+            }
             ScriptedEffect::AdvanceHead { thread_id } => {
                 self.weave_advance_head(weave_id, &thread_id)
             }
@@ -1045,6 +1159,96 @@ impl Scheduler {
     /// prompt as input, continuation thread) is incoherent for
     /// scripted-driven threads — those compact via weave machinery when
     /// migration step 8 lands.
+    /// Execute a scripted driver's `request_compaction` effect (step
+    /// 11 slice 5): resolve the thread's compaction config and queue
+    /// `compaction_ready` onto the weave's drain (the `thread_derived`
+    /// delivery shape — same activation, after the current event's
+    /// remaining effects). Every failure refuses via
+    /// `compaction_refused` rather than faulting the activation — the
+    /// conditions are environmental (a head that advanced, a disabled
+    /// config, an unreadable prompt file) and the driver needs the
+    /// event to clear its own in-flight marker.
+    fn weave_request_compaction(&mut self, weave_id: &str, thread_id: &str) -> Result<(), String> {
+        use crate::runtime::driver::PersistedDriverEffect;
+        let effect = PersistedDriverEffect::RequestCompaction {
+            thread_id: thread_id.to_string(),
+        };
+        let event = match self.resolve_scripted_compaction(weave_id, thread_id) {
+            Ok(resolved) => {
+                if let Some(weave) = self.weaves.get_mut(weave_id) {
+                    weave.record_completed_effect(effect);
+                    self.mark_weave_dirty(weave_id);
+                }
+                ScriptedEvent::CompactionReady {
+                    thread_id: thread_id.to_string(),
+                    reason: "driver".to_string(),
+                    prompt: resolved.prompt,
+                    summary_regex: resolved.summary_regex,
+                    continuation_template: resolved.continuation_template,
+                }
+            }
+            Err(message) => {
+                if let Some(weave) = self.weaves.get_mut(weave_id) {
+                    weave.record_failed_effect(effect, message.as_str());
+                    self.mark_weave_dirty(weave_id);
+                }
+                ScriptedEvent::CompactionRefused {
+                    thread_id: thread_id.to_string(),
+                    message,
+                }
+            }
+        };
+        self.scripted_events
+            .entry(weave_id.to_string())
+            .or_default()
+            .push_back(event);
+        Ok(())
+    }
+
+    /// Deliver a client's manual CompactThread request to a scripted
+    /// weave's driver (step 11 slice 5): same admission as the
+    /// driver's own `request_compaction`, but refusals bounce to the
+    /// requesting client as the returned error instead of becoming a
+    /// `compaction_refused` event, and nothing journals — the request
+    /// wasn't a driver effect, and the flow the driver composes in
+    /// response journals itself. On success the driver activates with
+    /// `compaction_ready {reason = "manual"}` and every ticked thread
+    /// is stepped, origin first (the slice-3 delivery shape).
+    pub(super) fn deliver_manual_compaction(
+        &mut self,
+        weave_id: &str,
+        thread_id: &str,
+        pending_io: &mut FuturesUnordered<SchedulerFuture>,
+    ) -> Result<(), String> {
+        let resolved = self.resolve_scripted_compaction(weave_id, thread_id)?;
+        let event = ScriptedEvent::CompactionReady {
+            thread_id: thread_id.to_string(),
+            reason: "manual".to_string(),
+            prompt: resolved.prompt,
+            summary_regex: resolved.summary_regex,
+            continuation_template: resolved.continuation_template,
+        };
+        self.run_scripted_driver(weave_id, thread_id, event, pending_io);
+        let mut ticked: Vec<String> = self
+            .weaves
+            .get(weave_id)
+            .map(|weave| {
+                weave
+                    .ticked_thread_ids()
+                    .filter(|tid| {
+                        self.thread_ticker.get(*tid).map(String::as_str) == Some(weave_id)
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ticked.sort_by_key(|tid| tid != thread_id);
+        for tid in ticked {
+            self.step_until_blocked(&tid, pending_io);
+        }
+        Ok(())
+    }
+
     pub(super) fn has_scripted_ticker(&self, thread_id: &str) -> bool {
         self.thread_ticker
             .get(thread_id)

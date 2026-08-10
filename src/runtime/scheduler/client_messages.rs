@@ -200,6 +200,41 @@ impl Scheduler {
                 thread_id,
                 correlation_id,
             } => {
+                // Scripted-ticked threads own their compaction
+                // lifecycle (step 11 slice 5): deliver the resolved
+                // config to the weave's driver as a `compaction_ready`
+                // event instead of registering the builtin Function.
+                // No positive ack message exists — the visible UX is
+                // the driver appending the summary prompt and running
+                // the turn, which thread subscribers stream as usual.
+                let scripted_weave = self
+                    .thread_ticker
+                    .get(&thread_id)
+                    .filter(|weave_id| {
+                        self.weaves.get(*weave_id).is_some_and(|weave| {
+                            matches!(
+                                weave.driver,
+                                whisper_agent_protocol::ThreadDriverConfig::Scripted { .. }
+                            )
+                        })
+                    })
+                    .cloned();
+                if let Some(weave_id) = scripted_weave {
+                    if let Err(message) =
+                        self.deliver_manual_compaction(&weave_id, &thread_id, pending_io)
+                    {
+                        warn!(conn_id, %thread_id, %message, "compact_thread (scripted) refused");
+                        self.router.send_to_client(
+                            conn_id,
+                            ServerToClient::Error {
+                                correlation_id,
+                                thread_id: Some(thread_id),
+                                message: format!("compact_thread: {message}"),
+                            },
+                        );
+                    }
+                    return;
+                }
                 // Route through the Function registry — same path as
                 // auto-compact takes with its SchedulerInternal caller.
                 let spec = crate::functions::Function::CompactThread {
