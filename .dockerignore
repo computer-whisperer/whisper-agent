@@ -4,7 +4,7 @@ target/
 
 # wasm-pack output — regenerated in the builder stage so a stale local
 # pkg/ never leaks into the image
-crates/whisper-agent-webui/pkg/
+crates/whisper-agent-damascene-ui/pkg/
 
 # Dev runtime artifacts (defaults from scripts/dev.sh and the bare CLI
 # fallbacks in main.rs)
