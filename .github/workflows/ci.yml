@@ -33,14 +33,19 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Prebuilt binary straight from the upstream release, pinned to the
+      # same version as `ARG WASM_PACK_VERSION` in the Dockerfile (bump
+      # both together). This replaced jetli/wasm-pack-action, which
+      # resolved `latest` to 0.9.1 (2021) mid-day on 2026-05-07 and later
+      # sat on the Node 20 runtime that GitHub deprecated in 2025-09.
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          # Pin: jetli's `latest` resolution flipped to 0.9.1 (2021)
-          # mid-day on 2026-05-07, breaking workspace inheritance
-          # parsing. v0.13.1 is the upstream stable; bump after
-          # verifying the action no longer regresses.
-          version: 'v0.13.1'
+        env:
+          WASM_PACK_VERSION: 0.13.1
+        run: |
+          curl -sSfL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | sudo tar -xz --strip-components=1 -C /usr/local/bin \
+                "wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack"
+          wasm-pack --version
 
       # `src/server.rs` embeds `crates/whisper-agent-damascene-ui/pkg/` via
       # `rust-embed`; the macro checks the folder exists at compile time.
