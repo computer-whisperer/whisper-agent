@@ -14,8 +14,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Damascene lives in a sibling worktree under active development; uncomment
 # the path specs when testing unreleased UI/runtime fixes locally.
-damascene-core = "0.6.0"
-damascene-markdown = "0.6.0"
+damascene-core = "0.8.0"
+damascene-markdown = "0.8.0"
 # damascene-core = { path = "../../../../damascene/damascene.main/crates/damascene-core" }
 # damascene-markdown = { path = "../../../../damascene/damascene.main/crates/damascene-markdown" }
 
@@ -76,7 +76,7 @@ js-sys = "0.3"
 # a `WebHandle::request_redraw` shim, so `web_entry.rs` only carries
 # whisper-agent-specific glue (WebSocket, drag-drop files, image-paste)
 # instead of the full wgpu/winit bootstrap.
-damascene-web = "0.6.0"
+damascene-web = "0.8.0"
 # damascene-web = { path = "../../../../damascene/damascene.main/crates/damascene-web" }
 web-sys = { version = "0.3", features = [
     "WebSocket",

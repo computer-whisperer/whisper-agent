@@ -17,8 +17,8 @@ whisper-agent-protocol = { workspace = true }
 # Damascene's optional native winit + wgpu host. Owns window creation,
 # event loop, surface configuration, and frame submission so this
 # binary only has to plug a `ChatApp` into it.
-damascene-core = "0.6.0"
-damascene-winit-wgpu = "0.6.0"
+damascene-core = "0.8.0"
+damascene-winit-wgpu = "0.8.0"
 # damascene-core = { path = "../../../../damascene/damascene.main/crates/damascene-core" }
 # damascene-winit-wgpu = { path = "../../../../damascene/damascene.main/crates/damascene-winit-wgpu" }
 
