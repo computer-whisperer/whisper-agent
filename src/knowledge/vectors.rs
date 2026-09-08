@@ -564,13 +564,13 @@ pub(super) fn dequantize_record(slice: &[u8], quant: VectorQuant, dim: usize) ->
     let mut out = Vec::with_capacity(dim);
     match quant {
         VectorQuant::F32 => {
-            for chunk in slice.chunks_exact(4) {
-                out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in slice.as_chunks::<4>().0 {
+                out.push(f32::from_le_bytes(*chunk));
             }
         }
         VectorQuant::F16 => {
-            for chunk in slice.chunks_exact(2) {
-                let h = half::f16::from_le_bytes(chunk.try_into().unwrap());
+            for chunk in slice.as_chunks::<2>().0 {
+                let h = half::f16::from_le_bytes(*chunk);
                 out.push(h.to_f32());
             }
         }

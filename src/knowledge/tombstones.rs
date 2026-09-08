@@ -62,10 +62,8 @@ impl Tombstones {
         file.read_to_end(&mut buf)?;
 
         let mut sorted = Vec::with_capacity(n_records);
-        for record in buf.chunks_exact(RECORD_SIZE) {
-            let mut id = [0u8; 32];
-            id.copy_from_slice(record);
-            sorted.push(ChunkId(id));
+        for record in buf.as_chunks::<RECORD_SIZE>().0 {
+            sorted.push(ChunkId(*record));
         }
         sorted.sort_unstable();
         sorted.dedup();

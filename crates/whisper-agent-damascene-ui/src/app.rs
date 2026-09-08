@@ -4116,7 +4116,6 @@ impl ChatApp {
                         whisper_agent_protocol::HostEnvBinding::Named {
                             name,
                             workspace_root,
-                            runas: _,
                             ..
                         } => match workspace_root {
                             Some(p) => format!("{name} (cwd: {})", p.display()),

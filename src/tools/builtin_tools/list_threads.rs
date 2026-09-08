@@ -198,7 +198,7 @@ fn thread_row_from_bytes(bytes: &[u8]) -> Result<ThreadRow, serde_json::Error> {
         .map(|s| s.to_string());
     let origin_behavior_id = v
         .get("origin")
-        .and_then(|o| if o.is_null() { None } else { Some(o) })
+        .filter(|o| !o.is_null())
         .and_then(|o| o.get("behavior_id"))
         .and_then(|b| b.as_str())
         .map(|s| s.to_string());
