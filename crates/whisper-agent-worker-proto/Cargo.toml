@@ -3,6 +3,7 @@ name = "whisper-agent-worker-proto"
 description = "Wire types for the daemon ↔ worker IPC — host-daemon ↔ host-worker (formerly mcp-host)."
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

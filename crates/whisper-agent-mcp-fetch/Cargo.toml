@@ -3,6 +3,7 @@ name = "whisper-agent-mcp-fetch"
 description = "MCP server exposing a guarded web-fetch tool for whisper-agent"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

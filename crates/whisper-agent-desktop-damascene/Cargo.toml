@@ -3,6 +3,7 @@ name = "whisper-agent-desktop-damascene"
 description = "Native desktop client for whisper-agent (damascene + tokio-tungstenite)"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

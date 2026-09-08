@@ -3,6 +3,7 @@ name = "whisper-agent-damascene-ui"
 description = "Browser + native chat UI for whisper-agent (damascene)"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]

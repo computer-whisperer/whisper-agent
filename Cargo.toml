@@ -7,6 +7,11 @@ resolver = "3"
 # independently. `edition` and `license` stay shared.
 edition = "2024"
 license = "MIT OR Apache-2.0"
+# MSRV = the Dockerfile's `ARG RUST_VERSION` = the CI toolchain pin.
+# Declared so `cargo update` resolves to versions that build on it
+# (resolver 3 falls back past incompatible releases) and so a newer
+# local toolchain can't quietly raise the floor. Bump all three together.
+rust-version = "1.92"
 
 # Shared dependency specs. Consumers inherit with `{ workspace = true }`
 # and may add extra features per-crate. Deps with divergent
@@ -59,6 +64,7 @@ name = "whisper-agent"
 description = "Server-resident agent loop that reaches into managed POSIX hosts via MCP"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]

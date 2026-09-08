@@ -18,8 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Pinned to the same minor as `ARG RUST_VERSION` in the Dockerfile
+      # (and `[workspace.package].rust-version`), so CI verifies the
+      # toolchain that builds the production image. `@stable` kept
+      # breaking here: each release adds clippy lints and `-D warnings`
+      # turns them into failures (red from 2026-08-09 to 2026-09-08).
+      # Bump all three together.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.92
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown

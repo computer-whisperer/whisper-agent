@@ -3,6 +3,7 @@ name = "whisper-agent-host-daemon"
 description = "Host-side daemon for the v2 host-env protocol — dials whisper-agent over WebSocket and provisions per-session sandboxes for incoming tool calls."
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [lib]

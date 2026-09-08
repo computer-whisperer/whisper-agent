@@ -15,6 +15,8 @@
 # Build:   podman build -t whisper-agent .
 # Inspect: podman run --rm -it whisper-agent /usr/local/bin/whisper-agent --help
 
+# The workspace MSRV. Move `[workspace.package].rust-version` and the
+# toolchain pin in `.github/workflows/ci.yml` together with this.
 ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
 # Pin to match `.github/workflows/ci.yml` so the image and CI cannot

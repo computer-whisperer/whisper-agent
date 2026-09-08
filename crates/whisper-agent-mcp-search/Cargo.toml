@@ -3,6 +3,7 @@ name = "whisper-agent-mcp-search"
 description = "MCP server exposing a web-search tool (Brave Search API) for whisper-agent"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

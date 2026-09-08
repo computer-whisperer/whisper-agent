@@ -3,6 +3,7 @@ name = "whisper-agent-protocol"
 description = "Wire protocol shared between whisper-agent server and webui (CBOR over WebSocket)"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

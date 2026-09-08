@@ -3,6 +3,7 @@ name = "whisper-agent-mcp-imagegen"
 description = "MCP server exposing an image_generate tool backed by the OpenAI Images API. Reads its OpenAI auth from the shared whisper-agent.toml so a single config file drives both the main daemon and image-gen sibling."
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]

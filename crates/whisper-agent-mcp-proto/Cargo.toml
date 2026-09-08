@@ -3,6 +3,7 @@ name = "whisper-agent-mcp-proto"
 description = "Shared MCP and JSON-RPC types for whisper-agent's MCP servers (mcp-host, mcp-fetch)"
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

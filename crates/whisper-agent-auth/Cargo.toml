@@ -3,6 +3,7 @@ name = "whisper-agent-auth"
 description = "Shared auth primitives for whisper-agent: ApiKey + ChatGPT-subscription (Codex OAuth) used by the main daemon and sibling MCP daemons that hit OpenAI."
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

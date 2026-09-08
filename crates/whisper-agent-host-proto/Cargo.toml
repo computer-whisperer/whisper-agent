@@ -3,6 +3,7 @@ name = "whisper-agent-host-proto"
 description = "Wire types for the host-env protocol — whisper-agent ↔ host-daemon."
 version = "0.3.31"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
