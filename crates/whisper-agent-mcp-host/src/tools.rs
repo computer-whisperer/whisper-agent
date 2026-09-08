@@ -2821,6 +2821,24 @@ fn main() {
     }
 
     #[test]
+    fn prepare_image_rasterizes_gzipped_svgz() {
+        // `.svgz` is gzip-wrapped SVG. `looks_like_svg` admits it by
+        // the gzip magic and usvg inflates it — but only with resvg's
+        // `svgz` feature, which 0.48 split out of the default set.
+        // Locks in that the Cargo.toml feature list keeps it on.
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&make_svg(64, 48)).unwrap();
+        let bytes = enc.finish().unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]));
+        let prepared = prepare_image(&bytes).unwrap();
+        assert_eq!(prepared.mime_type, "image/png");
+        let decoded = image::load_from_memory(&prepared.bytes).unwrap();
+        assert_eq!(decoded.width(), 64);
+        assert_eq!(decoded.height(), 48);
+    }
+
+    #[test]
     fn prepare_image_rasterizes_prolog_less_svg() {
         // SVGs without an `<?xml ?>` prolog are common (browsers and
         // most editors emit them this way for inline embedding).

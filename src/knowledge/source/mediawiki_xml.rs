@@ -210,9 +210,9 @@ impl Iterator for MediaWikiXmlIter {
             // the event borrows from `self.buf`, but `handle_start`
             // re-borrows `self` mutably to drive `read_text_into`.
             let action = match self.reader.read_event_into(&mut self.buf) {
-                Ok(Event::Start(start)) => StartAction::Start(start.name().as_ref().to_vec()),
-                Ok(Event::Empty(start)) => StartAction::Empty(start.name().as_ref().to_vec()),
-                Ok(Event::End(end)) => StartAction::End(end.name().as_ref().to_vec()),
+                Ok(Event::Start(start)) => StartAction::Start(start.name().into_inner().to_owned()),
+                Ok(Event::Empty(start)) => StartAction::Empty(start.name().into_inner().to_owned()),
+                Ok(Event::End(end)) => StartAction::End(end.name().into_inner().to_owned()),
                 Ok(Event::Eof) => return None,
                 Err(e) => {
                     self.failed = true;
@@ -238,14 +238,14 @@ impl Iterator for MediaWikiXmlIter {
                 StartAction::Empty(name) => {
                     // `<redirect ... />` is the only empty tag we care
                     // about. Other self-closing tags get ignored.
-                    if name == b"redirect"
+                    if name == "redirect"
                         && let Some(state) = self.current.as_mut()
                     {
                         state.is_redirect = true;
                     }
                 }
                 StartAction::End(name) => {
-                    if name == b"page"
+                    if name == "page"
                         && let Some(state) = self.current.take()
                         && let Some(record) = state.into_record()
                     {
@@ -262,35 +262,35 @@ impl Iterator for MediaWikiXmlIter {
 /// drop the borrowed event before re-borrowing `self` mutably for
 /// `read_text_into`.
 enum StartAction {
-    Start(Vec<u8>),
-    Empty(Vec<u8>),
-    End(Vec<u8>),
+    Start(String),
+    Empty(String),
+    End(String),
     Skip,
 }
 
 impl MediaWikiXmlIter {
-    fn handle_start(&mut self, tag: &[u8]) -> Result<(), SourceError> {
+    fn handle_start(&mut self, tag: &str) -> Result<(), SourceError> {
         match tag {
-            b"page" => {
+            "page" => {
                 self.current = Some(PageState::default());
             }
-            b"title" if self.current.is_some() => {
-                let title = self.read_inner_text(b"title")?;
+            "title" if self.current.is_some() => {
+                let title = self.read_inner_text("title")?;
                 if let Some(state) = self.current.as_mut() {
                     state.title = Some(title);
                 }
             }
-            b"ns" if self.current.is_some() => {
-                let raw = self.read_inner_text(b"ns")?;
+            "ns" if self.current.is_some() => {
+                let raw = self.read_inner_text("ns")?;
                 if let Some(state) = self.current.as_mut() {
                     state.ns = raw.trim().parse::<i32>().ok();
                 }
             }
-            b"text" if self.current.is_some() => {
+            "text" if self.current.is_some() => {
                 // `<text>` appears at `<page>/<revision>/<text>`. We
                 // don't track depth — `<text>` doesn't appear elsewhere
                 // in the schema, so an unconditional read is correct.
-                let text = self.read_inner_text(b"text")?;
+                let text = self.read_inner_text("text")?;
                 if let Some(state) = self.current.as_mut() {
                     state.text = Some(text);
                 }
@@ -300,34 +300,26 @@ impl MediaWikiXmlIter {
         Ok(())
     }
 
-    /// Read until the matching end tag and decode the inner text. The
+    /// Read until the matching end tag and unescape the inner text. The
     /// quick-xml buffered-reader API uses `read_text_into` (a separate
     /// buffer); after this call the reader sits just past `</tag>`.
-    /// Inner XML entities are unescaped (so `&amp;` arrives as `&`).
-    fn read_inner_text(&mut self, tag: &[u8]) -> Result<String, SourceError> {
+    /// quick-xml validates the span as UTF-8 on the way out, so the
+    /// event already derefs to `str`. Inner XML entities are unescaped
+    /// (so `&amp;` arrives as `&`).
+    fn read_inner_text(&mut self, tag: &str) -> Result<String, SourceError> {
         self.text_buf.clear();
-        let qname = QName(tag);
-        let bytes_text = self
+        let text = self
             .reader
-            .read_text_into(qname, &mut self.text_buf)
+            .read_text_into(QName(tag), &mut self.text_buf)
             .map_err(|e| {
                 SourceError::Other(format!(
-                    "mediawiki xml: read_text_into({}) at byte {}: {e}",
-                    String::from_utf8_lossy(tag),
+                    "mediawiki xml: read_text_into({tag}) at byte {}: {e}",
                     self.reader.buffer_position(),
                 ))
             })?;
-        let decoded = bytes_text.decode().map_err(|e| {
+        let unescaped = unescape(&text).map_err(|e| {
             SourceError::Other(format!(
-                "mediawiki xml: decode({}) at byte {}: {e}",
-                String::from_utf8_lossy(tag),
-                self.reader.buffer_position(),
-            ))
-        })?;
-        let unescaped = unescape(&decoded).map_err(|e| {
-            SourceError::Other(format!(
-                "mediawiki xml: unescape({}) at byte {}: {e}",
-                String::from_utf8_lossy(tag),
+                "mediawiki xml: unescape({tag}) at byte {}: {e}",
                 self.reader.buffer_position(),
             ))
         })?;
